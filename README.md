@@ -33,3 +33,12 @@ Download: https://github.com/Thyayro/cowboy-rec-ios/releases/tag/v0.1.0-test
 O arquivo CowboyRec-unsigned.ipa deve ser assinado/importado com AltStore Classic; o Safari não instala diretamente. Depois da instalação: entre em Conta / biblioteca, volte à câmera, confira o modo solicitado/ativo e grave um clipe curto. Verifique o vídeo na biblioteca antes de gravações importantes. A versão web anterior continua disponível.
 
 SHA256 do IPA: `02780c0471c6966ba87c5f5ac07b879e3cb1f36bda22c8780070110c752ca167`.
+## v0.2.0 — câmera ampla e Rec integrado
+
+A câmera nativa ocupa a tela, com zoom e gravação sobre a prévia. Biblioteca e Rec completo abrem as telas reais da VPS dentro do aplicativo, compartilhando o cookie persistente de login com os envios nativos. O primeiro acesso sem conta abre o login automaticamente. Downloads da biblioteca podem ser exportados pelo compartilhamento do iOS. O app impede voltar à câmera nativa enquanto o Rec web está gravando.
+
+A captura nativa usa AVFoundation; as funções adicionais do Rec continuam sendo executadas pela interface web, não foram reimplementadas como controles AVFoundation. Ao entrar no Rec completo, a câmera nativa é liberada para evitar disputa com a câmera web. A prévia preenche a tela com resizeAspectFill; o vídeo salvo conserva o quadro original. Capturas nativas mantêm o limite de 256 MB e o envio ao parar.
+
+Atualização: baixe o IPA v0.2.0 e importe com + no AltStore, mantendo o app instalado. O bundle identifier permanece com.cowboy.rec.personal, para atualização no mesmo app e preservação da fila. Backup do código anterior: backup/native-ui-v0.1.0-20261004. Os dados continuam nas APIs e arquivos de sessões existentes da VPS; nenhum banco alternativo foi criado.
+
+Validação: compilação Release para iPhone, integridade do IPA e acesso HTTP autenticado a /api/me, /api/rec/list, /rec e /js/rec/rec.js. Login interativo, permissões WebKit, layout físico, downloads e captura/envio no iPhone devem ser conferidos no dispositivo; testes de servidor não comprovam o fluxo físico.
