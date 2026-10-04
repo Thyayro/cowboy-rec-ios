@@ -19,6 +19,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   private var requestedHDR = false
   private var requestedCodec = AVVideoCodecType.hevc
   private var availableDevices: [AVCaptureDevice] = []
+  private var rotationAngle: Double = 90
+  @Published var captureAngle: Double = 90
   struct Lens: Identifiable, Sendable { let id: String; let name: String }
   @Published var lenses: [Lens] = []
   @Published var lensID = ""
@@ -59,6 +61,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   @Published var minimumZoom: Double = 0.5
   @Published var maximumZoom: Double = 10
   @Published var activeMode = AVCaptureVideoStabilizationMode.off
+  @Published var preferredMode = AVCaptureVideoStabilizationMode.cinematicExtended
   @Published var colorLocked = false
   @Published var recoverableFile: URL?
   var onSaved: ((URL, String?) -> Void)?
@@ -156,7 +159,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
       if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
       guard let connection=movie.connection(with:.video),movie.availableVideoCodecTypes.contains(encoding) else { throw failure("Codec não disponível neste formato") }
-      if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle=90 }
+      if connection.isVideoRotationAngleSupported(rotationAngle) { connection.videoRotationAngle=rotationAngle }
       movie.setOutputSettings([AVVideoCodecKey:encoding],for:connection)
       movie.maxRecordedFileSize=256*1024*1024
       zoomObservation?.invalidate()
@@ -211,6 +214,14 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   }
   func setHDR(_ enabled: Bool) { reconfigure { try self.configure(hdr:enabled) } }
   func setCodec(_ value: String) { reconfigure { try self.configure(codec:AVVideoCodecType(rawValue:value)) } }
+  func setCaptureAngle(_ angle: Double) {
+    queue.async {
+      guard self.outputURL == nil,!self.movie.isRecording else { return }
+      self.rotationAngle=angle
+      if let connection=self.movie.connection(with:.video),connection.isVideoRotationAngleSupported(angle) { connection.videoRotationAngle=angle }
+      self.publish { self.captureAngle=angle }
+    }
+  }
   var zoomPresets: [Double] {
     [0.5,1,2,5,10].filter { value in
       (value >= minimumZoom && value <= maximumZoom) || (value == 0.5 && canSwitchUltraWide && !recording && !finishing)
@@ -249,7 +260,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     let mode = fallback.first { cam.activeFormat.isVideoStabilizationModeSupported($0) } ?? .off
     if connection.isVideoStabilizationSupported { connection.preferredVideoStabilizationMode = mode }
     let actual = connection.activeVideoStabilizationMode
-    publish { self.activeMode = mode; self.status = "4K · 60 fps · estabilização solicitada: \(Self.label(mode)) · ativa: \(Self.label(actual))" }
+    let description="\(name(cam)) · \(selectedProfile.label)\(requestedHDR ? " · HDR" : "") · estabilização solicitada: \(Self.label(mode))"
+    publish { self.preferredMode=mode;self.activeMode = actual; self.status = description }
   }
   static func label(_ mode: AVCaptureVideoStabilizationMode) -> String {
     switch mode { case .off: return "Desligada"; case .standard: return "Standard"; case .cinematic: return "Cinematic"; case .cinematicExtended: return "Cinematic Extended"; default: return "Sistema" }
@@ -284,7 +296,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
           if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
           if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
         }
-        self.publish { self.colorLocked = locked }
+        self.publish { self.colorLocked = locked;self.manualExposure=false;self.manualWhiteBalance=false }
       } catch { self.publish { self.status = error.localizedDescription } }
     }
   }
@@ -411,6 +423,16 @@ struct CameraPreview: UIViewRepresentable {
   final class Surface: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var preview: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+    var lockedAngle: Double?
+    var angleChanged: ((Double) -> Void)?
+    private var lastAngle: Double?
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      let orientation=window?.windowScene?.interfaceOrientation
+      let angle=lockedAngle ?? (orientation == .landscapeLeft ? 180 : orientation == .landscapeRight ? 0 : 90)
+      if let connection=preview.connection,connection.isVideoRotationAngleSupported(angle) { connection.videoRotationAngle=angle }
+      if angle != lastAngle { lastAngle=angle;angleChanged?(angle) }
+    }
   }
   func makeCoordinator() -> Coordinator { Coordinator(camera:camera) }
   final class Coordinator: NSObject {
@@ -423,13 +445,15 @@ struct CameraPreview: UIViewRepresentable {
   }
   func makeUIView(context: Context) -> Surface {
     let view = Surface(); view.preview.session = camera.session; view.preview.videoGravity = .resizeAspectFill
+    view.angleChanged={ angle in camera.setCaptureAngle(angle) }
     view.addGestureRecognizer(UITapGestureRecognizer(target:context.coordinator,action:#selector(Coordinator.tapped(_:))))
     return view
   }
   func updateUIView(_ view: Surface, context: Context) {
+    view.lockedAngle=camera.recording || camera.finishing ? camera.captureAngle : nil
+    view.setNeedsLayout()
     if let connection = view.preview.connection {
-      if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
-      if connection.isVideoStabilizationSupported { connection.preferredVideoStabilizationMode = camera.activeMode }
+      if connection.isVideoStabilizationSupported { connection.preferredVideoStabilizationMode = camera.preferredMode }
     }
   }
 }

@@ -18,6 +18,7 @@ struct NativeCameraSettings: View {
           ForEach(camera.codecs,id:\.self) { codec in Text(codec == "hvc1" ? "HEVC" : codec == "avc1" ? "H.264" : codec).tag(codec) }
         }.disabled(configuringDisabled || camera.hdrEnabled)
         Text(camera.status).font(.caption)
+        Text("Estabilização ativa: \(NativeCamera.label(camera.activeMode))").font(.caption)
         Text("Os formatos são detectados na lente selecionada. Não há redução automática de resolução ou FPS para trocar de lente. Para escolher outra lente sem suporte ao formato atual, primeiro selecione um formato compatível.").font(.caption2)
       }
       Section("Foco e luz") {

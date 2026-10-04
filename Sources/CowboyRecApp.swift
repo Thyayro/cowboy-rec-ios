@@ -17,6 +17,7 @@ struct RecorderView: View {
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 0.91, green: 0.65, blue: 0.24)
   var body: some View {
+    GeometryReader { geometry in
     ZStack {
       Color.black.ignoresSafeArea()
       CameraPreview(camera: camera).ignoresSafeArea()
@@ -63,8 +64,9 @@ struct RecorderView: View {
             Button { open(.rec) } label: { VStack { Image(systemName: "square.grid.2x2").font(.title2); Text("Rec completo").font(.caption2) }.frame(maxWidth: .infinity) }.disabled(camera.recording || camera.finishing)
           }
           if camera.recording { Text("GRAVANDO").font(.caption.weight(.bold)).foregroundStyle(.red) }
-        }.padding(20).background(LinearGradient(colors: [.clear,.black.opacity(0.9),.black],startPoint: .top,endPoint: .bottom))
+        }.padding(20).frame(maxWidth:geometry.size.width > geometry.size.height ? 360 : .infinity).background(LinearGradient(colors: [.clear,.black.opacity(0.9),.black],startPoint: .top,endPoint: .bottom)).frame(maxWidth:.infinity,alignment:.trailing)
       }
+    }
     }.tint(gold).preferredColorScheme(.dark)
       .fullScreenCover(item: $portal,onDismiss: {
         Task { await cloud.refresh(); if let owner=cloud.email { camera.recoverSaved(owner: owner) }; camera.start() }
