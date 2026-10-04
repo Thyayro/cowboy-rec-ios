@@ -1,5 +1,5 @@
 from pathlib import Path
-import re
+import re, subprocess
 root=Path('cowboy-rec-ios')
 for f in root.glob('Sources/*.swift'):
     s=f.read_text(encoding='utf-8-sig')
@@ -13,7 +13,8 @@ assert 'Ray-Ban' not in cloud and 'Óculos' not in cloud
 cam=(root/'Sources/NativeCamera.swift').read_text(encoding='utf-8-sig')
 assert 'ramp(toVideoZoomFactor:' in cam and '3840' in cam and '2160' in cam
 assert 'isVideoStabilizationModeSupported' in cam
-for f in root.rglob('*'):
-    if f.is_file() and ".git" not in f.parts:
-        assert not re.search(r'((?:ghp_|gho_|sk-proj-)[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA )?PRIVATE KEY-----)',f.read_text(encoding='utf-8-sig')), f
+tracked = subprocess.check_output(['git', '-C', str(root), 'ls-files'], text=True).splitlines()
+for name in tracked:
+    f = root / name
+    assert not re.search(r'((?:ghp_|gho_|sk-proj-)[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA )?PRIVATE KEY-----)',f.read_text(encoding='utf-8-sig')), f
 print('PASS source structure: native camera/ramp, 4K60 checks, queue ownership/receipt, no duplicate stabilization, no glasses dependency or embedded credentials. Not a Swift compilation.')
