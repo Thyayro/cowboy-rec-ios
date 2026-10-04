@@ -320,7 +320,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         guard cam.isFocusModeSupported(.locked),cam.isLockingFocusWithCustomLensPositionSupported else { throw self.failure("Foco manual indisponível nesta lente") }
         cam.setFocusModeLocked(lensPosition:Float(max(0,min(1,position ?? Double(cam.lensPosition)))),completionHandler:nil)
       } else if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
-      self.publish { self.manualFocus=manual }
+      self.publish { self.manualFocus=manual;if let position { self.lensPosition=max(0,min(1,position)) } }
     }
   }
   func focusAt(_ point: CGPoint) {
@@ -344,11 +344,19 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         let seconds=max(minimum,min(maximum,shutter.map { 1/max(1,$0) } ?? CMTimeGetSeconds(cam.exposureDuration)))
         cam.setExposureModeCustom(duration:CMTime(seconds:seconds,preferredTimescale:1000000000),iso:sensitivity,completionHandler:nil)
       } else if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
-      self.publish { self.manualExposure=manual;self.colorLocked=false }
+      self.publish {
+        self.manualExposure=manual;self.colorLocked=false
+        if let iso { self.iso=max(self.minISO,min(self.maxISO,iso)) }
+        if let shutter { self.shutter=max(self.minShutter,min(self.maxShutter,shutter)) }
+      }
     }
   }
   func setExposureBias(_ value: Double) {
-    control { cam in cam.setExposureTargetBias(Float(max(Double(cam.minExposureTargetBias),min(Double(cam.maxExposureTargetBias),value))),completionHandler:nil) }
+    control { cam in
+      let bias=max(Double(cam.minExposureTargetBias),min(Double(cam.maxExposureTargetBias),value))
+      cam.setExposureTargetBias(Float(bias),completionHandler:nil)
+      self.publish { self.exposureBias=bias }
+    }
   }
   func setWhiteBalance(_ manual: Bool,temperature: Double? = nil) {
     control { cam in
@@ -359,7 +367,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         gains.redGain=max(1,min(cam.maxWhiteBalanceGain,gains.redGain));gains.greenGain=max(1,min(cam.maxWhiteBalanceGain,gains.greenGain));gains.blueGain=max(1,min(cam.maxWhiteBalanceGain,gains.blueGain))
         cam.setWhiteBalanceModeLocked(with:gains,completionHandler:nil)
       } else if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
-      self.publish { self.manualWhiteBalance=manual;self.colorLocked=false }
+      self.publish { self.manualWhiteBalance=manual;self.colorLocked=false;if let temperature { self.temperature=max(2000,min(10000,temperature)) } }
     }
   }
   func record(owner: String) {
