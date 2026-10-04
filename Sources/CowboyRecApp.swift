@@ -24,7 +24,7 @@ struct RecorderView: View {
       VStack(spacing: 0) {
         HStack {
           VStack(alignment: .leading,spacing: 3) {
-            Text("COWBOY REC").font(.headline).tracking(2)
+            Text("COWBOY REC · 0.3.1").font(.headline).tracking(2)
             Text("4K · 60 FPS · \(NativeCamera.label(camera.activeMode))").font(.caption2)
           }
           Spacer()
@@ -71,14 +71,18 @@ struct RecorderView: View {
       .fullScreenCover(item: $portal,onDismiss: {
         Task { await cloud.refresh(); if let owner=cloud.email { camera.recoverSaved(owner: owner) }; camera.start() }
       }) { destination in
-        NavigationStack {
-          CowboyAccountView(destination: destination,control: portalControl)
-            .navigationTitle(destination.title).navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Câmera nativa") {
+        VStack(spacing:0) {
+          HStack {
+            Text("Cowboy Rec · app nativo 0.3.1").font(.caption.weight(.bold))
+            Spacer()
+            Button("Câmera 4K/60") {
               Task { if await portalControl.canReturnToCamera() { portal=nil } else { captureWarning=true } }
-            } } }
-            .alert("Gravação em andamento",isPresented: $captureWarning) { Button("OK",role: .cancel) {} } message: { Text("Pare a gravação ou transmissão no Rec antes de voltar à câmera nativa.") }
-        }.preferredColorScheme(.dark)
+            }.buttonStyle(.borderedProminent)
+          }.padding(12).background(Color.black)
+          CowboyAccountView(destination:destination,control:portalControl)
+        }
+        .alert("Gravação em andamento",isPresented:$captureWarning) { Button("OK",role:.cancel) {} } message: { Text("Pare a gravação antes de voltar à câmera nativa.") }
+        .preferredColorScheme(.dark)
       }
       .sheet(isPresented: $settings) {
         NavigationStack {

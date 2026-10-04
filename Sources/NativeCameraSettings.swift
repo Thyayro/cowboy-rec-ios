@@ -14,9 +14,11 @@ struct NativeCameraSettings: View {
           ForEach(camera.profiles) { profile in Text(profile.label).tag(profile.id) }
         }.disabled(configuringDisabled || camera.profiles.isEmpty)
         Toggle("HDR (HLG)",isOn:Binding(get:{camera.hdrEnabled},set:{camera.setHDR($0)})).disabled(configuringDisabled || !camera.hdrAvailable)
+        Toggle("Apple Log",isOn:Binding(get:{camera.logEnabled},set:{camera.setLog($0)})).disabled(configuringDisabled || !camera.logAvailable)
+        if !camera.logAvailable { Text("Apple Log não está disponível neste aparelho/lente em \(camera.formatLabel). HDR não é Log.").font(.caption2) }
         Picker("Codec",selection:Binding(get:{camera.codec},set:{camera.setCodec($0)})) {
           ForEach(camera.codecs,id:\.self) { codec in Text(codec == "hvc1" ? "HEVC" : codec == "avc1" ? "H.264" : codec).tag(codec) }
-        }.disabled(configuringDisabled || camera.hdrEnabled)
+        }.disabled(configuringDisabled || camera.hdrEnabled || camera.logEnabled)
         Text(camera.status).font(.caption)
         Text("Estabilização ativa: \(NativeCamera.label(camera.activeMode))").font(.caption)
         Text("Os formatos são detectados na lente selecionada. Não há redução automática de resolução ou FPS para trocar de lente. Para escolher outra lente sem suporte ao formato atual, primeiro selecione um formato compatível.").font(.caption2)

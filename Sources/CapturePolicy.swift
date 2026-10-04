@@ -19,14 +19,15 @@ struct NativeFormatDescriptor: Sendable {
   let ranges: [NativeFrameRange]
   let hdr: Bool
   let stabilized: Bool
-  func supports(_ p: NativeCaptureProfile,hdr requestedHDR: Bool) -> Bool {
-    width == p.width && height == p.height && (!requestedHDR || hdr) && ranges.contains { $0.min <= p.fps+0.001 && $0.max >= p.fps-0.001 }
+  var log: Bool = false
+  func supports(_ p: NativeCaptureProfile,hdr requestedHDR: Bool,log requestedLog: Bool = false) -> Bool {
+    width == p.width && height == p.height && (!requestedHDR || hdr) && (!requestedLog || log) && ranges.contains { $0.min <= p.fps+0.001 && $0.max >= p.fps-0.001 }
   }
 }
 enum NativeCapturePolicy {
-  static func profiles(_ formats: [NativeFormatDescriptor],hdr: Bool) -> [NativeCaptureProfile] {
+  static func profiles(_ formats: [NativeFormatDescriptor],hdr: Bool,log: Bool = false) -> [NativeCaptureProfile] {
     var choices=Set<NativeCaptureProfile>()
-    for f in formats where !hdr || f.hdr {
+    for f in formats where (!hdr || f.hdr) && (!log || f.log) {
       for range in f.ranges {
         let common: [Double] = [24,25,30,48,50,60,90,100,120,144,180,200,240]
         for fps in Set(common+[range.min,range.max]) where fps >= range.min-0.001 && fps <= range.max+0.001 && fps >= 1 {
@@ -36,8 +37,8 @@ enum NativeCapturePolicy {
     }
     return choices.sorted { a,b in a.width*a.height == b.width*b.height ? a.fps < b.fps : a.width*a.height > b.width*b.height }
   }
-  static func select(_ profile: NativeCaptureProfile,hdr: Bool,formats: [NativeFormatDescriptor]) -> Int? {
-    let matches=formats.filter { $0.supports(profile,hdr:hdr) }
+  static func select(_ profile: NativeCaptureProfile,hdr: Bool,formats: [NativeFormatDescriptor],log: Bool = false) -> Int? {
+    let matches=formats.filter { $0.supports(profile,hdr:hdr,log:log) }
     return (matches.first(where: { $0.stabilized }) ?? matches.first)?.index
   }
 }
@@ -50,5 +51,6 @@ struct NativeCaptureMetadata: Codable, Sendable {
   let codec: String
   let lens: String
   let stabilization: String
-  var settings: [String:Any] { ["width":width,"height":height,"frameRate":frameRate,"hdr":hdr,"codec":codec,"lens":lens,"native_stabilization":stabilization] }
+  var colorProfile: String? = nil
+  var settings: [String:Any] { ["width":width,"height":height,"frameRate":frameRate,"hdr":hdr,"codec":codec,"lens":lens,"native_stabilization":stabilization,"color_profile":colorProfile ?? (hdr ? "hlg" : "rec709")] }
 }

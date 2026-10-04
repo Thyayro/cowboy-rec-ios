@@ -17,6 +17,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   private var telemetry: DispatchSourceTimer?
   private var selectedProfile = NativeCaptureProfile.main
   private var requestedHDR = false
+  private var requestedLog = false
+  @Published var logAvailable = false
+  @Published var logEnabled = false
   private var requestedCodec = AVVideoCodecType.hevc
   private var availableDevices: [AVCaptureDevice] = []
   private var rotationAngle: Double = 90
@@ -86,7 +89,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   private func descriptors(_ cam: AVCaptureDevice) -> [NativeFormatDescriptor] {
     cam.formats.enumerated().map { index,f in
       let d=CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-      return NativeFormatDescriptor(index:index,width:Int(d.width),height:Int(d.height),ranges:f.videoSupportedFrameRateRanges.map { NativeFrameRange(min:$0.minFrameRate,max:$0.maxFrameRate) },hdr:f.supportedColorSpaces.contains(.HLG_BT2020),stabilized:f.isVideoStabilizationModeSupported(desired))
+      return NativeFormatDescriptor(index:index,width:Int(d.width),height:Int(d.height),ranges:f.videoSupportedFrameRateRanges.map { NativeFrameRange(min:$0.minFrameRate,max:$0.maxFrameRate) },hdr:f.supportedColorSpaces.contains(.HLG_BT2020),stabilized:f.isVideoStabilizationModeSupported(desired),log:f.supportedColorSpaces.contains(.appleLog))
     }
   }
   private func name(_ cam: AVCaptureDevice) -> String {
@@ -111,7 +114,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     }
     return 1
   }
-  private func configure(cameraID: String? = nil, profile: NativeCaptureProfile? = nil, hdr: Bool? = nil, codec: AVVideoCodecType? = nil, zoom: Double? = nil) throws {
+  private func configure(cameraID: String? = nil, profile: NativeCaptureProfile? = nil, hdr: Bool? = nil, codec: AVVideoCodecType? = nil, log: Bool? = nil, zoom: Double? = nil) throws {
     if availableDevices.isEmpty {
       availableDevices=AVCaptureDevice.DiscoverySession(deviceTypes:[.builtInWideAngleCamera,.builtInUltraWideCamera,.builtInTelephotoCamera,.builtInDualWideCamera,.builtInTripleCamera],mediaType:.video,position:.unspecified).devices
       let choices=availableDevices.map { Lens(id:$0.uniqueID,name:name($0)) }
@@ -119,13 +122,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     }
     let cam = cameraID.flatMap { id in availableDevices.first(where: { $0.uniqueID == id }) } ?? device ?? availableDevices.first(where: { $0.position == .back && $0.deviceType == .builtInWideAngleCamera })
     guard let cam else { throw failure("Câmera indisponível") }
-    let chosen=profile ?? selectedProfile,wantsHDR=hdr ?? requestedHDR
+    let chosen=profile ?? selectedProfile,wantsHDR=hdr ?? requestedHDR,wantsLog=log ?? requestedLog
     let encoding=codec ?? requestedCodec
     let catalog=descriptors(cam)
-    guard let index=NativeCapturePolicy.select(chosen,hdr:wantsHDR,formats:catalog) else {
+    guard let index=NativeCapturePolicy.select(chosen,hdr:wantsHDR,formats:catalog,log:wantsLog) else {
       throw failure("\(name(cam)) não suporta \(chosen.label)\(wantsHDR ? " HDR" : ""). Escolha um formato suportado; a qualidade não foi reduzida.")
     }
-    if wantsHDR && encoding != .hevc { throw failure("HDR exige HEVC; selecione HEVC antes de ativar HDR") }
+    if (wantsHDR || wantsLog) && encoding != .hevc { throw failure("HDR/Log exige HEVC; selecione HEVC antes de ativar HDR") }
     let input=try AVCaptureDeviceInput(device:cam)
     let oldVideo=session.inputs.compactMap { $0 as? AVCaptureDeviceInput }.first(where: { $0.device.hasMediaType(.video) })
     let oldFormat=cam.activeFormat,oldMin=cam.activeVideoMinFrameDuration,oldMax=cam.activeVideoMaxFrameDuration,oldSpace=cam.activeColorSpace
@@ -150,7 +153,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       cam.activeVideoMinFrameDuration=duration;cam.activeVideoMaxFrameDuration=duration
       cam.automaticallyAdjustsVideoHDREnabled=false
       if cam.activeFormat.isVideoHDRSupported { cam.isVideoHDREnabled=wantsHDR }
-      if wantsHDR { cam.activeColorSpace = .HLG_BT2020 }
+      if wantsLog { cam.activeColorSpace = .appleLog }
+      else if wantsHDR { cam.activeColorSpace = .HLG_BT2020 }
       else if cam.activeFormat.supportedColorSpaces.contains(.sRGB) { cam.activeColorSpace = .sRGB }
       let nativeBase=displayBase(cam)
       let relative=zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor/base) : max(1,Double(cam.minAvailableVideoZoomFactor/nativeBase)))
@@ -163,21 +167,22 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       movie.setOutputSettings([AVVideoCodecKey:encoding],for:connection)
       movie.maxRecordedFileSize=256*1024*1024
       zoomObservation?.invalidate()
-      device=cam;base=nativeBase;selectedProfile=chosen;requestedHDR=wantsHDR;requestedCodec=encoding;configured=true
+      device=cam;base=nativeBase;selectedProfile=chosen;requestedHDR=wantsHDR;requestedLog=wantsLog;requestedCodec=encoding;configured=true
       zoomObservation=cam.observe(\.videoZoomFactor,options:[.initial,.new]) { [weak self] cam,_ in
         guard let self else { return };let value=Double(cam.videoZoomFactor/nativeBase)
         self.publish { self.zoom=value }
       }
       let low=Double(cam.minAvailableVideoZoomFactor/nativeBase),high=Double(min(cam.maxAvailableVideoZoomFactor/nativeBase,10))
-      let options=NativeCapturePolicy.profiles(catalog,hdr:wantsHDR)
+      let options=NativeCapturePolicy.profiles(catalog,hdr:wantsHDR,log:wantsLog)
       let hdrOK=catalog.contains { $0.supports(chosen,hdr:true) }
+      let logOK=catalog.contains { $0.supports(chosen,hdr:false,log:true) }
       let codecNames=movie.availableVideoCodecTypes.filter { $0 == .hevc || $0 == .h264 }.map { $0.rawValue }
       let display=name(cam),minimumISO=Double(cam.activeFormat.minISO),maximumISO=Double(cam.activeFormat.maxISO)
       let exposureMinimum=CMTimeGetSeconds(cam.activeFormat.minExposureDuration)
-      let ultraAvailable=cam.position == .back && availableDevices.contains { lens in lens.position == .back && lens.deviceType == .builtInUltraWideCamera && NativeCapturePolicy.select(chosen,hdr:wantsHDR,formats:descriptors(lens)) != nil }
+      let ultraAvailable=cam.position == .back && availableDevices.contains { lens in lens.position == .back && lens.deviceType == .builtInUltraWideCamera && NativeCapturePolicy.select(chosen,hdr:wantsHDR,formats:descriptors(lens),log:wantsLog) != nil }
       publish {
         self.minimumZoom=low;self.maximumZoom=high;self.lensID=cam.uniqueID;self.lensName=display
-        self.profiles=options;self.profileID=chosen.id;self.formatLabel=chosen.label;self.hdrAvailable=hdrOK;self.hdrEnabled=wantsHDR
+        self.profiles=options;self.profileID=chosen.id;self.formatLabel=chosen.label;self.hdrAvailable=hdrOK;self.hdrEnabled=wantsHDR;self.logAvailable=logOK;self.logEnabled=wantsLog
         self.codecs=codecNames;self.codec=encoding.rawValue
         self.torchAvailable=cam.hasTorch;self.torchEnabled=cam.torchMode == .on
         self.canSwitchUltraWide=ultraAvailable
@@ -208,11 +213,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   func selectLens(_ id: String) { reconfigure { try self.configure(cameraID:id) } }
   func selectProfile(_ id: String) {
     reconfigure {
-      guard let cam=self.device,let p=NativeCapturePolicy.profiles(self.descriptors(cam),hdr:self.requestedHDR).first(where: { $0.id == id }) else { throw self.failure("Formato indisponível") }
+      guard let cam=self.device,let p=NativeCapturePolicy.profiles(self.descriptors(cam),hdr:self.requestedHDR,log:self.requestedLog).first(where: { $0.id == id }) else { throw self.failure("Formato indisponível") }
       try self.configure(profile:p)
     }
   }
-  func setHDR(_ enabled: Bool) { reconfigure { try self.configure(hdr:enabled) } }
+  func setHDR(_ enabled: Bool) { reconfigure { try self.configure(hdr:enabled,log:false) } }
+  func setLog(_ enabled: Bool) { reconfigure { try self.configure(hdr:false,log:enabled) } }
   func setCodec(_ value: String) { reconfigure { try self.configure(codec:AVVideoCodecType(rawValue:value)) } }
   func setCaptureAngle(_ angle: Double) {
     queue.async {
@@ -379,7 +385,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       do {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(owner).write(to: file.appendingPathExtension("owner"), options: .atomic)
-        let metadata=NativeCaptureMetadata(width:self.selectedProfile.width,height:self.selectedProfile.height,frameRate:self.selectedProfile.fps,hdr:self.requestedHDR,codec:self.requestedCodec.rawValue,lens:self.device.map { self.name($0) } ?? "Câmera",stabilization:Self.label(self.movie.connection(with:.video)?.activeVideoStabilizationMode ?? .off))
+        let metadata=NativeCaptureMetadata(width:self.selectedProfile.width,height:self.selectedProfile.height,frameRate:self.selectedProfile.fps,hdr:self.requestedHDR,codec:self.requestedCodec.rawValue,lens:self.device.map { self.name($0) } ?? "Câmera",stabilization:Self.label(self.movie.connection(with:.video)?.activeVideoStabilizationMode ?? .off),colorProfile:self.requestedLog ? "applelog" : self.requestedHDR ? "hlg" : "rec709")
         try JSONEncoder().encode(metadata).write(to:file.appendingPathExtension("capture"),options:.atomic)
       } catch { self.publish { self.status = error.localizedDescription }; return }
       self.outputURL = file
