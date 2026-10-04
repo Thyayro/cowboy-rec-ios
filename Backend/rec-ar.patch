@@ -1,0 +1,59 @@
+--- a/server/rec.js
++++ b/server/rec.js
+@@ -124,7 +124,8 @@
+ }
+ const json = (res, code, o) => { const b = Buffer.from(JSON.stringify(o)); res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': b.length }); res.end(b); };
+ // arquivos que acompanham a tomada (sufixo no nome do arquivo de vídeo)
+-const SIDE = { gcsv: '.gcsv', ori: '.ori.csv', cube: '.cube', space: '.space.json', thumb: '.thumb.jpg' };
++const ARTracking = require('./ar-tracking');
++const SIDE = { ar: '.ar.json', gcsv: '.gcsv', ori: '.ori.csv', cube: '.cube', space: '.space.json', thumb: '.thumb.jpg' };
+ // NOME AUTOMÁTICO (gravação sem nome): primeiro nome de quem gravou + dia/hora de Brasília — "Carlos · 30/09 22:56".
+ // Arquivo baixado: "Carlos_30-09_22h56_t1.mp4" (curto, sem código interno).
+ const firstName = (name, email) => String(name || String(email || '').split('@')[0].replace(/[._-]+/g, ' ')).trim().split(/\s+/)[0].replace(/^./, c => c.toUpperCase()) || 'Gravação';
+@@ -138,7 +139,7 @@
+   return { ...S, title: titleOf(S), auto_title: !S.title, takes: S.takes.map(k => {
+     const base = `/api/rec/file/${S.id}/`, f = path.join(DIR, S.id, k.file), side = {};
+     for (const [n, suf] of Object.entries(SIDE)) if (fs.existsSync(f + suf)) side[n] = base + k.file + suf;
+-    if (fs.existsSync(f + '.ori.csv')) side.blender = `/api/rec/blender/${S.id}/${k.file}`;
++    if (fs.existsSync(f + '.ori.csv') || fs.existsSync(f + '.ar.json')) side.blender = `/api/rec/blender/${S.id}/${k.file}`;
+     if (k.kind === 'photo') side.thumb = base + k.file;
+     if (k.orig_file && fs.existsSync(path.join(DIR, S.id, k.orig_file))) side.orig = base + k.orig_file;
+     if (k.stabilization && k.stabilization.original_file && fs.existsSync(path.join(DIR, S.id, k.stabilization.original_file))) side.unstabilized = base + k.stabilization.original_file;
+@@ -232,7 +233,7 @@
+       if (!k2 || k2.trashed || !outOk) { try { fs.unlinkSync(tmp); } catch {} if (k2) patchTake(sid, takeId, x => { x.conv = { state: code === null || code === 255 ? 'cancelada' : 'falhou', mode, err: err.trim().split('\n').pop() || 'ffmpeg ' + code }; }); return done(); }
+       const m2 = probe(tmp); if (!m2 || !m2.dur || (dur && m2.dur < dur * 0.97)) { try { fs.unlinkSync(tmp); } catch {} patchTake(sid, takeId, x => { x.conv = { state: 'falhou', mode, err: `saída incompleta (${m2 && m2.dur}s de ${dur}s)` }; }); return done(); }
+       const out = path.join(dir, outName); if (out !== f && fs.existsSync(out)) { try { fs.unlinkSync(out); } catch {} }
+-      fs.renameSync(tmp, out); try { fs.unlinkSync(f + '.thumb.jpg'); } catch {}
++      fs.renameSync(tmp, out); for (const suffix of Object.values(SIDE)) if (suffix !== '.thumb.jpg' && fs.existsSync(f+suffix) && out!==f) fs.copyFileSync(f+suffix,out+suffix); try { fs.unlinkSync(f + '.thumb.jpg'); } catch {}
+       await ff(['-ss', '0.3', '-i', out, '-frames:v', '1', '-vf', 'scale=360:-2', '-q:v', '4', out + '.thumb.jpg']);
+       const oldFile = k2.file, oldBytes = k2.bytes;
+       if (mode !== 'keep' && out !== f) { for (const suf of ['', '.n']) { try { fs.unlinkSync(f + suf); } catch {} } }
+@@ -435,7 +436,7 @@
+   let dur = 0; try { dur = parseFloat(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f]).stdout.toString()) || 0; } catch {}
+   patchTake(sid, takeId, x => { x.post = 'pronto'; if (dur && !x.duration_ms) x.duration_ms = Math.round(dur * 1000); });
+   // cor do arquivo: LOG/HDR importado entra sozinho na fila de conversão (escolha feita na importação; padrão = substituir)
+-  const m = probe(f); const cin = colorIn(m);
++  const m = probe(f); const cin = k.settings?.color_profile === 'applelog' ? 'applelog' : colorIn(m);
+   const k2 = patchTake(sid, takeId, x => { x.media = m; x.colorin = cin; x.color = COLOR_L[cin] || null; });
+   if (k2 && (cin === 'applelog' || cin === 'hlg') && k2.convert !== 'none' && (k2.convert || cin === 'applelog')) enqueueConv(sid, takeId, k2.convert || 'replace');
+   else if (k2) readyForPlayback(sid, takeId);
+@@ -601,6 +602,7 @@
+     const b = await body(req, kind === 'thumb' ? 4e5 : 20e6); const f = path.join(DIR, S.id, k.file + suf);
+     // miniatura do celular (quadro do início): a galeria já mostra antes do ffmpeg; nunca troca a do servidor
+     if (kind === 'thumb') { if (b[0] !== 0xff || b[1] !== 0xd8 || fs.existsSync(f)) return json(res, 200, { ok: true, kept: true }); fs.writeFileSync(f, b); return json(res, 200, { ok: true }); }
++    if (kind === 'ar') { try { ARTracking.validate(JSON.parse(b.toString())); } catch(e) { return json(res,400,{error:e.message}); } }
+     if (u.query.append) fs.appendFileSync(f, b); else fs.writeFileSync(f, b);
+     return json(res, 200, { ok: true });
+   }
+@@ -632,8 +634,9 @@
+   if (p.startsWith('/api/rec/blender/')) {
+     const [sid, file] = p.slice('/api/rec/blender/'.length).split('/');
+     const S = readSession(clean(sid)); const k = S && S.takes.find(x => x.file === file);
+-    if (!k || !fs.existsSync(path.join(DIR, S.id, k.file + '.ori.csv'))) return json(res, 404, { error: 'tomada sem dados de orientação' });
+-    const txt = blenderScript(S, k);
++    if (!k || (!fs.existsSync(path.join(DIR, S.id, k.file + '.ori.csv')) && !fs.existsSync(path.join(DIR, S.id, k.file + '.ar.json')))) return json(res, 404, { error: 'tomada sem dados de orientação/AR' });
++    const ar=path.join(DIR, S.id, k.file + '.ar.json');
++    const txt = fs.existsSync(ar) ? ARTracking.blender(JSON.parse(fs.readFileSync(ar,'utf8')),k.file) : blenderScript(S, k);
+     res.writeHead(200, { 'Content-Type': 'text/x-python; charset=utf-8', 'Content-Disposition': `attachment; filename="camera3d_${S.id}_${k.file.replace(/\.\w+$/, '')}.py"`, 'Cache-Control': 'no-store' });
+     return res.end(txt);
+   }
