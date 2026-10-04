@@ -200,7 +200,7 @@ struct CameraPreview: UIViewRepresentable {
     var preview: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
   }
   func makeUIView(context: Context) -> Surface {
-    let view = Surface(); view.preview.session = camera.session; view.preview.videoGravity = .resizeAspect; return view
+    let view = Surface(); view.preview.session = camera.session; view.preview.videoGravity = .resizeAspectFill; return view
   }
   func updateUIView(_ view: Surface, context: Context) {
     if let connection = view.preview.connection {

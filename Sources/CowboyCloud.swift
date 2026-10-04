@@ -36,6 +36,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
   func refresh() async {
     let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
     cookie = cookies.filter { $0.name == "ce_sess" && $0.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")) == Self.origin.host }.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    guard !cookie.isEmpty else { email = nil; status = "Entre com a mesma conta usada no Rec web"; return }
     do {
       let me = try await request("/api/me", cookie: cookie)
       guard let owner = me["email"] as? String, !owner.isEmpty else { throw CloudError.message("Faça login no Cowboy") }
@@ -120,25 +121,92 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     let session = URLSession(configuration: configuration, delegate: CowboyNoRedirect(), delegateQueue: nil)
     defer { session.invalidateAndCancel() }
     let (body, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), http.url?.host == Self.origin.host,
-      let result = try JSONSerialization.jsonObject(with: body) as? [String: Any] else { throw CloudError.message("Falha no envio ou login expirado") }
+    guard let http = response as? HTTPURLResponse else { throw CloudError.message("Servidor sem resposta") }
+    if http.statusCode == 401 || (300..<400).contains(http.statusCode) { throw CloudError.message("Entre novamente na conta Cowboy pelo app") }
+    let result = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+    guard (200..<300).contains(http.statusCode), http.url?.host == Self.origin.host, let result else {
+      throw CloudError.message(result?["error"] as? String ?? "Servidor retornou HTTP \(http.statusCode)")
+    }
     return result
   }
 }
 
+enum CowboyPortal: String, Identifiable {
+  case account, rec, library
+  var id: String { rawValue }
+  var title: String { self == .account ? "Conta Cowboy" : self == .library ? "Biblioteca da VPS" : "Rec completo" }
+}
+
 struct CowboyAccountView: UIViewRepresentable {
-  func makeCoordinator() -> Coordinator { Coordinator() }
+  var destination: CowboyPortal = .account
+  func makeCoordinator() -> Coordinator { Coordinator(destination: destination) }
   func makeUIView(context: Context) -> WKWebView {
-    let web = WKWebView()
+    let config = WKWebViewConfiguration()
+    config.websiteDataStore = .default()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    if destination == .library {
+      // Uses the real Rec library, including its account permissions and actions.
+      let script = "let attempts=0;const open=setInterval(()=>{const b=document.getElementById('libbtn');if(b){clearInterval(open);b.click();}else if(++attempts>100)clearInterval(open);},100);"
+      config.userContentController.addUserScript(WKUserScript(source: script,injectionTime: .atDocumentEnd,forMainFrameOnly: true))
+    }
+    let web = WKWebView(frame: .zero,configuration: config)
     web.navigationDelegate = context.coordinator
-    web.load(URLRequest(url: CowboyCloud.origin.appendingPathComponent("studio")))
+    web.uiDelegate = context.coordinator
+    web.isOpaque = false
+    web.backgroundColor = .black
+    web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.load(URLRequest(url: CowboyCloud.origin.appendingPathComponent(destination == .account ? "login" : "rec")))
     return web
   }
   func updateUIView(_ uiView: WKWebView, context: Context) {}
-  final class Coordinator: NSObject, WKNavigationDelegate {
+  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+    let destination: CowboyPortal
+    private var downloads: [ObjectIdentifier: URL] = [:]
+    init(destination: CowboyPortal) { self.destination=destination }
+    @MainActor func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+      Task { await CowboyCloud.shared.refresh() }
+      if destination == .account, webView.url?.path != "/login" {
+        // Login is shared with uploads; the same account sees its VPS recordings.
+        if webView.url?.path != "/rec" { webView.load(URLRequest(url: CowboyCloud.origin.appendingPathComponent("rec"))) }
+      }
+    }
     @MainActor func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
       let url = navigationAction.request.url
-      decisionHandler(url?.scheme == "https" && url?.host == CowboyCloud.origin.host ? .allow : .cancel)
+      guard url?.host == CowboyCloud.origin.host && url?.scheme == "https" || url?.scheme == "blob" else { decisionHandler(.cancel); return }
+      decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
+    }
+    @MainActor func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+      let attachment = (navigationResponse.response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition")?.lowercased().contains("attachment") == true
+      decisionHandler(attachment || !navigationResponse.canShowMIMEType ? .download : .allow)
+    }
+    @MainActor func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) { download.delegate=self }
+    @MainActor func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) { download.delegate=self }
+    @MainActor func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+      let directory=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+      do {
+        try FileManager.default.createDirectory(at: directory,withIntermediateDirectories: true)
+        let file=directory.appendingPathComponent((suggestedFilename as NSString).lastPathComponent)
+        downloads[ObjectIdentifier(download)]=file; completionHandler(file)
+      } catch { completionHandler(nil) }
+    }
+    @MainActor func downloadDidFinish(_ download: WKDownload) {
+      guard let file=downloads.removeValue(forKey: ObjectIdentifier(download)),
+        let scene=UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
+        var controller=scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else { return }
+      while let presented=controller.presentedViewController { controller=presented }
+      controller.present(UIActivityViewController(activityItems: [file],applicationActivities: nil),animated: true)
+    }
+    @MainActor func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+      downloads.removeValue(forKey: ObjectIdentifier(download))
+      CowboyCloud.shared.status="Download interrompido: \(error.localizedDescription)"
+    }
+    @MainActor func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+      decisionHandler(origin.protocol == "https" && origin.host == CowboyCloud.origin.host ? .prompt : .deny)
+    }
+    @MainActor func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+      if navigationAction.targetFrame == nil, let url=navigationAction.request.url, url.host == CowboyCloud.origin.host { webView.load(navigationAction.request) }
+      return nil
     }
   }
 }
