@@ -45,7 +45,7 @@ final class NativeARCamera: NSObject, ObservableObject, ARSessionDelegate, AVCap
           }
           let options=ARWorldTrackingConfiguration.supportedVideoFormats
           guard let format=options.filter({$0.framesPerSecond>=60}).max(by:{$0.imageResolution.width*$0.imageResolution.height<$1.imageResolution.width*$1.imageResolution.height}) ?? options.max(by:{$0.imageResolution.width*$0.imageResolution.height<$1.imageResolution.width*$1.imageResolution.height}) else { throw self.error("Sem formato AR disponível") }
-          let config=ARWorldTrackingConfiguration();config.videoFormat=format;config.planeDetection=[.horizontal];config.isVideoHDREnabled=false
+          let config=ARWorldTrackingConfiguration();config.videoFormat=format;config.planeDetection=[.horizontal];config.videoHDRAllowed=false
           self.fps=format.framesPerSecond;self.width=Int(format.imageResolution.width);self.height=Int(format.imageResolution.height)
           self.session.delegate=self;self.session.delegateQueue=self.queue;self.session.run(config,options:[.resetTracking,.removeExistingAnchors])
           self.publish { self.formatLabel="AR \(self.width)×\(self.height) · \(self.fps) fps";self.floorSelected=false }
@@ -141,7 +141,7 @@ final class NativeARCamera: NSObject, ObservableObject, ARSessionDelegate, AVCap
       else { self.status="Captura interrompida preservada: \(writer.error?.localizedDescription ?? "erro")" }
     } }
   }
-  func close() { queue.async { self.finish();self.session.pause();if self.audioSession.isRunning { self.audioSession.stopRunning() };self.publish { self.ready=false } } }
+  func close(_ completion: (@Sendable () -> Void)? = nil) { queue.async { self.finish();self.session.pause();if self.audioSession.isRunning { self.audioSession.stopRunning() };self.publish { self.ready=false;completion?() } } }
   func session(_ session:ARSession,didFailWithError error:Error) { queue.async { self.finish();self.publish { self.status=error.localizedDescription;self.ready=false } } }
   func sessionWasInterrupted(_ session:ARSession) { queue.async { self.finish();self.publish { self.ready=false;self.status="AR interrompido; capture novamente ao voltar" } } }
 }
@@ -191,7 +191,7 @@ struct NativeARRecorderView:View {
     ZStack {
       NativeARPreview(camera:camera).ignoresSafeArea()
       VStack {
-        HStack { Text(camera.formatLabel).font(.headline);Spacer();Button("Câmera cinema") { camera.close();dismiss() }.disabled(camera.recording || camera.finishing) }.padding().background(.black.opacity(0.7))
+        HStack { Text(camera.formatLabel).font(.headline);Spacer();Button("Câmera cinema") { camera.close { Task { @MainActor in dismiss() } } }.disabled(camera.recording || camera.finishing) }.padding().background(.black.opacity(0.7))
         Spacer()
         VStack(spacing:12) {
           Text("\(camera.tracking) · \(camera.planeCount) planos").font(.caption)

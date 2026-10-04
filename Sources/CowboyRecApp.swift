@@ -92,7 +92,7 @@ struct RecorderView: View {
             Section("Espaço 3D") {
               Button("Chão 3D / rastreamento ARKit") {
                 settings=false
-                DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { camera.close { arPresentation=true } }
+                DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { camera.close { Task { @MainActor in arPresentation=true } } }
               }.disabled(camera.recording || camera.finishing)
               Text("Modo AR com vídeo e poses 3D sincronizados. Usa os formatos do ARKit; não usa Apple Log nem a estabilização cinematográfica.").font(.caption2)
             }
@@ -121,6 +121,7 @@ struct RecorderView: View {
             try cloud.enqueue(file,owner: owner)
             try? FileManager.default.removeItem(at: file.appendingPathExtension("owner"))
             try? FileManager.default.removeItem(at: file.appendingPathExtension("capture"))
+            try? FileManager.default.removeItem(at: file.appendingPathExtension("ar"))
             try? FileManager.default.removeItem(at: file)
             camera.recoverableFile=nil
           } catch { camera.recoverableFile=file; camera.status="Vídeo preservado: \(error.localizedDescription)" }
@@ -130,7 +131,7 @@ struct RecorderView: View {
       }
       .onChange(of: phase) { _,value in
         if value != .active { camera.close() }
-        else if portal == nil { camera.start(); Task { await cloud.refresh() } }
+        else if portal == nil && !arPresentation { camera.start(); Task { await cloud.refresh() } }
       }
   }
   private func open(_ destination: CowboyPortal) { camera.close(); portal=destination }
