@@ -1,0 +1,25 @@
+name: Build iPhone unsigned
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate project
+        run: brew install xcodegen && xcodegen generate
+      - name: Build native camera
+        run: xcodebuild -project CowboyRec.xcodeproj -scheme CowboyRec -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package unsigned IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/CowboyRec.app Payload/
+          zip -qr CowboyRec-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CowboyRec-unsigned
+          path: CowboyRec-unsigned.ipa
+          retention-days: 3
