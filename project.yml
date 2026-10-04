@@ -14,8 +14,8 @@ settings:
     INFOPLIST_KEY_UILaunchScreen_Generation: YES
     INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
     INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-    MARKETING_VERSION: "0.3.1"
-    CURRENT_PROJECT_VERSION: "5"
+    MARKETING_VERSION: "0.4.0"
+    CURRENT_PROJECT_VERSION: "6"
 targets:
   CowboyRec:
     type: application

@@ -33,3 +33,6 @@ if icon.exists():
     assert 'ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon' in config
     assert 'INFOPLIST_KEY_CFBundleDisplayName: "Cowboy Rec"' in config
 print('PASS source structure: native camera/ramp, 4K60 checks, queue ownership/receipt, no duplicate stabilization, no glasses dependency or embedded credentials. Not a Swift compilation.')
+
+app=(root/"Sources/CowboyRecApp.swift").read_text(encoding="utf-8-sig")
+assert "NativeCameraSettings(camera:camera" in app, "Native settings must be rendered in the app"

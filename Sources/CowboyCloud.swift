@@ -25,6 +25,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     var session: String?
     var take: String?
     var capture: NativeCaptureMetadata?
+    var hasAR: Bool? = nil
   }
   enum CloudError: LocalizedError {
     case message(String)
@@ -54,8 +55,12 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     let video = directory.appendingPathComponent(cid + ".mov")
     try FileManager.default.copyItem(at: source, to: video)
     let capture=(try? Data(contentsOf:source.appendingPathExtension("capture"))).flatMap { try? JSONDecoder().decode(NativeCaptureMetadata.self,from:$0) }
-    do { try save(Pending(owner: owner, cid: cid,capture:capture), at: directory.appendingPathComponent(cid + ".json")) }
-    catch { try? FileManager.default.removeItem(at: video); throw error }
+    let hasAR=FileManager.default.fileExists(atPath:source.appendingPathExtension("ar").path)
+    do {
+      if hasAR { try FileManager.default.copyItem(at:source.appendingPathExtension("ar"),to:directory.appendingPathComponent(cid+".ar.json")) }
+      try save(Pending(owner: owner, cid: cid,capture:capture,hasAR:hasAR), at: directory.appendingPathComponent(cid + ".json"))
+    }
+    catch { try? FileManager.default.removeItem(at: video);try? FileManager.default.removeItem(at:directory.appendingPathComponent(cid+".ar.json")); throw error }
     queueRevision += 1
     status = "Vídeo salvo no iPhone; aguardando envio"
     Task { await resume() }
@@ -83,7 +88,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
           item.session = id; try save(item, at: metadata)
         }
         if item.take == nil {
-          let result = try await request("/api/rec/take", method: "POST", json: ["session": item.session!, "cid": item.cid, "label": item.capture?.lens ?? "Câmera do iPhone", "mime": "video/quicktime", "convert": "none", "settings": item.capture?.settings ?? [:], "stabilization": ["enabled": false]], cookie: credential)
+          let result = try await request("/api/rec/take", method: "POST", json: ["session": item.session!, "cid": item.cid, "label": item.capture?.lens ?? "Câmera do iPhone", "mime": "video/quicktime", "convert": item.capture?.convertRec709 == true ? "keep" : "none", "settings": item.capture?.settings ?? [:], "stabilization": ["enabled": false]], cookie: credential)
           guard let id = result["take"] as? String else { throw CloudError.message("Resposta de gravação inválida") }
           item.take = id; try save(item, at: metadata)
         }
@@ -104,12 +109,18 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
           guard let acknowledged = result["next"] as? Int, acknowledged == next + 1 else { throw CloudError.message("Servidor não confirmou o trecho") }
           next = acknowledged
         }
+        if item.hasAR == true {
+          let data=try Data(contentsOf:directory.appendingPathComponent(item.cid+".ar.json"))
+          let receipt=try await request("/api/rec/side?take=\(item.take!)&kind=ar",method:"PUT",data:data,cookie:credential)
+          guard receipt["ok"] as? Bool == true else { throw CloudError.message("Servidor não confirmou as poses AR") }
+        }
         let duration=try? await AVURLAsset(url:video).load(.duration)
         let milliseconds=duration.flatMap { $0.seconds.isFinite ? Int($0.seconds*1000) : nil } ?? 0
         let result = try await request("/api/rec/stop", method: "POST", json: ["take": item.take!, "chunks": count, "duration_ms": milliseconds, "reason": "iPhone AVFoundation"], cookie: credential)
         guard result["status"] as? String == "done", result["bytes"] as? Int == size else { throw CloudError.message("Servidor não confirmou o vídeo completo") }
         try FileManager.default.removeItem(at: metadata)
         try FileManager.default.removeItem(at: video)
+        if item.hasAR == true { try? FileManager.default.removeItem(at:directory.appendingPathComponent(item.cid+".ar.json")) }
       }
       status = "Envios concluídos · \(owner)"
       if queueRevision != revision { Task { await resume() } }

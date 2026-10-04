@@ -20,6 +20,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   private var requestedLog = false
   @Published var logAvailable = false
   @Published var logEnabled = false
+  @Published var convertRec709 = true
   private var requestedCodec = AVVideoCodecType.hevc
   private var availableDevices: [AVCaptureDevice] = []
   private var rotationAngle: Double = 90
@@ -378,6 +379,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     }
   }
   func record(owner: String) {
+    let convert=convertRec709
     queue.async {
       guard self.configured, self.session.isRunning, !self.movie.isRecording, self.outputURL == nil else { return }
       self.owner = owner
@@ -386,7 +388,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       do {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(owner).write(to: file.appendingPathExtension("owner"), options: .atomic)
-        let metadata=NativeCaptureMetadata(width:self.selectedProfile.width,height:self.selectedProfile.height,frameRate:self.selectedProfile.fps,hdr:self.requestedHDR,codec:self.requestedCodec.rawValue,lens:self.device.map { self.name($0) } ?? "Câmera",stabilization:Self.label(self.movie.connection(with:.video)?.activeVideoStabilizationMode ?? .off),colorProfile:self.requestedLog ? "applelog" : self.requestedHDR ? "hlg" : "rec709")
+        let metadata=NativeCaptureMetadata(width:self.selectedProfile.width,height:self.selectedProfile.height,frameRate:self.selectedProfile.fps,hdr:self.requestedHDR,codec:self.requestedCodec.rawValue,lens:self.device.map { self.name($0) } ?? "Câmera",stabilization:Self.label(self.movie.connection(with:.video)?.activeVideoStabilizationMode ?? .off),colorProfile:self.requestedLog ? "applelog" : self.requestedHDR ? "hlg" : "rec709",convertRec709:convert,captureMode:"avfoundation")
         try JSONEncoder().encode(metadata).write(to:file.appendingPathExtension("capture"),options:.atomic)
       } catch { self.publish { self.status = error.localizedDescription }; return }
       self.outputURL = file
@@ -414,7 +416,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     }
   }
   func stopRecording() { queue.async { if self.movie.isRecording { self.publish { self.finishing = true }; self.movie.stopRecording() } } }
-  func close() { queue.async { self.telemetry?.cancel();self.telemetry=nil; if self.movie.isRecording { self.movie.stopRecording() }; if self.session.isRunning { self.session.stopRunning() }; self.publish { self.ready = false } } }
+  func close(_ completion: (@Sendable () -> Void)? = nil) { queue.async { self.telemetry?.cancel();self.telemetry=nil; if self.movie.isRecording { self.movie.stopRecording() }; if self.session.isRunning { self.session.stopRunning() }; self.publish { self.ready = false;completion?() } } }
   func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
     publish { self.recording = true; self.finishing = false }
   }

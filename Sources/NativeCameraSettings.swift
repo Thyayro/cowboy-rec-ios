@@ -16,6 +16,8 @@ struct NativeCameraSettings: View {
         Toggle("HDR (HLG)",isOn:Binding(get:{camera.hdrEnabled},set:{camera.setHDR($0)})).disabled(configuringDisabled || !camera.hdrAvailable)
         Toggle("Apple Log",isOn:Binding(get:{camera.logEnabled},set:{camera.setLog($0)})).disabled(configuringDisabled || !camera.logAvailable)
         if !camera.logAvailable { Text("Apple Log não está disponível neste aparelho/lente em \(camera.formatLabel). HDR não é Log.").font(.caption2) }
+        Toggle("Rec.709 na VPS (preservar original)",isOn:$camera.convertRec709).disabled(configuringDisabled)
+        Text("Captura o Log/HDR original. Ao finalizar o envio, a VPS cria Rec.709 na mesma resolução e FPS; o original permanece disponível. A prévia da câmera não recebe LUT.").font(.caption2)
         Picker("Codec",selection:Binding(get:{camera.codec},set:{camera.setCodec($0)})) {
           ForEach(camera.codecs,id:\.self) { codec in Text(codec == "hvc1" ? "HEVC" : codec == "avc1" ? "H.264" : codec).tag(codec) }
         }.disabled(configuringDisabled || camera.hdrEnabled || camera.logEnabled)

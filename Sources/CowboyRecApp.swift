@@ -10,6 +10,7 @@ struct RecorderView: View {
   @State private var portalControl = CowboyPortalControl()
   @State private var captureWarning = false
   @State private var settings = false
+  @State private var arPresentation = false
   @State private var strength = 3
   @State private var zoom: Double = 1
   @State private var zoomEditing = false
@@ -24,7 +25,7 @@ struct RecorderView: View {
       VStack(spacing: 0) {
         HStack {
           VStack(alignment: .leading,spacing: 3) {
-            Text("COWBOY REC · 0.3.1").font(.headline).tracking(2)
+            Text("COWBOY REC · 0.4.0").font(.headline).tracking(2)
             Text("4K · 60 FPS · \(NativeCamera.label(camera.activeMode))").font(.caption2)
           }
           Spacer()
@@ -73,7 +74,7 @@ struct RecorderView: View {
       }) { destination in
         VStack(spacing:0) {
           HStack {
-            Text("Cowboy Rec · app nativo 0.3.1").font(.caption.weight(.bold))
+            Text("Cowboy Rec · app nativo 0.4.0").font(.caption.weight(.bold))
             Spacer()
             Button("Câmera 4K/60") {
               Task { if await portalControl.canReturnToCamera() { portal=nil } else { captureWarning=true } }
@@ -87,6 +88,14 @@ struct RecorderView: View {
       .sheet(isPresented: $settings) {
         NavigationStack {
           Form {
+            NativeCameraSettings(camera:camera,configuringDisabled:camera.recording || camera.finishing || !camera.ready)
+            Section("Espaço 3D") {
+              Button("Chão 3D / rastreamento ARKit") {
+                settings=false
+                DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { camera.close { arPresentation=true } }
+              }.disabled(camera.recording || camera.finishing)
+              Text("Modo AR com vídeo e poses 3D sincronizados. Usa os formatos do ARKit; não usa Apple Log nem a estabilização cinematográfica.").font(.caption2)
+            }
             Section("Câmera nativa") {
               Picker("Estabilização",selection: $strength) {
                 Text("Desligada").tag(0); Text("Standard").tag(1); Text("Cinematic").tag(2); Text("Forte").tag(3)
@@ -105,6 +114,7 @@ struct RecorderView: View {
           }.navigationTitle("Configurações").toolbar { Button("OK") { settings=false } }
         }.presentationDetents([.medium,.large])
       }
+      .fullScreenCover(isPresented:$arPresentation,onDismiss:{ camera.start() }) { NativeARRecorderView() }
       .task {
         camera.onSaved = { file,owner in
           do {

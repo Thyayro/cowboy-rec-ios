@@ -52,5 +52,7 @@ struct NativeCaptureMetadata: Codable, Sendable {
   let lens: String
   let stabilization: String
   var colorProfile: String? = nil
+  var convertRec709: Bool? = nil
+  var captureMode: String? = nil
   var settings: [String:Any] { ["width":width,"height":height,"frameRate":frameRate,"hdr":hdr,"codec":codec,"lens":lens,"native_stabilization":stabilization,"color_profile":colorProfile ?? (hdr ? "hlg" : "rec709")] }
 }
