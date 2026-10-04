@@ -14,6 +14,42 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   private var recovering = Set<URL>()
   private var owner: String?
   private var outputURL: URL?
+  private var telemetry: DispatchSourceTimer?
+  private var selectedProfile = NativeCaptureProfile.main
+  private var requestedHDR = false
+  private var requestedCodec = AVVideoCodecType.hevc
+  private var availableDevices: [AVCaptureDevice] = []
+  struct Lens: Identifiable, Sendable { let id: String; let name: String }
+  @Published var lenses: [Lens] = []
+  @Published var lensID = ""
+  @Published var lensName = "Principal 1×"
+  @Published var profiles: [NativeCaptureProfile] = []
+  @Published var profileID = NativeCaptureProfile.main.id
+  @Published var formatLabel = "Aguardando câmera"
+  @Published var hdrAvailable = false
+  @Published var hdrEnabled = false
+  @Published var codecs: [String] = []
+  @Published var codec = "hevc"
+  @Published var torchAvailable = false
+  @Published var torchEnabled = false
+  @Published var canSwitchUltraWide = false
+  @Published var focusAvailable = false
+  @Published var manualFocus = false
+  @Published var lensPosition: Double = 0
+  @Published var exposureAvailable = false
+  @Published var manualExposure = false
+  @Published var iso: Double = 100
+  @Published var minISO: Double = 20
+  @Published var maxISO: Double = 2000
+  @Published var shutter: Double = 120
+  @Published var minShutter: Double = 60
+  @Published var maxShutter: Double = 8000
+  @Published var exposureBias: Double = 0
+  @Published var minExposureBias: Double = -2
+  @Published var maxExposureBias: Double = 2
+  @Published var whiteBalanceAvailable = false
+  @Published var manualWhiteBalance = false
+  @Published var temperature: Double = 5000
   private var desired = AVCaptureVideoStabilizationMode.cinematicExtended
   @Published var status = "Câmera aguardando permissão"
   @Published var ready = false
@@ -37,61 +73,174 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
           if !self.configured { try self.configure() }
           if !self.session.isRunning { self.session.startRunning() }
           self.configureStabilization()
+          self.startTelemetry()
           self.publish { self.ready = true }
         } catch { self.publish { self.status = error.localizedDescription } }
       }
     }
   }
   private func publish(_ action: @escaping @Sendable () -> Void) { DispatchQueue.main.async(execute: action) }
-  private func configure() throws {
-    let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInDualWideCamera, .builtInWideAngleCamera], mediaType: .video, position: .back)
-    guard let cam = discovery.devices.first(where: { $0.deviceType == .builtInDualWideCamera }) ?? discovery.devices.first,
-      let mic = AVCaptureDevice.default(for: .audio) else { throw failure("Câmera ou microfone indisponível") }
-    let videoInput = try AVCaptureDeviceInput(device: cam), audioInput = try AVCaptureDeviceInput(device: mic)
-    session.beginConfiguration()
-    defer {
-      if !configured { session.inputs.forEach(session.removeInput); session.outputs.forEach(session.removeOutput) }
-      session.commitConfiguration()
+  private func descriptors(_ cam: AVCaptureDevice) -> [NativeFormatDescriptor] {
+    cam.formats.enumerated().map { index,f in
+      let d=CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+      return NativeFormatDescriptor(index:index,width:Int(d.width),height:Int(d.height),ranges:f.videoSupportedFrameRateRanges.map { NativeFrameRange(min:$0.minFrameRate,max:$0.maxFrameRate) },hdr:f.supportedColorSpaces.contains(.HLG_BT2020),stabilized:f.isVideoStabilizationModeSupported(desired))
     }
-    guard session.canAddInput(videoInput), session.canAddInput(audioInput) else { throw failure("Entradas da câmera indisponíveis") }
-    session.addInput(videoInput); session.addInput(audioInput)
-    guard session.canAddOutput(movie) else { throw failure("Gravação nativa indisponível") }
-    session.addOutput(movie)
-    session.sessionPreset = .inputPriority
+  }
+  private func name(_ cam: AVCaptureDevice) -> String {
+    if cam.position == .front { return "Frontal" }
+    switch cam.deviceType {
+    case .builtInWideAngleCamera: return "Principal 1×"
+    case .builtInUltraWideCamera: return "Ultra-angular 0,5×"
+    case .builtInTelephotoCamera: return "Teleobjetiva"
+    default: return "Traseira automática"
+    }
+  }
+  private func displayBase(_ cam: AVCaptureDevice) -> CGFloat {
+    if cam.deviceType == .builtInUltraWideCamera { return 2 }
+    if cam.isVirtualDevice && cam.constituentDevices.contains(where: { $0.deviceType == .builtInUltraWideCamera }) {
+      return CGFloat(cam.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue ?? 2)
+    }
+    if cam.deviceType == .builtInTelephotoCamera,
+      let virtual=availableDevices.first(where: { $0.deviceType == .builtInTripleCamera }),
+      let last=virtual.virtualDeviceSwitchOverVideoZoomFactors.last?.doubleValue {
+      let main=virtual.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue ?? 2
+      return CGFloat(main/last)
+    }
+    return 1
+  }
+  private func configure(cameraID: String? = nil, profile: NativeCaptureProfile? = nil, hdr: Bool? = nil, codec: AVVideoCodecType? = nil, zoom: Double? = nil) throws {
+    if availableDevices.isEmpty {
+      availableDevices=AVCaptureDevice.DiscoverySession(deviceTypes:[.builtInWideAngleCamera,.builtInUltraWideCamera,.builtInTelephotoCamera,.builtInDualWideCamera,.builtInTripleCamera],mediaType:.video,position:.unspecified).devices
+      let choices=availableDevices.map { Lens(id:$0.uniqueID,name:name($0)) }
+      publish { self.lenses=choices }
+    }
+    let cam = cameraID.flatMap { id in availableDevices.first(where: { $0.uniqueID == id }) } ?? device ?? availableDevices.first(where: { $0.position == .back && $0.deviceType == .builtInWideAngleCamera })
+    guard let cam else { throw failure("Câmera indisponível") }
+    let chosen=profile ?? selectedProfile,wantsHDR=hdr ?? requestedHDR
+    let encoding=codec ?? requestedCodec
+    let catalog=descriptors(cam)
+    guard let index=NativeCapturePolicy.select(chosen,hdr:wantsHDR,formats:catalog) else {
+      throw failure("\(name(cam)) não suporta \(chosen.label)\(wantsHDR ? " HDR" : ""). Escolha um formato suportado; a qualidade não foi reduzida.")
+    }
+    if wantsHDR && encoding != .hevc { throw failure("HDR exige HEVC; selecione HEVC antes de ativar HDR") }
+    let input=try AVCaptureDeviceInput(device:cam)
+    let oldVideo=session.inputs.compactMap { $0 as? AVCaptureDeviceInput }.first(where: { $0.device.hasMediaType(.video) })
+    let oldFormat=cam.activeFormat,oldMin=cam.activeVideoMinFrameDuration,oldMax=cam.activeVideoMaxFrameDuration,oldSpace=cam.activeColorSpace
+    let wasConfigured=configured
+    session.beginConfiguration()
+    defer { session.commitConfiguration() }
     try cam.lockForConfiguration()
     defer { cam.unlockForConfiguration() }
-    // Keep resolution/fps first; never choose a smaller format just for stabilization.
-    let candidates = cam.formats.filter { f in
-      let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-      return d.width == 3840 && d.height == 2160 && f.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 60 && $0.maxFrameRate >= 60 }
+    do {
+      if let oldVideo { session.removeInput(oldVideo) }
+      guard session.canAddInput(input) else { throw failure("Esta câmera não pode ser aberta") }
+      session.addInput(input)
+      if !wasConfigured {
+        guard let mic=AVCaptureDevice.default(for:.audio) else { throw failure("Microfone indisponível") }
+        let audio=try AVCaptureDeviceInput(device:mic)
+        guard session.canAddInput(audio),session.canAddOutput(movie) else { throw failure("Gravação indisponível") }
+        session.addInput(audio);session.addOutput(movie)
+      }
+      session.sessionPreset = .inputPriority
+      cam.activeFormat=cam.formats[index]
+      let duration=CMTime(seconds:1/chosen.fps,preferredTimescale:600000)
+      cam.activeVideoMinFrameDuration=duration;cam.activeVideoMaxFrameDuration=duration
+      cam.automaticallyAdjustsVideoHDREnabled=false
+      if cam.activeFormat.isVideoHDRSupported { cam.isVideoHDREnabled=wantsHDR }
+      if wantsHDR { cam.activeColorSpace = .HLG_BT2020 }
+      else if cam.activeFormat.supportedColorSpaces.contains(.sRGB) { cam.activeColorSpace = .sRGB }
+      let nativeBase=displayBase(cam)
+      let relative=zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor/base) : max(1,Double(cam.minAvailableVideoZoomFactor/nativeBase)))
+      cam.videoZoomFactor=max(cam.minAvailableVideoZoomFactor,min(CGFloat(relative)*nativeBase,cam.maxAvailableVideoZoomFactor))
+      if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
+      if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
+      if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
+      guard let connection=movie.connection(with:.video),movie.availableVideoCodecTypes.contains(encoding) else { throw failure("Codec não disponível neste formato") }
+      if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle=90 }
+      movie.setOutputSettings([AVVideoCodecKey:encoding],for:connection)
+      movie.maxRecordedFileSize=256*1024*1024
+      zoomObservation?.invalidate()
+      device=cam;base=nativeBase;selectedProfile=chosen;requestedHDR=wantsHDR;requestedCodec=encoding;configured=true
+      zoomObservation=cam.observe(\.videoZoomFactor,options:[.initial,.new]) { [weak self] cam,_ in
+        guard let self else { return };let value=Double(cam.videoZoomFactor/nativeBase)
+        self.publish { self.zoom=value }
+      }
+      let low=Double(cam.minAvailableVideoZoomFactor/nativeBase),high=Double(min(cam.maxAvailableVideoZoomFactor/nativeBase,10))
+      let options=NativeCapturePolicy.profiles(catalog,hdr:wantsHDR)
+      let hdrOK=catalog.contains { $0.supports(chosen,hdr:true) }
+      let codecNames=movie.availableVideoCodecTypes.filter { $0 == .hevc || $0 == .h264 }.map { $0.rawValue }
+      let display=name(cam),minimumISO=Double(cam.activeFormat.minISO),maximumISO=Double(cam.activeFormat.maxISO)
+      let exposureMinimum=CMTimeGetSeconds(cam.activeFormat.minExposureDuration)
+      let ultraAvailable=cam.position == .back && availableDevices.contains { lens in lens.position == .back && lens.deviceType == .builtInUltraWideCamera && NativeCapturePolicy.select(chosen,hdr:wantsHDR,formats:descriptors(lens)) != nil }
+      publish {
+        self.minimumZoom=low;self.maximumZoom=high;self.lensID=cam.uniqueID;self.lensName=display
+        self.profiles=options;self.profileID=chosen.id;self.formatLabel=chosen.label;self.hdrAvailable=hdrOK;self.hdrEnabled=wantsHDR
+        self.codecs=codecNames;self.codec=encoding.rawValue
+        self.torchAvailable=cam.hasTorch;self.torchEnabled=cam.torchMode == .on
+        self.canSwitchUltraWide=ultraAvailable
+        self.focusAvailable=cam.isFocusModeSupported(.locked) && cam.isLockingFocusWithCustomLensPositionSupported;self.manualFocus=false
+        self.exposureAvailable=cam.isExposureModeSupported(.custom);self.manualExposure=false
+        self.minISO=minimumISO;self.maxISO=maximumISO
+        self.minShutter=chosen.fps;self.maxShutter=max(chosen.fps,1/max(exposureMinimum,0.000001))
+        self.minExposureBias=Double(cam.minExposureTargetBias);self.maxExposureBias=Double(cam.maxExposureTargetBias)
+        self.whiteBalanceAvailable=cam.isWhiteBalanceModeSupported(.locked);self.manualWhiteBalance=false;self.colorLocked=false
+      }
+      configureStabilization()
+    } catch {
+      session.inputs.compactMap { $0 as? AVCaptureDeviceInput }.filter { $0.device.hasMediaType(.video) }.forEach { session.removeInput($0) }
+      if let oldVideo,session.canAddInput(oldVideo) { session.addInput(oldVideo) }
+      if !wasConfigured { session.inputs.forEach { session.removeInput($0) };session.outputs.forEach { session.removeOutput($0) } }
+      cam.activeFormat=oldFormat;cam.activeVideoMinFrameDuration=oldMin;cam.activeVideoMaxFrameDuration=oldMax;cam.activeColorSpace=oldSpace
+      throw error
     }
-    guard let format = candidates.first(where: { $0.isVideoStabilizationModeSupported(desired) }) ?? candidates.first else {
-      throw failure("4K/60 não disponível nesta câmera; não foi reduzida a qualidade automaticamente")
+  }
+  private func reconfigure(_ action: @escaping @Sendable () throws -> Void) {
+    queue.async {
+      guard self.outputURL == nil,!self.movie.isRecording else { self.publish { self.status="Pare a gravação antes de trocar câmera, formato ou codec" };return }
+      self.publish { self.ready=false }
+      do { try action();self.publish { self.ready=self.session.isRunning } }
+      catch { self.publish { self.ready=self.session.isRunning;self.status=error.localizedDescription } }
     }
-    cam.activeFormat = format
-    cam.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 60)
-    cam.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 60)
-    base = cam.deviceType == .builtInDualWideCamera ? (cam.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue.mapCGFloat ?? 2) : 1
-    cam.videoZoomFactor = max(cam.minAvailableVideoZoomFactor, min(base, cam.maxAvailableVideoZoomFactor))
-    if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
-    if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
-    if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
-    device = cam
-    let displayBase = base
-    zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
-      guard let self else { return }
-      let value = Double(cam.videoZoomFactor / displayBase)
-      self.publish { self.zoom = value }
+  }
+  func selectLens(_ id: String) { reconfigure { try self.configure(cameraID:id) } }
+  func selectProfile(_ id: String) {
+    reconfigure {
+      guard let cam=self.device,let p=NativeCapturePolicy.profiles(self.descriptors(cam),hdr:self.requestedHDR).first(where: { $0.id == id }) else { throw self.failure("Formato indisponível") }
+      try self.configure(profile:p)
     }
-    movie.maxRecordedFileSize = 256 * 1024 * 1024
-    if let connection = movie.connection(with: .video) {
-      if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
-      if movie.availableVideoCodecTypes.contains(.hevc) { movie.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: connection) }
+  }
+  func setHDR(_ enabled: Bool) { reconfigure { try self.configure(hdr:enabled) } }
+  func setCodec(_ value: String) { reconfigure { try self.configure(codec:AVVideoCodecType(rawValue:value)) } }
+  var zoomPresets: [Double] {
+    [0.5,1,2,5,10].filter { value in
+      (value >= minimumZoom && value <= maximumZoom) || (value == 0.5 && canSwitchUltraWide && !recording && !finishing)
     }
-    configureStabilization()
-    configured = true
-    let low = Double(cam.minAvailableVideoZoomFactor / base), high = Double(min(cam.maxAvailableVideoZoomFactor / base, 10))
-    publish { self.minimumZoom = low; self.maximumZoom = high; self.zoom = 1 }
+  }
+  func selectZoom(_ value: Double) {
+    queue.async {
+      guard let cam=self.device else { return }
+      if self.outputURL == nil && cam.position == .back && ((cam.deviceType == .builtInWideAngleCamera && value<1) || (cam.deviceType == .builtInUltraWideCamera && value>=1)) {
+        let type: AVCaptureDevice.DeviceType = value<1 ? .builtInUltraWideCamera : .builtInWideAngleCamera
+        if let lens=self.availableDevices.first(where: { $0.position == .back && $0.deviceType == type }) {
+          do { try self.configure(cameraID:lens.uniqueID,zoom:value) } catch { self.publish { self.status=error.localizedDescription } }
+          return
+        }
+      }
+      self.setZoom(value)
+    }
+  }
+  private func startTelemetry() {
+    guard telemetry == nil else { return }
+    let timer=DispatchSource.makeTimerSource(queue:queue)
+    timer.schedule(deadline:.now(),repeating:.seconds(1))
+    timer.setEventHandler { [weak self] in
+      guard let self,let cam=self.device,self.session.isRunning else { return }
+      let iso=Double(cam.iso),shutter=1/max(0.000001,CMTimeGetSeconds(cam.exposureDuration)),position=Double(cam.lensPosition),bias=Double(cam.exposureTargetBias)
+      let temp=Double(cam.temperatureAndTintValues(for:cam.deviceWhiteBalanceGains).temperature)
+      let actual=self.movie.connection(with:.video)?.activeVideoStabilizationMode ?? .off
+      self.publish { self.iso=iso;self.shutter=shutter;self.lensPosition=position;self.exposureBias=bias;self.temperature=temp;self.activeMode=actual }
+    }
+    telemetry=timer;timer.resume()
   }
   private func failure(_ message: String) -> NSError { NSError(domain: "CowboyCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
   private func configureStabilization() {
@@ -107,7 +256,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   }
   func setStabilization(_ value: Int) {
     queue.async {
-      guard !self.movie.isRecording else { return }
+      guard self.outputURL == nil,!self.movie.isRecording else { return }
       self.desired = value == 0 ? .off : value == 1 ? .standard : value == 2 ? .cinematic : .cinematicExtended
       self.configureStabilization()
     }
@@ -139,6 +288,68 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       } catch { self.publish { self.status = error.localizedDescription } }
     }
   }
+  private func control(_ action: @escaping @Sendable (AVCaptureDevice) throws -> Void) {
+    queue.async {
+      guard let cam=self.device,self.session.isRunning else { return }
+      do { try cam.lockForConfiguration();defer { cam.unlockForConfiguration() };try action(cam) }
+      catch { self.publish { self.status=error.localizedDescription } }
+    }
+  }
+  func setTorch(_ enabled: Bool) {
+    control { cam in
+      guard cam.hasTorch,cam.isTorchAvailable else { throw self.failure("Lanterna indisponível nesta câmera") }
+      if enabled { try cam.setTorchModeOn(level:AVCaptureDevice.maxAvailableTorchLevel) } else { cam.torchMode = .off }
+      self.publish { self.torchEnabled=enabled }
+    }
+  }
+  func setFocus(_ manual: Bool,position: Double? = nil) {
+    control { cam in
+      if manual {
+        guard cam.isFocusModeSupported(.locked),cam.isLockingFocusWithCustomLensPositionSupported else { throw self.failure("Foco manual indisponível nesta lente") }
+        cam.setFocusModeLocked(lensPosition:Float(max(0,min(1,position ?? Double(cam.lensPosition)))),completionHandler:nil)
+      } else if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
+      self.publish { self.manualFocus=manual }
+    }
+  }
+  func focusAt(_ point: CGPoint) {
+    control { cam in
+      if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.autoFocus) {
+        cam.focusPointOfInterest=point;cam.focusMode = .autoFocus
+        self.publish { self.manualFocus=false }
+      }
+      if cam.isExposurePointOfInterestSupported && cam.exposureMode != .locked && cam.exposureMode != .custom {
+        cam.exposurePointOfInterest=point
+      }
+    }
+  }
+  func setExposure(_ manual: Bool,iso: Double? = nil,shutter: Double? = nil) {
+    control { cam in
+      if manual {
+        guard cam.isExposureModeSupported(.custom) else { throw self.failure("Exposição manual indisponível") }
+        let sensitivity=Float(max(Double(cam.activeFormat.minISO),min(Double(cam.activeFormat.maxISO),iso ?? Double(cam.iso))))
+        let minimum=CMTimeGetSeconds(cam.activeFormat.minExposureDuration)
+        let maximum=min(CMTimeGetSeconds(cam.activeFormat.maxExposureDuration),1/self.selectedProfile.fps)
+        let seconds=max(minimum,min(maximum,shutter.map { 1/max(1,$0) } ?? CMTimeGetSeconds(cam.exposureDuration)))
+        cam.setExposureModeCustom(duration:CMTime(seconds:seconds,preferredTimescale:1000000000),iso:sensitivity,completionHandler:nil)
+      } else if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
+      self.publish { self.manualExposure=manual;self.colorLocked=false }
+    }
+  }
+  func setExposureBias(_ value: Double) {
+    control { cam in cam.setExposureTargetBias(Float(max(Double(cam.minExposureTargetBias),min(Double(cam.maxExposureTargetBias),value))),completionHandler:nil) }
+  }
+  func setWhiteBalance(_ manual: Bool,temperature: Double? = nil) {
+    control { cam in
+      if manual {
+        guard cam.isWhiteBalanceModeSupported(.locked) else { throw self.failure("Balanço de branco manual indisponível") }
+        let current=cam.temperatureAndTintValues(for:cam.deviceWhiteBalanceGains)
+        var gains=cam.deviceWhiteBalanceGains(for:AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature:Float(max(2000,min(10000,temperature ?? Double(current.temperature)))),tint:current.tint))
+        gains.redGain=max(1,min(cam.maxWhiteBalanceGain,gains.redGain));gains.greenGain=max(1,min(cam.maxWhiteBalanceGain,gains.greenGain));gains.blueGain=max(1,min(cam.maxWhiteBalanceGain,gains.blueGain))
+        cam.setWhiteBalanceModeLocked(with:gains,completionHandler:nil)
+      } else if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
+      self.publish { self.manualWhiteBalance=manual;self.colorLocked=false }
+    }
+  }
   func record(owner: String) {
     queue.async {
       guard self.configured, self.session.isRunning, !self.movie.isRecording, self.outputURL == nil else { return }
@@ -148,6 +359,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       do {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(owner).write(to: file.appendingPathExtension("owner"), options: .atomic)
+        let metadata=NativeCaptureMetadata(width:self.selectedProfile.width,height:self.selectedProfile.height,frameRate:self.selectedProfile.fps,hdr:self.requestedHDR,codec:self.requestedCodec.rawValue,lens:self.device.map { self.name($0) } ?? "Câmera",stabilization:Self.label(self.movie.connection(with:.video)?.activeVideoStabilizationMode ?? .off))
+        try JSONEncoder().encode(metadata).write(to:file.appendingPathExtension("capture"),options:.atomic)
       } catch { self.publish { self.status = error.localizedDescription }; return }
       self.outputURL = file
       self.movie.startRecording(to: file, recordingDelegate: self)
@@ -174,7 +387,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     }
   }
   func stopRecording() { queue.async { if self.movie.isRecording { self.publish { self.finishing = true }; self.movie.stopRecording() } } }
-  func close() { queue.async { if self.movie.isRecording { self.movie.stopRecording() }; if self.session.isRunning { self.session.stopRunning() }; self.publish { self.ready = false } } }
+  func close() { queue.async { self.telemetry?.cancel();self.telemetry=nil; if self.movie.isRecording { self.movie.stopRecording() }; if self.session.isRunning { self.session.stopRunning() }; self.publish { self.ready = false } } }
   func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
     publish { self.recording = true; self.finishing = false }
   }
@@ -199,8 +412,19 @@ struct CameraPreview: UIViewRepresentable {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var preview: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
   }
+  func makeCoordinator() -> Coordinator { Coordinator(camera:camera) }
+  final class Coordinator: NSObject {
+    let camera: NativeCamera
+    init(camera: NativeCamera) { self.camera=camera }
+    @objc func tapped(_ recognizer: UITapGestureRecognizer) {
+      guard let surface=recognizer.view as? Surface else { return }
+      camera.focusAt(surface.preview.captureDevicePointConverted(fromLayerPoint:recognizer.location(in:surface)))
+    }
+  }
   func makeUIView(context: Context) -> Surface {
-    let view = Surface(); view.preview.session = camera.session; view.preview.videoGravity = .resizeAspectFill; return view
+    let view = Surface(); view.preview.session = camera.session; view.preview.videoGravity = .resizeAspectFill
+    view.addGestureRecognizer(UITapGestureRecognizer(target:context.coordinator,action:#selector(Coordinator.tapped(_:))))
+    return view
   }
   func updateUIView(_ view: Surface, context: Context) {
     if let connection = view.preview.connection {

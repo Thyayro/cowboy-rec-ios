@@ -12,7 +12,7 @@ struct RecorderView: View {
   @State private var settings = false
   @State private var strength = 3
   @State private var zoom: Double = 1
-  @State private var locked = false
+  @State private var zoomEditing = false
   @Environment(\.scenePhase) private var phase
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 0.91, green: 0.65, blue: 0.24)
@@ -36,16 +36,19 @@ struct RecorderView: View {
             Button("Entrar na conta Cowboy para gravar") { open(.account) }.font(.subheadline).padding(10)
           } else { Text(cloud.status).font(.caption2).lineLimit(2) }
           HStack(spacing: 8) {
-            ForEach([0.5,1,2,5,10],id: \.self) { value in
-              Button { zoom=min(camera.maximumZoom,max(camera.minimumZoom,value)); camera.setZoom(zoom) } label: {
+            ForEach(camera.zoomPresets,id: \.self) { value in
+              Button { camera.selectZoom(value) } label: {
                 Text(String(format: "%g×",value)).font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).padding(.vertical,9)
               }.background(abs(camera.zoom-value)<0.12 ? gold.opacity(0.35) : Color.black.opacity(0.4),in: Capsule())
             }
           }.disabled(!camera.ready)
           HStack {
             Text(String(format: "%.1f×",camera.zoom)).font(.caption).monospacedDigit().frame(width: 42)
-            Slider(value: $zoom,in: camera.minimumZoom...max(camera.minimumZoom+0.01,camera.maximumZoom))
-              .onChange(of: zoom) { _,value in camera.setZoom(value) }
+            Slider(value: $zoom,in: camera.minimumZoom...max(camera.minimumZoom+0.01,camera.maximumZoom),onEditingChanged: { editing in
+              zoomEditing=editing
+              if !editing { camera.setZoom(zoom) }
+            }).onChange(of: zoom) { _,value in if zoomEditing { camera.setZoom(value) } }
+              .onChange(of: camera.zoom) { _,value in if !zoomEditing { zoom=max(camera.minimumZoom,min(camera.maximumZoom,value)) } }
           }.disabled(!camera.ready)
           HStack {
             Button { open(.library) } label: { VStack { Image(systemName: "photo.stack").font(.title2); Text("Biblioteca").font(.caption2) }.frame(maxWidth: .infinity) }.disabled(camera.recording || camera.finishing)
@@ -82,7 +85,7 @@ struct RecorderView: View {
               Picker("Estabilização",selection: $strength) {
                 Text("Desligada").tag(0); Text("Standard").tag(1); Text("Cinematic").tag(2); Text("Forte").tag(3)
               }.disabled(camera.recording || camera.finishing).onChange(of: strength) { _,value in camera.setStabilization(value) }
-              Toggle("Travar luz e cor",isOn: $locked).disabled(!camera.ready).onChange(of: locked) { _,value in camera.lockColor(value) }
+              Toggle("Travar luz e cor",isOn:Binding(get:{camera.colorLocked},set:{camera.lockColor($0)})).disabled(!camera.ready)
               Text(camera.status).font(.caption)
             }
             Section("Conta e sincronização") {
@@ -101,6 +104,7 @@ struct RecorderView: View {
           do {
             try cloud.enqueue(file,owner: owner)
             try? FileManager.default.removeItem(at: file.appendingPathExtension("owner"))
+            try? FileManager.default.removeItem(at: file.appendingPathExtension("capture"))
             try? FileManager.default.removeItem(at: file)
             camera.recoverableFile=nil
           } catch { camera.recoverableFile=file; camera.status="Vídeo preservado: \(error.localizedDescription)" }

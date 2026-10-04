@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import SwiftUI
 import WebKit
+import AVFoundation
 
 final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
   func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
@@ -23,6 +24,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     var cid: String
     var session: String?
     var take: String?
+    var capture: NativeCaptureMetadata?
   }
   enum CloudError: LocalizedError {
     case message(String)
@@ -51,7 +53,8 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     let cid = "native" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     let video = directory.appendingPathComponent(cid + ".mov")
     try FileManager.default.copyItem(at: source, to: video)
-    do { try save(Pending(owner: owner, cid: cid), at: directory.appendingPathComponent(cid + ".json")) }
+    let capture=(try? Data(contentsOf:source.appendingPathExtension("capture"))).flatMap { try? JSONDecoder().decode(NativeCaptureMetadata.self,from:$0) }
+    do { try save(Pending(owner: owner, cid: cid,capture:capture), at: directory.appendingPathComponent(cid + ".json")) }
     catch { try? FileManager.default.removeItem(at: video); throw error }
     queueRevision += 1
     status = "Vídeo salvo no iPhone; aguardando envio"
@@ -80,7 +83,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
           item.session = id; try save(item, at: metadata)
         }
         if item.take == nil {
-          let result = try await request("/api/rec/take", method: "POST", json: ["session": item.session!, "cid": item.cid, "label": "Câmera do iPhone", "mime": "video/quicktime", "convert": "none", "stabilization": ["enabled": false]], cookie: credential)
+          let result = try await request("/api/rec/take", method: "POST", json: ["session": item.session!, "cid": item.cid, "label": item.capture?.lens ?? "Câmera do iPhone", "mime": "video/quicktime", "convert": "none", "settings": item.capture?.settings ?? [:], "stabilization": ["enabled": false]], cookie: credential)
           guard let id = result["take"] as? String else { throw CloudError.message("Resposta de gravação inválida") }
           item.take = id; try save(item, at: metadata)
         }
@@ -101,7 +104,9 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
           guard let acknowledged = result["next"] as? Int, acknowledged == next + 1 else { throw CloudError.message("Servidor não confirmou o trecho") }
           next = acknowledged
         }
-        let result = try await request("/api/rec/stop", method: "POST", json: ["take": item.take!, "chunks": count, "reason": "iPhone AVFoundation"], cookie: credential)
+        let duration=try? await AVURLAsset(url:video).load(.duration)
+        let milliseconds=duration.flatMap { $0.seconds.isFinite ? Int($0.seconds*1000) : nil } ?? 0
+        let result = try await request("/api/rec/stop", method: "POST", json: ["take": item.take!, "chunks": count, "duration_ms": milliseconds, "reason": "iPhone AVFoundation"], cookie: credential)
         guard result["status"] as? String == "done", result["bytes"] as? Int == size else { throw CloudError.message("Servidor não confirmou o vídeo completo") }
         try FileManager.default.removeItem(at: metadata)
         try FileManager.default.removeItem(at: video)

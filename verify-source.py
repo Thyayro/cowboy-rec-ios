@@ -12,7 +12,10 @@ assert 'guard me["email"] as? String == owner' in cloud
 assert 'result["bytes"] as? Int == size' in cloud
 assert 'Ray-Ban' not in cloud and 'Óculos' not in cloud
 cam=(root/'Sources/NativeCamera.swift').read_text(encoding='utf-8-sig')
-assert 'ramp(toVideoZoomFactor:' in cam and '3840' in cam and '2160' in cam
+assert 'ramp(toVideoZoomFactor:' in cam
+policy=(root/'Sources/CapturePolicy.swift').read_text(encoding='utf-8-sig')
+assert 'width: 3840,height: 2160,fps: 60' in policy
+assert 'NativeCapturePolicy.select' in cam and '.builtInWideAngleCamera' in cam
 assert 'isVideoStabilizationModeSupported' in cam
 tracked = subprocess.check_output(['git', '-C', str(root), 'ls-files'], text=True).splitlines()
 for name in tracked:
