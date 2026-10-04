@@ -137,8 +137,19 @@ enum CowboyPortal: String, Identifiable {
   var title: String { self == .account ? "Conta Cowboy" : self == .library ? "Biblioteca da VPS" : "Rec completo" }
 }
 
+@MainActor @Observable final class CowboyPortalControl {
+  weak var web: WKWebView?
+  func canReturnToCamera() async -> Bool {
+    guard let web else { return true }
+    // Do not unload the full Rec while it is capturing or transmitting live.
+    let value = try? await web.evaluateJavaScript("document.body.classList.contains('recording') || document.body.classList.contains('live')")
+    return value as? Bool != true
+  }
+}
+
 struct CowboyAccountView: UIViewRepresentable {
   var destination: CowboyPortal = .account
+  var control: CowboyPortalControl
   func makeCoordinator() -> Coordinator { Coordinator(destination: destination) }
   func makeUIView(context: Context) -> WKWebView {
     let config = WKWebViewConfiguration()
@@ -151,6 +162,7 @@ struct CowboyAccountView: UIViewRepresentable {
       config.userContentController.addUserScript(WKUserScript(source: script,injectionTime: .atDocumentEnd,forMainFrameOnly: true))
     }
     let web = WKWebView(frame: .zero,configuration: config)
+    control.web = web
     web.navigationDelegate = context.coordinator
     web.uiDelegate = context.coordinator
     web.isOpaque = false

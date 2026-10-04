@@ -7,6 +7,8 @@ import AVFoundation
 struct RecorderView: View {
   @StateObject private var camera = NativeCamera()
   @State private var portal: CowboyPortal?
+  @State private var portalControl = CowboyPortalControl()
+  @State private var captureWarning = false
   @State private var settings = false
   @State private var strength = 3
   @State private var zoom: Double = 1
@@ -65,9 +67,12 @@ struct RecorderView: View {
         Task { await cloud.refresh(); if let owner=cloud.email { camera.recoverSaved(owner: owner) }; camera.start() }
       }) { destination in
         NavigationStack {
-          CowboyAccountView(destination: destination)
+          CowboyAccountView(destination: destination,control: portalControl)
             .navigationTitle(destination.title).navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Câmera nativa") { portal=nil } } }
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Câmera nativa") {
+              Task { if await portalControl.canReturnToCamera() { portal=nil } else { captureWarning=true } }
+            } } }
+            .alert("Gravação em andamento",isPresented: $captureWarning) { Button("OK",role: .cancel) {} } message: { Text("Pare a gravação ou transmissão no Rec antes de voltar à câmera nativa.") }
         }.preferredColorScheme(.dark)
       }
       .sheet(isPresented: $settings) {
@@ -83,7 +88,7 @@ struct RecorderView: View {
             Section("Conta e sincronização") {
               Text(cloud.email ?? "Você ainda não entrou na conta")
               Text(cloud.status).font(.caption)
-              Button("Entrar / gerenciar conta") { settings=false; open(.account) }.disabled(camera.recording || camera.finishing)
+              Button("Entrar / gerenciar conta") { settings=false; DispatchQueue.main.asyncAfter(deadline: .now()+0.4) { open(.account) } }.disabled(camera.recording || camera.finishing)
               Button("Retomar envios") { Task { await cloud.refresh() } }
               Text("A captura nativa é salva no iPhone e enviada à biblioteca da VPS ao parar. Limite atual: 256 MB por clipe.").font(.caption)
               if let file=camera.recoverableFile { ShareLink("Exportar captura preservada",item: file) }
