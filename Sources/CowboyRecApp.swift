@@ -26,7 +26,7 @@ struct RecorderView: View {
         HStack {
           VStack(alignment: .leading,spacing: 3) {
             Text("COWBOY REC · 0.4.0").font(.headline).tracking(2)
-            Text("4K · 60 FPS · \(NativeCamera.label(camera.activeMode))").font(.caption2)
+            Text("\(camera.formatLabel) · \(NativeCamera.label(camera.activeMode))").font(.caption2)
           }
           Spacer()
           Button { settings=true } label: { Image(systemName: "slider.horizontal.3").font(.title3).padding(12) }
