@@ -22,7 +22,7 @@ struct RecorderView: View {
       CameraPreview(camera: camera).background(.black).aspectRatio(9.0 / 16.0, contentMode: .fit)
       Text(camera.status).font(.caption)
       HStack {
-        Text(String(format: "%.1f×", zoom)).monospacedDigit()
+        Text(String(format: "%.1f×", camera.zoom)).monospacedDigit()
         Slider(value: $zoom, in: camera.minimumZoom...max(camera.minimumZoom + 0.01, camera.maximumZoom))
           .onChange(of: zoom) { _, value in camera.setZoom(value) }
       }.disabled(!camera.ready)
@@ -48,9 +48,10 @@ struct RecorderView: View {
         Button("Retomar envios") { Task { await cloud.refresh() } }
       }
       Text(cloud.status).font(.caption)
+      Text("Envio ao parar · limite de 256 MB por clipe").font(.caption2)
       if let file = camera.recoverableFile { ShareLink("Salvar vídeo que não entrou na fila", item: file) }
     }.padding().preferredColorScheme(.dark)
-      .sheet(isPresented: $account, onDismiss: { Task { await cloud.refresh(); camera.start() } }) {
+      .sheet(isPresented: $account, onDismiss: { Task { await cloud.refresh(); if let owner = cloud.email { camera.recoverSaved(owner: owner) }; camera.start() } }) {
         NavigationStack { CowboyAccountView().toolbar { Button("Voltar à câmera") { account = false } } }
       }
       .task {
@@ -64,7 +65,7 @@ struct RecorderView: View {
           }
           catch { camera.recoverableFile = file; camera.status = "Vídeo mantido no aparelho: \(error.localizedDescription)" }
         }
-        await cloud.refresh(); camera.start()
+        await cloud.refresh(); if let owner = cloud.email { camera.recoverSaved(owner: owner) }; camera.start()
       }
       .onChange(of: phase) { _, value in
         if value != .active { camera.close() }

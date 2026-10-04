@@ -4,7 +4,7 @@ Aplicativo independente do gravador web e do projeto de óculos Meta. Câmera na
 
 Perfil inicial Forte solicita cinematicExtended e mostra os modos solicitado/ativo. Esse modo não foi comprovado equivalente ao Extreme da Blackmagic. Fallback explícito para Cinematic/Standard conforme suporte do formato, preservando 4K/60. Modos mais fortes podem adicionar atraso e recorte. Mudança de lente fica sob controle do dispositivo virtual iOS; não foi implementada calibração extra de paralaxe/cor. Retrato somente nesta versão.
 
-Gravação local primeiro; envia ao parar, pela conta Cowboy, em partes de 8 MB com recibos. Não é streaming ao vivo nem upload durante a captura. Limite de 256 MB por clipe; o sistema finaliza ao atingir o limite. Interrupções de segundo plano encerram captura. Fila persistente vinculada à conta; Retomar confere conta e continua pelos recibos. Original preservado, convert:none, estabilização do servidor desativada. Se enfileirar falha, captura permanece em Application Support e a tela oferece compartilhar o arquivo. Capturas interrompidas por encerramento forçado ainda precisam de recuperação manual; não há promessa de reparo automático.
+Gravação local primeiro; envia ao parar, pela conta Cowboy, em partes de 8 MB com recibos. Não é streaming ao vivo nem upload durante a captura. Limite de 256 MB por clipe; o sistema finaliza ao atingir o limite. Interrupções de segundo plano encerram captura. Fila persistente vinculada à conta; Retomar confere conta e continua pelos recibos. Original preservado, convert:none, estabilização do servidor desativada. Se enfileirar falha, captura permanece em Application Support e a tela oferece compartilhar o arquivo. Capturas finalizadas que ficaram fora da fila são recuperadas ao entrar na mesma conta. Capturas danificadas por encerramento forçado são preservadas para exportação e recuperação manual; não há promessa de reparo automático.
 
 ## Compilar
 
@@ -16,6 +16,11 @@ Instalar AltServer/AltStore Classic seguindo o fornecedor. Apple ID deve ser inf
 
 ## Validação pendente
 
-Fonte preparada em Windows. Sem SDK iOS/Xcode local; compilação e testes físicos ainda pendentes. Não anunciar como instalado ou funcionando no iPhone antes de build, assinatura e teste. Conferir prévia/arquivo no iPhone 16 em 0,5x, 1x, 2x, 5x e 10x; modos Standard/Cinematic/Forte, latência, cor/luz, fps/resolução reais, áudio, interrupção e retomada dos envios. Calibrar contra Blackmagic Extreme no mesmo cenário. Não há garantia de troca de lente imperceptível.
+Compilação inicial Release/arm64 realizada com sucesso no runner macOS do GitHub em 04/10/2026. A compilação da revisão final é verificada antes de publicar o IPA. Instalação, assinatura e testes físicos no iPhone 16 ainda pendentes. Não anunciar como instalado ou funcionando no iPhone antes de build, assinatura e teste. Conferir prévia/arquivo no iPhone 16 em 0,5x, 1x, 2x, 5x e 10x; modos Standard/Cinematic/Forte, latência, cor/luz, fps/resolução reais, áudio, interrupção e retomada dos envios. Calibrar contra Blackmagic Extreme no mesmo cenário. Não há garantia de troca de lente imperceptível.
 
 Fontes: https://developer.apple.com/support/compare-memberships/ ; https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows ; https://faq.altstore.io/altstore-classic/your-altstore ; https://docs.github.com/en/actions/concepts/billing-and-usage ; https://developer.apple.com/documentation/avfoundation/avcapturevideostabilizationmode/cinematicextended
+
+
+## Backup e retorno
+
+A versão anterior está na tag `backup/pre-final-20261004` e no arquivo local `.backups/cowboy-rec-ios-before-final-20261004.zip` do workspace de origem. A primeira compilação também foi preservada em `.backups/cowboy-rec-ios-first-build`. O gravador web permanece publicado, separado deste aplicativo; seus fontes foram arquivados na VPS em `/root/cowboy-rec-web-before-native-20261004.tar.gz`. Nenhum serviço web foi reiniciado ou substituído nesta etapa. Para usar o gravador anterior, abra o endereço `/rec` no Safari. Para retornar ao código nativo anterior, use a tag de backup e compile novamente; os arquivos pendentes no iPhone não devem ser apagados.

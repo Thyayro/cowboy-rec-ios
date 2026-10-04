@@ -10,6 +10,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
   private var device: AVCaptureDevice?
   private var base: CGFloat = 1
   private var configured = false
+  private var zoomObservation: NSKeyValueObservation?
+  private var recovering = Set<URL>()
   private var owner: String?
   private var outputURL: URL?
   private var desired = AVCaptureVideoStabilizationMode.cinematicExtended
@@ -75,9 +77,15 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
     if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
     device = cam
+    let displayBase = base
+    zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
+      guard let self else { return }
+      let value = Double(cam.videoZoomFactor / displayBase)
+      self.publish { self.zoom = value }
+    }
     movie.maxRecordedFileSize = 256 * 1024 * 1024
     if let connection = movie.connection(with: .video) {
-      connection.videoRotationAngle = 90
+      if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }
       if movie.availableVideoCodecTypes.contains(.hevc) { movie.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: connection) }
     }
     configureStabilization()
@@ -143,6 +151,26 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
       } catch { self.publish { self.status = error.localizedDescription }; return }
       self.outputURL = file
       self.movie.startRecording(to: file, recordingDelegate: self)
+    }
+  }
+  // Finalized captures survive app restarts even if enqueue failed after stopping.
+  // Unfinished files are kept for manual recovery, never uploaded as valid clips.
+  func recoverSaved(owner: String) {
+    queue.async {
+      let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CowboyCaptures")
+      let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+      for file in files where file.pathExtension == "mov" && file != self.outputURL {
+        guard let data = try? Data(contentsOf: file.appendingPathExtension("owner")),
+          (try? JSONDecoder().decode(String.self, from: data)) == owner, self.recovering.insert(file).inserted else { continue }
+        Task {
+          let asset = AVURLAsset(url: file)
+          guard let duration = try? await asset.load(.duration), duration.isNumeric, duration.seconds > 0 else {
+            self.publish { self.recoverableFile = file; self.status = "Captura interrompida mantida; exporte o arquivo para recuperação"; self.queue.async { self.recovering.remove(file) } }
+            return
+          }
+          self.publish { self.onSaved?(file, owner); self.queue.async { self.recovering.remove(file) } }
+        }
+      }
     }
   }
   func stopRecording() { queue.async { if self.movie.isRecording { self.publish { self.finishing = true }; self.movie.stopRecording() } } }
