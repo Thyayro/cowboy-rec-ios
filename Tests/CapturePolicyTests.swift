@@ -9,6 +9,10 @@ import Foundation
     ]
     assert(NativeCapturePolicy.select(.main,hdr:false,formats:formats)==3)
     assert(NativeCapturePolicy.select(.main,hdr:true,formats:formats)==nil,"HDR may not silently downgrade 4K60 to 4K30")
+    assert(NativeCapturePolicy.select(.main,hdr:false,formats:formats,log:true)==nil,"HDR support does not imply Apple Log support")
+    let logFormats=[NativeFormatDescriptor(index:5,width:3840,height:2160,ranges:[NativeFrameRange(min:24,max:60)],hdr:false,stabilized:true,log:true)]
+    assert(NativeCapturePolicy.select(.main,hdr:false,formats:logFormats,log:true)==5)
+    assert(NativeCapturePolicy.profiles(formats,hdr:false,log:true).isEmpty)
     assert(NativeCapturePolicy.select(.main,hdr:false,formats:Array(formats.prefix(2)))==nil,"4K60 may not silently downgrade to HD240")
     let choices=NativeCapturePolicy.profiles(formats,hdr:false)
     assert(choices.contains(.main))

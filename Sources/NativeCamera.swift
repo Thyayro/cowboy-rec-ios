@@ -133,6 +133,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     let oldVideo=session.inputs.compactMap { $0 as? AVCaptureDeviceInput }.first(where: { $0.device.hasMediaType(.video) })
     let oldFormat=cam.activeFormat,oldMin=cam.activeVideoMinFrameDuration,oldMax=cam.activeVideoMaxFrameDuration,oldSpace=cam.activeColorSpace
     let wasConfigured=configured
+    session.automaticallyConfiguresCaptureDeviceForWideColor=false
     session.beginConfiguration()
     defer { session.commitConfiguration() }
     try cam.lockForConfiguration()
