@@ -131,7 +131,7 @@ final class NativeARCamera: NSObject, ObservableObject, ARSessionDelegate, AVCap
     guard let writer,let file else { return }
     let owner=self.owner
     self.videoInput?.markAsFinished();self.audioInput?.markAsFinished()
-    try? poseFile?.write(contentsOf:Data("]}".utf8));try? poseFile?.close();poseFile=nil
+    try? poseFile?.write(contentsOf:Data([93,125]));try? poseFile?.close();poseFile=nil
     self.writer=nil;self.adaptor=nil;self.started=nil
     if audioSession.isRunning { audioSession.stopRunning() }
     publish { self.recording=false;self.finishing=true }
