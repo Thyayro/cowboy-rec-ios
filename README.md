@@ -16,7 +16,7 @@ Instalar AltServer/AltStore Classic seguindo o fornecedor. Apple ID deve ser inf
 
 ## Validação pendente
 
-Compilação inicial Release/arm64 realizada com sucesso no runner macOS do GitHub em 04/10/2026. A compilação da revisão final é verificada antes de publicar o IPA. Instalação, assinatura e testes físicos no iPhone 16 ainda pendentes. Não anunciar como instalado ou funcionando no iPhone antes de build, assinatura e teste. Conferir prévia/arquivo no iPhone 16 em 0,5x, 1x, 2x, 5x e 10x; modos Standard/Cinematic/Forte, latência, cor/luz, fps/resolução reais, áudio, interrupção e retomada dos envios. Calibrar contra Blackmagic Extreme no mesmo cenário. Não há garantia de troca de lente imperceptível.
+Compilação inicial Release/arm64 realizada com sucesso no runner macOS do GitHub em 04/10/2026. Compilação final Release/arm64 concluída com sucesso e IPA verificado: ZIP íntegro, binário ARM64 de iPhone, identificador correto e permissões de câmera/microfone. Build: https://github.com/Thyayro/cowboy-rec-ios/actions/runs/37218309137 . Instalação, assinatura e testes físicos no iPhone 16 ainda pendentes. Não anunciar como instalado ou funcionando no iPhone antes de build, assinatura e teste. Conferir prévia/arquivo no iPhone 16 em 0,5x, 1x, 2x, 5x e 10x; modos Standard/Cinematic/Forte, latência, cor/luz, fps/resolução reais, áudio, interrupção e retomada dos envios. Calibrar contra Blackmagic Extreme no mesmo cenário. Não há garantia de troca de lente imperceptível.
 
 Fontes: https://developer.apple.com/support/compare-memberships/ ; https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows ; https://faq.altstore.io/altstore-classic/your-altstore ; https://docs.github.com/en/actions/concepts/billing-and-usage ; https://developer.apple.com/documentation/avfoundation/avcapturevideostabilizationmode/cinematicextended
 
@@ -24,3 +24,12 @@ Fontes: https://developer.apple.com/support/compare-memberships/ ; https://faq.a
 ## Backup e retorno
 
 A versão anterior está na tag `backup/pre-final-20261004` e no arquivo local `.backups/cowboy-rec-ios-before-final-20261004.zip` do workspace de origem. A primeira compilação também foi preservada em `.backups/cowboy-rec-ios-first-build`. O gravador web permanece publicado, separado deste aplicativo; seus fontes foram arquivados na VPS em `/root/cowboy-rec-web-before-native-20261004.tar.gz`. Nenhum serviço web foi reiniciado ou substituído nesta etapa. Para usar o gravador anterior, abra o endereço `/rec` no Safari. Para retornar ao código nativo anterior, use a tag de backup e compile novamente; os arquivos pendentes no iPhone não devem ser apagados.
+
+
+## Versão de teste publicada
+
+Download: https://github.com/Thyayro/cowboy-rec-ios/releases/tag/v0.1.0-test
+
+O arquivo CowboyRec-unsigned.ipa deve ser assinado/importado com AltStore Classic; o Safari não instala diretamente. Depois da instalação: entre em Conta / biblioteca, volte à câmera, confira o modo solicitado/ativo e grave um clipe curto. Verifique o vídeo na biblioteca antes de gravações importantes. A versão web anterior continua disponível.
+
+SHA256 do IPA: `02780c0471c6966ba87c5f5ac07b879e3cb1f36bda22c8780070110c752ca167`.
