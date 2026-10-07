@@ -32,6 +32,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
   private var fastFresh = false
   var lensMatch: LensMatch?
+  var blackBorder: (() -> Void)?
   private var nextStats = 0.0
   private var fastAt = 0.0
   private var crop = 1.06
@@ -73,13 +74,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     fastBuffer = buffer; fastPTS = pts; fastFresh = true
     let now = CACurrentMediaTime()
     fastAt = now
-    let wantStats = lensMatch?.enabled == true && now >= nextStats
+    let wantStats = now >= nextStats
     if wantStats { nextStats = now + 0.03 }
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib
     if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
     lock.unlock()
-    if wantStats, let lm = lensMatch { calibQueue.async { if let st = self.stats(buffer) { lm.observe(st, at: pts) } } }
+    if wantStats { let lm = lensMatch; calibQueue.async { if let st = self.stats(buffer), let lm, lm.enabled { lm.observe(st, at: pts) } } }
     if go { calibQueue.async { if let img = self.small(buffer) { self.lock.lock(); self.calibFast = (pts, img); self.lock.unlock() } else { self.lock.lock(); self.calibBusy = false; self.lock.unlock() } } }
   }
   // cor/luz do quadro como sai na tela (depois do LUT, antes da correção): média RGB e luz em p20/p80
@@ -98,6 +99,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       let c = SIMD3<Float>(Float(bytes[i]), Float(bytes[i + 1]), Float(bytes[i + 2])) / 255
       sum += c; lum.append(c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722)
     }
+    // detector de BORDA PRETA no quadro em tempo real (estabilizador entortando a imagem durante o zoom?)
+    var ring: Float = 0, rn: Float = 0
+    for y in 0..<H { for x in 0..<W where x < 2 || y < 2 || x >= W - 2 || y >= H - 2 { let i = (y * W + x) * 4; ring += (Float(bytes[i]) + Float(bytes[i + 1]) + Float(bytes[i + 2])) / 765; rn += 1 } }
+    let inner = (sum * SIMD3<Float>(0.2126, 0.7152, 0.0722)).sum() / Float(W * H)
+    if rn > 0, ring / rn < 0.015, inner > 0.08 { blackBorder?() }
     lum.sort()
     return FrameStats(mean: sum / Float(W * H), p25: lum[lum.count / 4], p75: lum[lum.count * 3 / 4])
   }

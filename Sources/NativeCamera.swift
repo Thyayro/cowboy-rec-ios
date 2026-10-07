@@ -421,6 +421,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let match = lensMatch ?? LensMatch(deviceKey: cam.deviceType.rawValue)
       lensMatch = match; renderer.lensMatch = match
       match.motion = { MotionHub.shared.rotationSpeed() }
+      var lastBorderDiag = 0.0
+      renderer.blackBorder = { [weak cam] in
+        let now = CACurrentMediaTime(); guard now - lastBorderDiag > 4 else { return }; lastBorderDiag = now
+        Diag.step("fast-black-border", ["zoom": String(format: "%.2f", Double(cam?.videoZoomFactor ?? 0)), "ramping": cam?.isRampingVideoZoom ?? false])
+      }
       match.onLearn = { [weak self] lens, c in
         guard let self else { return }
         let st = match.status(); self.publish { self.lensMatchStatus = st }
