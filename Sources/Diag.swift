@@ -31,6 +31,7 @@ enum Diag {
   }
   static func install() {
     // travamento anterior: sobe o relatório
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     if let text = try? String(contentsOf: crashURL, encoding: .utf8) {
       post(["step": "ios-crash", "report": String(text.prefix(6500))])
       try? FileManager.default.removeItem(at: crashURL)
@@ -46,6 +47,9 @@ enum Diag {
     }
   }
   static func writeCrash(_ text: String) {
+    if let previous = try? String(contentsOf: crashURL, encoding: .utf8), previous.hasPrefix("EXCEÇÃO") {
+      try? (previous + "\n--- depois ---\n" + text.prefix(800)).write(to: crashURL, atomically: false, encoding: .utf8); return
+    }
     let steps = (try? String(contentsOf: stepsURL, encoding: .utf8)) ?? ""
     try? (text + "\n--- últimos passos ---\n" + steps).write(to: crashURL, atomically: false, encoding: .utf8)
   }

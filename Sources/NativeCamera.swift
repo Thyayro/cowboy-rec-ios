@@ -4,6 +4,7 @@ import CoreImage
 import QuartzCore
 import SwiftUI
 import UniformTypeIdentifiers
+import VideoToolbox
 
 // Gravador: (1) NUVEM — AVAssetWriter no perfil HLS fMP4 entrega init + um fragmento por segundo em memória, cada um vai
 // direto pra fila de envio (CloudStream); (2) ARQUIVO — se o iPhone recusar o modo fragmentado, grava um .mov no aparelho
@@ -620,7 +621,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     queue.async {
       guard self.configured, self.session.isRunning, !self.isRecording, let cam = self.device else { return }
       do {
-        guard var videoSettings = self.videoOut.recommendedVideoSettings(forVideoCodecType: self.requestedCodec, assetWriterOutputFileType: .mp4) else { throw self.failure("O iPhone não informou o formato de gravação") }
+        Diag.step("record-tap", ["codec": self.requestedCodec.rawValue, "fmt": self.selectedProfile.label, "log": self.requestedLog])
+        var (videoSettings, how) = self.writerVideoSettings(cam)
         var compression = (videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any]) ?? [:]
         compression[AVVideoMaxKeyFrameIntervalDurationKey] = 1.0
         compression[AVVideoExpectedSourceFrameRateKey] = Int(self.selectedProfile.fps.rounded())
@@ -631,7 +633,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let isFront = cam.position == .front
         let angle: Double = isFront ? 0 : (horizon ?? self.previewAngle)
         let transform = CGAffineTransform(rotationAngle: CGFloat(angle * .pi / 180))
-        Diag.step("record-start", ["fmt": self.selectedProfile.label, "log": self.requestedLog, "codec": self.requestedCodec.rawValue, "angle": angle, "video": String(String(describing: videoSettings).prefix(600))])
+        Diag.step("record-start", ["how": how, "fmt": self.selectedProfile.label, "log": self.requestedLog, "codec": self.requestedCodec.rawValue, "angle": angle, "video": String(String(describing: videoSettings).prefix(600))])
         var writer: SegmentWriter
         var localFile: URL?
         do { writer = try SegmentWriter.make(video: videoSettings, audio: audioSettings, transform: transform, file: nil) }
@@ -687,6 +689,34 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         self.publish { self.status = "Não começou a gravar: \(why)" }
       }
     }
+  }
+  // Configuração do codificador. 0.5.1 travava aqui: recommendedVideoSettings LANÇA exceção (NSException) em alguns
+  // formatos do iPhone 16 Pro (medido: AVFCapture dentro de record, 07/10). Agora: codec que o escritor aceita, recomendado
+  // protegido (mp4, depois mov) e, se o iPhone recusar os dois, configuração montada à mão pelo formato ativo.
+  private func writerVideoSettings(_ cam: AVCaptureDevice) -> ([String: Any], String) {
+    var codecs: [AVVideoCodecType] = []
+    _ = CowboyObjC.catching { codecs = self.videoOut.availableVideoCodecTypesForAssetWriter(writingTo: .mp4) }
+    var codec = requestedCodec
+    if !codecs.isEmpty && !codecs.contains(codec) { codec = codecs.contains(.hevc) ? .hevc : codecs[0] }
+    for type in [AVFileType.mp4, .mov] {
+      var got: [String: Any]?
+      let ex = CowboyObjC.catching { got = self.videoOut.recommendedVideoSettings(forVideoCodecType: codec, assetWriterOutputFileType: type) }
+      if let ex { Diag.step("recommended-fail", ["type": type.rawValue, "codec": codec.rawValue, "err": ex]) }
+      if ex == nil, let got, got[AVVideoWidthKey] != nil { return (got, "recomendado-" + (type == .mp4 ? "mp4" : "mov")) }
+    }
+    let d = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
+    let w = Int(d.width), h = Int(d.height), fps = selectedProfile.fps
+    let bitrate = max(8_000_000, min(100_000_000, Int(Double(w * h) * fps * 0.12)))
+    var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate, AVVideoExpectedSourceFrameRateKey: Int(fps.rounded())]
+    if codec == .hevc { compression[AVVideoProfileLevelKey] = (requestedLog || requestedHDR) ? (kVTProfileLevel_HEVC_Main10_AutoLevel as String) : (kVTProfileLevel_HEVC_Main_AutoLevel as String) }
+    else { compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel }
+    var settings: [String: Any] = [AVVideoCodecKey: codec, AVVideoWidthKey: w, AVVideoHeightKey: h, AVVideoCompressionPropertiesKey: compression]
+    if requestedHDR {
+      settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG, AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020]
+    } else if !requestedLog {
+      settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2, AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]
+    }   // Apple Log: a etiqueta de cor vem dos próprios quadros (o escritor copia)
+    return (settings, "manual")
   }
   func stopRecording() {
     dataQueue.async {
