@@ -46,6 +46,7 @@ final class LutBaker: @unchecked Sendable {
         float y = (yIn.read(p).r - a.y) * a.x;
         float3 rgb = clamp(float3(y + m.x * cr, y - m.y * cb - m.z * cr, y + m.w * cb), 0.0, 1.0);
         float3 o = lut.sample(s, (rgb * (n - 1.0) + 0.5) / n).rgb;
+        o = clamp(prm[4].x * pow(max(o, 0.0), float3(prm[3].w)) * prm[3].rgb, 0.0, 1.0);   // igualar câmeras (lente do quadro)
         float Y = dot(o, float3(0.2126, 0.7152, 0.0722));
         yOut.write(float4((64.0 + 876.0 * Y) / 1023.0), p);
         sumCb += (o.b - Y) / 1.8556; sumCr += (o.r - Y) / 1.5748;
@@ -96,7 +97,7 @@ final class LutBaker: @unchecked Sendable {
   static func supports(_ f: OSType) -> Bool { tenBit.contains(f) || eightBit.contains(f) }
 
   // quadro convertido com o mesmo tempo do original; nil = não deu (quem chama grava o original e conta a falha)
-  func convert(_ sample: CMSampleBuffer) -> CMSampleBuffer? {
+  func convert(_ sample: CMSampleBuffer, match: LensCorrection = .identity) -> CMSampleBuffer? {
     guard let src = CMSampleBufferGetImageBuffer(sample) else { return fail("sem imagem") }
     let fmt = CVPixelBufferGetPixelFormatType(src)
     let ten = Self.tenBit.contains(fmt), eight = Self.eightBit.contains(fmt)
@@ -123,11 +124,11 @@ final class LutBaker: @unchecked Sendable {
     if !full && !ten { range = SIMD4<Float>(255.0 / 219.0, 16.0 / 255.0, 255.0 / 224.0, 128.0 / 255.0) }
     let rec2020 = SIMD4<Float>(1.4746, 0.16455, 0.57135, 1.8814), rec709 = SIMD4<Float>(1.5748, 0.1873, 0.4681, 1.8556)
     let matrix = ten ? rec2020 : rec709
-    var prm: [SIMD4<Float>] = [range, matrix, SIMD4(Float(lutN), four22 ? 1 : 2, 0, 0)]
+    var prm: [SIMD4<Float>] = [range, matrix, SIMD4(Float(lutN), four22 ? 1 : 2, 0, 0), SIMD4(match.gain.x, match.gain.y, match.gain.z, match.gamma), SIMD4(match.scale, 0, 0, 0)]
     guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return fail("comando") }
     enc.setComputePipelineState(pipeline)
     enc.setTexture(yIn, index: 0); enc.setTexture(cIn, index: 1); enc.setTexture(lut, index: 2); enc.setTexture(yOut, index: 3); enc.setTexture(cOut, index: 4)
-    enc.setBytes(&prm, length: MemoryLayout<SIMD4<Float>>.stride * 3, index: 0)
+    enc.setBytes(&prm, length: MemoryLayout<SIMD4<Float>>.stride * prm.count, index: 0)
     let tg = MTLSize(width: 16, height: 16, depth: 1)
     enc.dispatchThreads(MTLSize(width: cOut.width, height: cOut.height, depth: 1), threadsPerThreadgroup: tg)
     enc.endEncoding()

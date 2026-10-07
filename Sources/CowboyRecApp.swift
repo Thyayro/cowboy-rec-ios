@@ -6,7 +6,7 @@ import AVFoundation
 }
 
 enum CameraTool: String, CaseIterable, Identifiable {
-  case grid, level, space, lut, frame, aspect
+  case grid, level, space, lut, match, frame, aspect
   var id: String { rawValue }
   var icon: String {
     switch self {
@@ -14,6 +14,7 @@ enum CameraTool: String, CaseIterable, Identifiable {
     case .level: return "level"
     case .space: return "cube.transparent"
     case .lut: return "camera.filters"
+    case .match: return "circle.lefthalf.filled"
     case .frame: return "rectangle.dashed"
     case .aspect: return "aspectratio"
     }
@@ -24,6 +25,7 @@ enum CameraTool: String, CaseIterable, Identifiable {
     case .level: return "Nível"
     case .space: return "3D"
     case .lut: return "LUT"
+    case .match: return "Igualar"
     case .frame: return "Moldura"
     case .aspect: return "Enquadrar"
     }
@@ -220,6 +222,7 @@ struct RecorderView: View {
     case .level: return tools.level
     case .space: return tools.space
     case .lut: return !LookPreset.named(camera.lookID).neutral || ((camera.logEnabled || camera.hdrEnabled) && !camera.rawLog)
+    case .match: return camera.lensMatchOn
     case .frame: return !tools.frame.isEmpty
     case .aspect: return tools.aspect != "livre"
     }
@@ -232,6 +235,7 @@ struct RecorderView: View {
     case .lut:
       if on { camera.setRawLog(false); if LookPreset.named(camera.lookID).neutral && !(camera.logEnabled || camera.hdrEnabled) { camera.setLook(UserDefaults.standard.string(forKey: "lastLook") ?? "cowboy") } }
       else { if !LookPreset.named(camera.lookID).neutral { UserDefaults.standard.set(camera.lookID, forKey: "lastLook") }; camera.setLook("natural"); camera.setRawLog(true) }
+    case .match: camera.setLensMatch(on)
     case .frame: tools.frame = on ? (UserDefaults.standard.string(forKey: "lastFrame") ?? "reels") : ""
     case .aspect: tools.aspect = on ? (UserDefaults.standard.string(forKey: "lastAspect") ?? "9:16") : "livre"
     }
@@ -278,6 +282,12 @@ struct RecorderView: View {
             Divider().frame(height: 20)
           }
           ForEach(LookPreset.all) { l in pill(l.label, camera.lookID == l.id) { camera.setLook(l.id); if !l.neutral { UserDefaults.standard.set(l.id, forKey: "lastLook") } } }
+        case .match:
+          ForEach([("ultra", "0,5×"), ("tele", "5×")], id: \.0) { item in
+            let n = camera.lensMatchStatus[item.0] ?? 0
+            pill(n > 0 ? "\(item.1) igualada (\(n))" : "\(item.1) aprendendo…", n > 0) {}
+          }
+          pill("Reaprender", false) { camera.resetLensMatch(); flash("Passe o zoom devagar por 1× e por 5× apontando pra mesma cena") }
         case .frame:
           ForEach([("reels", "Reels"), ("stories", "Stories"), ("feed", "Feed 4:5"), ("anuncio", "Anúncio")], id: \.0) { item in
             pill(item.1, tools.frame == item.0) { tools.frame = item.0; UserDefaults.standard.set(item.0, forKey: "lastFrame") }
@@ -316,7 +326,7 @@ struct RecorderView: View {
         let current = activePreset == value
         Button {
           UIImpactFeedbackGenerator(style: .light).impactOccurred()
-          camera.rampZoom(to: value)
+          camera.selectZoom(value)
         } label: {
           Text(current ? ZoomMath.label(camera.zoom) : ZoomMath.label(value).replacingOccurrences(of: "×", with: ""))
             .font(.system(size: current ? 13 : 12, weight: .bold)).monospacedDigit()

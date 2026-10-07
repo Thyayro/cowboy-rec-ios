@@ -194,6 +194,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
   static let thumbURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("last_thumb.jpg")
   private var recBaker: LutBaker?
+  let zoomDriver = ZoomDriver()
+  private var constituentObservation: NSKeyValueObservation?
+  private(set) var lensMatch: LensMatch?
+  @Published var lensMatchOn = UserDefaults.standard.object(forKey: "lensMatch") as? Bool ?? true
+  @Published var lensMatchStatus: [String: Int] = [:]
   // parar na hora: o toque derruba a gravação imediatamente (quadros que chegarem depois não entram)
   private let stopLock = NSLock()
   private var stopRequested = false
@@ -375,7 +380,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let sub = CMFormatDescriptionGetMediaSubType(cam.activeFormat.formatDescription)
       if videoOut.availableVideoPixelFormatTypes.contains(sub) { videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: sub] }
       if fastOK, fastOut.availableVideoPixelFormatTypes.contains(sub) { fastOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: sub] }
-      if cam.isVirtualDevice { cam.setPrimaryConstituentDeviceSwitchingBehavior(.auto, restrictedSwitchingBehaviorConditions: []) }
+      // troca de lente SÓ pelo zoom (no automático o iPhone também troca sozinho por foco perto/macro e pouca luz — salto no
+      // meio da tomada, com cor e luz diferentes)
+      if cam.isVirtualDevice {
+        if CowboyObjC.catching({ cam.setPrimaryConstituentDeviceSwitchingBehavior(.restricted, restrictedSwitchingBehaviorConditions: [.videoZoomChanged]) }) != nil {
+          cam.setPrimaryConstituentDeviceSwitchingBehavior(.auto, restrictedSwitchingBehaviorConditions: [])
+        }
+      }
       let nativeBase = displayBase(cam)
       let relative = zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor / base) : Double(cam.minAvailableVideoZoomFactor / nativeBase))
       cam.videoZoomFactor = max(cam.minAvailableVideoZoomFactor, min(CGFloat(relative) * nativeBase, cam.maxAvailableVideoZoomFactor))
@@ -406,6 +417,22 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
+      // igualar câmeras: lente ativa a cada instante (o quadro atrasado do arquivo procura a lente pelo próprio horário)
+      let match = lensMatch ?? LensMatch(deviceKey: cam.deviceType.rawValue)
+      lensMatch = match; renderer.lensMatch = match
+      match.onLearn = { [weak self] lens, c in
+        guard let self else { return }
+        let st = match.status(); self.publish { self.lensMatchStatus = st }
+        if c.samples == 1 || c.samples % 5 == 0 { Diag.step("lens-match", ["lens": lens, "n": c.samples, "gamma": String(format: "%.3f", c.gamma), "scale": String(format: "%.3f", c.scale), "gain": String(format: "%.3f %.3f %.3f", c.gain.x, c.gain.y, c.gain.z)]) }
+      }
+      constituentObservation?.invalidate()
+      if cam.isVirtualDevice {
+        constituentObservation = cam.observe(\.activePrimaryConstituent, options: [.initial, .new]) { cam, _ in
+          match.lensChanged(LensMatch.name(cam.activePrimaryConstituent?.deviceType))
+        }
+      } else { match.lensChanged(LensMatch.name(cam.deviceType)) }
+      let st0 = match.status()
+      DispatchQueue.main.async { self.zoomDriver.attach(cam); self.lensMatchStatus = st0 }
       renderer.onCrop = { c in Diag.step("crop-calib", ["crop": String(format: "%.3f", c)]) }
       zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
         guard let self else { return }
@@ -553,8 +580,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   // pinça/roda: segue o dedo com uma rampa rápida (suaviza sem atraso perceptível)
-  func followZoom(_ display: Double) { rampZoom(to: display, seconds: 0.06) }
-  func selectZoom(_ value: Double) { rampZoom(to: value) }
+  func followZoom(_ display: Double) { DispatchQueue.main.async { self.zoomDriver.follow(CGFloat(display) * self.base) } }
+  func selectZoom(_ value: Double) { DispatchQueue.main.async { self.zoomDriver.glide(to: CGFloat(value) * self.base) } }
+  func setLensMatch(_ on: Bool) { lensMatch?.setEnabled(on); lensMatchOn = on }
+  func resetLensMatch() { lensMatch?.reset(); lensMatchStatus = [:] }
   func setZoom(_ value: Double) { followZoom(value) }
 
   private func startTelemetry() {
@@ -852,7 +881,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     guard let writer, !stopping else { return }
     var baked: CMSampleBuffer?
     if let recBaker {
-      baked = recBaker.convert(sampleBuffer)
+      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds) ?? .identity)
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)

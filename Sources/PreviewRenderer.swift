@@ -31,6 +31,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // enquadramento do arquivo (corte medido); o arquivo continua com a estabilização Extrema. Zoom e troca de lente na hora.
   var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
   private var fastFresh = false
+  var lensMatch: LensMatch?
+  private var nextStats = 0.0
   private var fastAt = 0.0
   private var crop = 1.06
   private var cropSamples: [Double] = []
@@ -71,11 +73,40 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     fastBuffer = buffer; fastPTS = pts; fastFresh = true
     let now = CACurrentMediaTime()
     fastAt = now
+    let wantStats = lensMatch?.enabled == true && now >= nextStats
+    if wantStats { nextStats = now + 0.07 }
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib
     if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
     lock.unlock()
+    if wantStats, let lm = lensMatch { calibQueue.async { if let st = self.stats(buffer) { lm.observe(st, at: pts) } } }
     if go { calibQueue.async { if let img = self.small(buffer) { self.lock.lock(); self.calibFast = (pts, img); self.lock.unlock() } else { self.lock.lock(); self.calibBusy = false; self.lock.unlock() } } }
+  }
+  // cor/luz do quadro como sai na tela (depois do LUT, antes da correção): média RGB e luz em p20/p80
+  private func stats(_ buffer: CVPixelBuffer) -> FrameStats? {
+    var img = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+    let w = 64.0, sc = w / max(1, img.extent.width)
+    img = img.transformed(by: CGAffineTransform(scaleX: sc, y: sc))
+    img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+    let (cube, size) = currentCube(); img = Self.filtered(img, cube: cube, size: size)
+    let W = Int(img.extent.width), H = Int(img.extent.height)
+    guard W > 4, H > 4 else { return nil }
+    var bytes = [UInt8](repeating: 0, count: W * H * 4)
+    context.render(img, toBitmap: &bytes, rowBytes: W * 4, bounds: CGRect(x: 0, y: 0, width: W, height: H), format: .RGBA8, colorSpace: nil)
+    var sum = SIMD3<Float>(0, 0, 0); var lum = [Float](); lum.reserveCapacity(W * H)
+    for i in stride(from: 0, to: bytes.count, by: 4) {
+      let c = SIMD3<Float>(Float(bytes[i]), Float(bytes[i + 1]), Float(bytes[i + 2])) / 255
+      sum += c; lum.append(c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722)
+    }
+    lum.sort()
+    return FrameStats(mean: sum / Float(W * H), p20: lum[lum.count / 5], p80: lum[lum.count * 4 / 5])
+  }
+  static func matched(_ image: CIImage, _ m: LensCorrection) -> CIImage {
+    if m.isIdentity { return image }
+    var i = image.applyingFilter("CIGammaAdjust", parameters: ["inputPower": m.gamma])
+    i = i.applyingFilter("CIColorMatrix", parameters: ["inputRVector": CIVector(x: CGFloat(m.scale * m.gain.x), y: 0, z: 0, w: 0),
+      "inputGVector": CIVector(x: 0, y: CGFloat(m.scale * m.gain.y), z: 0, w: 0), "inputBVector": CIVector(x: 0, y: 0, z: CGFloat(m.scale * m.gain.z), w: 0)])
+    return i
   }
   private func small(_ buffer: CVPixelBuffer) -> CGImage? {
     var img = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
@@ -141,11 +172,12 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let a = zoomHistory.dropLast().last, let b = zoomHistory.last, abs(a.1 - b.1) > 0.0005 { lastZoomMove = now }
     let live = lightPreview && fast != nil && now - fastAt < 0.5
     let liveFrame: CVPixelBuffer? = live && fastFresh ? fast : nil
+    let livePTS = fastPTS
     if live { fastFresh = false; pending = nil }
     lock.unlock()
     if live {
       guard let liveFrame else { return }
-      drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror)
+      drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now) ?? .identity)
       return
     }
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
@@ -181,7 +213,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       }
     }
     image = image.cropped(to: fit)
-    image = Self.filtered(image, cube: cube, size: size)
+    image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
@@ -192,7 +224,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     frames += 1
   }
 
-  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool) {
+  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection) {
     guard let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
@@ -202,7 +234,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let sc = fitScale * max(1, crop)
     image = image.transformed(by: CGAffineTransform(scaleX: sc, y: sc))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY)).cropped(to: fit)
-    image = Self.filtered(image, cube: cube, size: size)
+    image = Self.matched(Self.filtered(image, cube: cube, size: size), match).cropped(to: fit)
     image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target)))
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
