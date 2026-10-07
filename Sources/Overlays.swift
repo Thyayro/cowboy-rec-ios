@@ -44,9 +44,9 @@ struct CameraOverlay: View {
   var body: some View {
     ZStack {
       if Framing.ratio(tools.aspect) > 0 { mask }
-      if tools.grid { grid }
-      if !tools.frame.isEmpty { instagram }
-      if (tools.level || tools.space) && !camera.front {
+      if tools.grid && !camera.recording { grid }
+      if !tools.frame.isEmpty && !camera.recording { instagram }
+      if (tools.level || tools.space) && !camera.front && !camera.recording {
         TimelineView(.animation) { _ in
           Canvas { ctx, _ in
             guard let m = MotionHub.shared.snapshot() else { return }

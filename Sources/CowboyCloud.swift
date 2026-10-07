@@ -232,7 +232,7 @@ struct CowboyAccountView: UIViewRepresentable {
       CowboyCloud.shared.status="Download interrompido: \(error.localizedDescription)"
     }
     @MainActor func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-      decisionHandler(origin.protocol == "https" && origin.host == CowboyCloud.origin.host ? .prompt : .deny)
+      decisionHandler(origin.protocol == "https" && origin.host == CowboyCloud.origin.host ? .grant : .deny)
     }
     @MainActor func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
       if navigationAction.targetFrame == nil, let url=navigationAction.request.url, url.host == CowboyCloud.origin.host { webView.load(navigationAction.request) }

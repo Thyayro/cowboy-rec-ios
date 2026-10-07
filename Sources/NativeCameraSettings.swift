@@ -27,8 +27,9 @@ struct NativeCameraSettings: View {
         if !camera.logAvailable { Text("Apple Log não aparece nesta lente/formato (\(camera.formatLabel)). Só iPhone Pro grava Log.").font(.caption2) }
         Toggle("HDR (HLG)", isOn: Binding(get: { camera.hdrEnabled }, set: { camera.setHDR($0) })).disabled(configuringDisabled || !camera.hdrAvailable || camera.logEnabled)
         Toggle("Prévia em Rec.709 (LUT do Log)", isOn: Binding(get: { !camera.rawLog }, set: { camera.setRawLog(!$0) })).disabled(!(camera.logEnabled || camera.hdrEnabled))
-        Toggle("Cópia Rec.709 na VPS (guarda o Log)", isOn: $camera.convertRec709).disabled(configuringDisabled)
-        Text("O arquivo sai em Apple Log de verdade (10 bits, HEVC). Na tela você vê o Rec.709 pelo mesmo LUT da VPS; ao terminar de subir, a VPS cria a cópia Rec.709 na mesma resolução e fps e mantém o Log original pra colorir.").font(.caption2)
+        Toggle("Arquivo final em Rec.709 + look", isOn: $camera.bake709).disabled(configuringDisabled)
+        Text(camera.bake709 ? "Ligado: cada quadro do Log real (10 bits) é convertido no iPhone pela curva oficial do Apple Log pra Rec.709 e recebe o look escolhido. O arquivo que sobe já é o final, sem esperar a VPS." : "Desligado: sobe o Apple Log original (10 bits) pra colorir; a VPS faz a cópia Rec.709 + look depois.").font(.caption2)
+        Toggle("Cópia Rec.709 na VPS (guarda o Log)", isOn: $camera.convertRec709).disabled(configuringDisabled || camera.bake709)
         Picker("Codec", selection: Binding(get: { camera.codec }, set: { camera.setCodec($0) })) {
           ForEach(camera.codecs, id: \.self) { codec in Text(codec == "hvc1" ? "HEVC" : codec == "avc1" ? "H.264" : codec).tag(codec) }
         }.disabled(configuringDisabled || camera.hdrEnabled || camera.logEnabled)

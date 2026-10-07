@@ -3,6 +3,7 @@ import Combine
 import CoreImage
 import QuartzCore
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 import VideoToolbox
 
@@ -184,6 +185,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var lookID = UserDefaults.standard.string(forKey: "look") ?? "natural"
   @Published var rawLog = false
   @Published var droppedFrames = 0
+  // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
+  @Published var bake709 = UserDefaults.standard.object(forKey: "bake709") as? Bool ?? true { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
+  @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
+  static let thumbURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("last_thumb.jpg")
+  private var recBaker: LutBaker?
   @Published var recoverableFile: URL?
   var onSaved: ((URL, String?) -> Void)?
   var spaceMeta: (() -> [String: Any])?
@@ -198,7 +204,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       MotionHub.shared.start()
       queue.async {
         do {
-          if !self.configured { try self.configure() }
+          if !self.configured { try self.guarded { try self.configure() } }
           if !self.session.isRunning { self.session.startRunning() }
           self.configureStabilization()
           self.startTelemetry()
@@ -366,6 +372,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       device = cam; base = nativeBase; selectedProfile = chosen; requestedHDR = wantsHDR; requestedLog = wantsLog; requestedCodec = encoding; configured = true
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
+      renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
       zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
         guard let self else { return }
         let value = Double(cam.videoZoomFactor / nativeBase), raw = Double(cam.videoZoomFactor)
@@ -415,9 +422,17 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     queue.async {
       guard !self.isRecording else { self.publish { self.status = "Pare a gravação antes de trocar câmera, formato ou codec" }; return }
       self.publish { self.ready = false }
-      do { try action(); self.publish { self.ready = self.session.isRunning } }
-      catch { self.publish { self.ready = self.session.isRunning; self.status = error.localizedDescription } }
+      self.renderer.freeze()
+      do { try self.guarded(action); self.publish { self.ready = self.session.isRunning } }
+      catch { Diag.step("config-fail", ["err": error.localizedDescription]); self.publish { self.ready = self.session.isRunning; self.status = error.localizedDescription } }
+      self.renderer.thaw()
     }
+  }
+  // o AVFoundation recusa configuração inválida com exceção (fecharia o app): vira erro comum
+  private func guarded(_ action: () throws -> Void) throws {
+    var thrown: Error?
+    if let ex = CowboyObjC.catching({ do { try action() } catch { thrown = error } }) { throw failure(ex) }
+    if let thrown { throw thrown }
   }
   private var isRecording: Bool { dataQueue.sync { writer != nil } }
   func selectLens(_ id: String) { reconfigure { try self.configure(cameraID: id) } }
@@ -497,7 +512,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         try cam.lockForConfiguration(); defer { cam.unlockForConfiguration() }
         let target = max(cam.minAvailableVideoZoomFactor, min(CGFloat(display) * self.base, cam.maxAvailableVideoZoomFactor))
         let rate = ZoomMath.rampRate(from: Double(cam.videoZoomFactor), to: Double(target), seconds: seconds)
-        cam.ramp(toVideoZoomFactor: target, withRate: Float(rate))
+        _ = CowboyObjC.catching { cam.ramp(toVideoZoomFactor: target, withRate: Float(rate)) }
       } catch { self.publish { self.status = error.localizedDescription } }
     }
   }
@@ -513,7 +528,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     timer.setEventHandler { [weak self] in
       guard let self, let cam = self.device, self.session.isRunning else { return }
       let iso = Double(cam.iso), shutter = 1 / max(0.000001, CMTimeGetSeconds(cam.exposureDuration)), position = Double(cam.lensPosition), bias = Double(cam.exposureTargetBias)
-      let temp = Double(cam.temperatureAndTintValues(for: cam.deviceWhiteBalanceGains).temperature)
+      var temp = self.temperature
+      _ = CowboyObjC.catching {
+        var g = cam.deviceWhiteBalanceGains; let mx = cam.maxWhiteBalanceGain
+        guard g.redGain.isFinite, g.greenGain.isFinite, g.blueGain.isFinite, mx >= 1 else { return }
+        g.redGain = max(1, min(mx, g.redGain)); g.greenGain = max(1, min(mx, g.greenGain)); g.blueGain = max(1, min(mx, g.blueGain))
+        temp = Double(cam.temperatureAndTintValues(for: g).temperature)
+      }
       let actual = self.videoOut.connection(with: .video)?.activeVideoStabilizationMode ?? .off
       self.publish { self.iso = iso; self.shutter = shutter; self.lensPosition = position; self.exposureBias = bias; self.temperature = temp; self.activeMode = actual }
     }
@@ -534,8 +555,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private func control(_ action: @escaping @Sendable (AVCaptureDevice) throws -> Void) {
     queue.async {
       guard let cam = self.device, self.session.isRunning else { return }
-      do { try cam.lockForConfiguration(); defer { cam.unlockForConfiguration() }; try action(cam) }
-      catch { self.publish { self.status = error.localizedDescription } }
+      do { try cam.lockForConfiguration(); defer { cam.unlockForConfiguration() }; try self.guarded { try action(cam) } }
+      catch { Diag.step("control-fail", ["err": error.localizedDescription]); self.publish { self.status = error.localizedDescription } }
     }
   }
   func setTorch(_ enabled: Bool) {
@@ -622,7 +643,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       guard self.configured, self.session.isRunning, !self.isRecording, let cam = self.device else { return }
       do {
         Diag.step("record-tap", ["codec": self.requestedCodec.rawValue, "fmt": self.selectedProfile.label, "log": self.requestedLog])
-        var (videoSettings, how) = self.writerVideoSettings(cam)
+        let source: SourceColor = self.requestedLog ? .appleLog : self.requestedHDR ? .hlg : .sdr
+        let bakeFn = self.bake709 ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
+        let baker = bakeFn.flatMap { LutBaker(transform: $0) }
+        var (videoSettings, how) = self.writerVideoSettings(cam, bake: baker != nil)
         var compression = (videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any]) ?? [:]
         let codecName = (videoSettings[AVVideoCodecKey] as? AVVideoCodecType)?.rawValue ?? (videoSettings[AVVideoCodecKey] as? String) ?? ""
         if codecName == AVVideoCodecType.hevc.rawValue || codecName == AVVideoCodecType.h264.rawValue {
@@ -655,8 +679,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         Diag.step("writer-ok", ["mode": localFile == nil ? "nuvem" : "arquivo", "audio": writer.hasAudio], send: false)
         let mode = self.videoOut.connection(with: .video)?.activeVideoStabilizationMode ?? .off
         let profile = self.selectedProfile
-        let colorProfile = self.requestedLog ? "applelog" : self.requestedHDR ? "hlg" : "rec709"
+        let colorProfile = baker != nil ? "rec709" : self.requestedLog ? "applelog" : self.requestedHDR ? "hlg" : "rec709"
         var meta = NativeCaptureMetadata(width: profile.width, height: profile.height, frameRate: profile.fps, hdr: self.requestedHDR, codec: self.requestedCodec.rawValue, lens: self.name(cam), stabilization: Self.label(mode), colorProfile: colorProfile, convertRec709: convert, captureMode: "avfoundation-stream").settings
+        if baker != nil { meta["baked"] = "\(source == .appleLog ? "Apple Log" : source == .hlg ? "HLG" : "SDR") -> Rec.709\(look.neutral ? "" : " + look " + look.label) (no iPhone, 10 bits)" }
         meta["zoom"] = Double(cam.videoZoomFactor / self.base); meta["bitrate"] = bitrate ?? (compression[AVVideoAverageBitRateKey] as? Int ?? 0); meta["rotation"] = angle
         let lookBody: Any = look.neutral ? NSNull() : ["id": look.id, "p": look.p]
         let body: [String: Any] = ["label": self.name(cam), "mime": "video/mp4", "settings": meta, "stabilization": ["enabled": false], "facing": isFront ? "user" : "environment",
@@ -667,13 +692,14 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           let m = NativeCaptureMetadata(width: profile.width, height: profile.height, frameRate: profile.fps, hdr: self.requestedHDR, codec: self.requestedCodec.rawValue, lens: self.name(cam), stabilization: Self.label(mode), colorProfile: colorProfile, convertRec709: convert, captureMode: "avfoundation-file")
           try JSONEncoder().encode(m).write(to: localFile.appendingPathExtension("capture"), options: .atomic)
           self.dataQueue.async {
-            self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = true; self.gyro = nil; self.elapsedMs = 0
+            self.recBaker = baker
+            self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = nil; self.elapsedMs = 0
             self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
           }
           return
         }
         let cid = CloudStream.shared.begin(owner: owner, title: "iPhone \(f.string(from: Date()))", body: body)
-        if !look.neutral {
+        if !look.neutral && baker == nil {
           let text = ColorMath.cubeText(title: "Cowboy \(look.label)") { ColorMath.grade($0, look.p) }
           CloudStream.shared.side(cid, kind: "cube", data: Data(text.utf8))
         }
@@ -683,6 +709,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           CloudStream.shared.push(cid, data, durationMs: self.elapsedMs)
         }
         self.dataQueue.async {
+          self.recBaker = baker
           self.writer = writer; self.recCid = cid; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = gyro; self.elapsedMs = 0
           MotionHub.shared.attach(gyro)
           self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
@@ -697,13 +724,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // Configuração do codificador. 0.5.1 travava aqui: recommendedVideoSettings LANÇA exceção (NSException) em alguns
   // formatos do iPhone 16 Pro (medido: AVFCapture dentro de record, 07/10). Agora: codec que o escritor aceita, recomendado
   // protegido (mp4, depois mov) e, se o iPhone recusar os dois, configuração montada à mão pelo formato ativo.
-  private func writerVideoSettings(_ cam: AVCaptureDevice) -> ([String: Any], String) {
+  private func writerVideoSettings(_ cam: AVCaptureDevice, bake: Bool = false) -> ([String: Any], String) {
     var codecs: [AVVideoCodecType] = []
     _ = CowboyObjC.catching { codecs = self.videoOut.availableVideoCodecTypesForAssetWriter(writingTo: .mp4) }
     // HEVC/H.264 sempre: o "recomendado" do iPhone em Apple Log é ProRes 422 HQ (apch, 760 Mb/s — medido 07/10), que não
     // sobe ao vivo e não aceita quadro-chave por segundo. O codificador HEVC 10 bits aceita os quadros Log do mesmo jeito.
     let codec: AVVideoCodecType = requestedCodec == .h264 ? .h264 : .hevc
-    if codecs.contains(codec) {
+    if codecs.contains(codec) && !bake {
       for type in [AVFileType.mp4, .mov] {
         var got: [String: Any]?
         let ex = CowboyObjC.catching { got = self.videoOut.recommendedVideoSettings(forVideoCodecType: codec, assetWriterOutputFileType: type) }
@@ -717,20 +744,22 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let w = Int(d.width), h = Int(d.height), fps = selectedProfile.fps
     let bitrate = max(8_000_000, min(100_000_000, Int(Double(w * h) * fps * 0.12)))
     var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate, AVVideoExpectedSourceFrameRateKey: Int(fps.rounded())]
-    if codec == .hevc { compression[AVVideoProfileLevelKey] = (requestedLog || requestedHDR) ? (kVTProfileLevel_HEVC_Main10_AutoLevel as String) : (kVTProfileLevel_HEVC_Main_AutoLevel as String) }
+    if codec == .hevc { compression[AVVideoProfileLevelKey] = (requestedLog || requestedHDR || bake) ? (kVTProfileLevel_HEVC_Main10_AutoLevel as String) : (kVTProfileLevel_HEVC_Main_AutoLevel as String) }
     else { compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel }
     var settings: [String: Any] = [AVVideoCodecKey: codec, AVVideoWidthKey: w, AVVideoHeightKey: h, AVVideoCompressionPropertiesKey: compression]
-    if requestedHDR {
+    if requestedHDR && !bake {
       settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG, AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020]
-    } else if !requestedLog {
+    } else if !requestedLog || bake {
       settings[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2, AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2]
     }   // Apple Log: a etiqueta de cor vem dos próprios quadros (o escritor copia)
-    return (settings, "manual")
+    return (settings, bake ? "manual-709" : "manual")
   }
   func stopRecording() {
     dataQueue.async {
       guard let writer = self.writer else { return }
       self.writer = nil
+      if let b = self.recBaker, b.failures > 0 { Diag.step("bake-failures", ["n": b.failures]) }
+      self.recBaker = nil
       if let file = writer.fileURL {
         let owner = self.recOwner; self.recOwner = nil
         self.publish { self.recording = false; self.finishing = true }
@@ -771,17 +800,24 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     if output === audioOut { writer?.appendAudio(sampleBuffer); return }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
-    if let pixel { renderer.push(pixel) }
-    guard let writer else { return }
-    writer.appendVideo(sampleBuffer)
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    if let pixel { renderer.push(pixel, pts: pts.seconds) }
+    guard let writer else { return }
+    var baked: CMSampleBuffer?
+    if let recBaker { baked = recBaker.convert(sampleBuffer) }
+    writer.appendVideo(baked ?? sampleBuffer)
     if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds) }
     if let s = recStart { elapsedMs = Int((pts - s).seconds * 1000) }
-    if !thumbDone, let pixel, let cid = recCid {
+    if !thumbDone, let pixel {
       thumbDone = true
-      let angle = recAngle, isFront = recFront
+      let angle = recAngle, isFront = recFront, cid = recCid
+      let thumbPixel = baked.flatMap { CMSampleBufferGetImageBuffer($0) } ?? pixel, cooked = baked != nil
       DispatchQueue.global(qos: .utility).async {
-        if let jpeg = self.renderer.thumbnail(pixel, orientation: isFront ? .up : Self.orientation(angle), mirrored: false) { CloudStream.shared.side(cid, kind: "thumb", data: jpeg) }
+        guard let jpeg = self.renderer.thumbnail(thumbPixel, orientation: isFront ? .up : Self.orientation(angle), mirrored: false, applyCube: !cooked) else { return }
+        if let cid { CloudStream.shared.side(cid, kind: "thumb", data: jpeg) }
+        try? jpeg.write(to: Self.thumbURL, options: .atomic)
+        let img = UIImage(data: jpeg)
+        self.publish { self.lastThumb = img }
       }
     }
     let now = CACurrentMediaTime()

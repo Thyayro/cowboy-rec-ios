@@ -1,0 +1,3 @@
+"NSCameraUsageDescription" = "O Cowboy usa a câmera do iPhone para gravar direto na nuvem.";
+"NSMicrophoneUsageDescription" = "O Cowboy grava o áudio junto do vídeo.";
+"CFBundleDisplayName" = "Cowboy Rec";

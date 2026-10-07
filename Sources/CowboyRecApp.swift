@@ -45,6 +45,7 @@ struct RecorderView: View {
   @State private var dialStart: Double?
   @State private var focusPoint: CGPoint?
   @State private var toast: String?
+  @State private var iconAngle: Double = 0
   @Environment(\.scenePhase) private var phase
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 1, green: 0.8, blue: 0)
@@ -122,7 +123,10 @@ struct RecorderView: View {
       if let owner = cloud.email { camera.recoverSaved(owner: owner); CloudStream.shared.resume(owner: owner); camera.start() } else { open(.account) }
     }
     .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { updateAngle() }
+      // tela travada em pé: só os ícones giram pra dar leitura (o vídeo usa o horizonte do aparelho)
+      let o = UIDevice.current.orientation
+      let a: Double? = o == .portrait ? 0 : o == .landscapeLeft ? 90 : o == .landscapeRight ? -90 : o == .portraitUpsideDown ? 180 : nil
+      if let a, a != iconAngle { withAnimation(.easeInOut(duration: 0.25)) { iconAngle = a } }
     }
     .onChange(of: phase) { _, value in
       if value == .background { camera.close(); CloudStream.shared.enterBackground(); MotionHub.shared.stop() }
@@ -151,8 +155,8 @@ struct RecorderView: View {
       }.padding(.leading, 10).padding(.top, 10)
       Spacer()
       if let panel, !camera.recording { panelView(panel).padding(.bottom, 10) }
-      lensBar.padding(.bottom, 12)
-      if camera.recording || stream.pendingMB > 1 { uploadLine.padding(.bottom, 8) }
+      if !camera.recording { lensBar.padding(.bottom, 12) }
+      if (!camera.recording && stream.pendingMB > 1) || (camera.recording && (stream.health == .offline || stream.health == .slow || stream.health == .error)) { uploadLine.padding(.bottom, 8) }
       bottomRow.padding(.bottom, 6)
     }
     .animation(.easeOut(duration: 0.18), value: camera.recording)
@@ -171,7 +175,7 @@ struct RecorderView: View {
           }.foregroundStyle(.white).padding(.horizontal, 10).padding(.vertical, 6).background(.white.opacity(0.12), in: Capsule())
         }.disabled(camera.recording)
         Spacer()
-        Text(timeText).font(.system(size: 16, weight: .semibold, design: .monospaced)).foregroundStyle(.white)
+        Text(timeText).font(.system(size: 16, weight: .semibold, design: .monospaced)).foregroundStyle(.white).rotationEffect(.degrees(abs(iconAngle) == 90 ? 0 : iconAngle))
           .padding(.horizontal, 10).padding(.vertical, 4).background(camera.recording ? rec : .white.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
         Spacer()
         if camera.torchAvailable {
@@ -190,7 +194,8 @@ struct RecorderView: View {
     var parts = ["Estab. \(NativeCamera.label(camera.activeMode))"]
     if camera.logEnabled { parts.append(camera.rawLog ? "Apple Log (cru)" : "Apple Log → prévia Rec.709") }
     if !LookPreset.named(camera.lookID).neutral { parts.append("look \(LookPreset.named(camera.lookID).label)") }
-    parts.append(camera.recording ? "gravando direto na nuvem" : "grava direto na nuvem")
+    parts.append(camera.recording ? (stream.line.isEmpty ? "gravando direto na nuvem" : stream.line) : "grava direto na nuvem")
+    if camera.bake709 && (camera.logEnabled || camera.hdrEnabled || !LookPreset.named(camera.lookID).neutral) { parts.append("arquivo Rec.709 + look") }
     if camera.droppedFrames > 0 { parts.append("\(camera.droppedFrames) quadros perdidos") }
     return parts.joined(separator: " · ")
   }
@@ -246,7 +251,7 @@ struct RecorderView: View {
               .overlay(Circle().stroke(panel == t ? Color.white : .clear, lineWidth: 1.5))
               .foregroundStyle(isOn(t) ? .black : .white)
             Text(t.title).font(.system(size: 9, weight: .semibold)).foregroundStyle(.white).shadow(radius: 2)
-          }
+          }.rotationEffect(.degrees(iconAngle))
         }.buttonStyle(.plain)
       }
     }
@@ -317,6 +322,7 @@ struct RecorderView: View {
             .foregroundStyle(current ? gold : .white)
             .frame(minWidth: current ? 44 : 34, minHeight: current ? 44 : 34)
             .background(Color.black.opacity(0.5), in: Circle())
+            .rotationEffect(.degrees(iconAngle))
         }.buttonStyle(.plain)
       }
     }
@@ -342,8 +348,15 @@ struct RecorderView: View {
   private var bottomRow: some View {
     HStack {
       Button { open(.library) } label: {
-        Image(systemName: "photo.stack").font(.system(size: 20, weight: .semibold)).frame(width: 50, height: 50)
-          .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white)
+        Group {
+          if let thumb = camera.lastThumb {
+            Image(uiImage: thumb).resizable().scaledToFill().frame(width: 50, height: 50).clipShape(RoundedRectangle(cornerRadius: 12))
+              .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.8), lineWidth: 1.5))
+          } else {
+            Image(systemName: "photo.stack").font(.system(size: 20, weight: .semibold)).frame(width: 50, height: 50)
+              .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white)
+          }
+        }.rotationEffect(.degrees(iconAngle))
       }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing)
       Spacer()
       Button(action: shutter) {
@@ -356,7 +369,7 @@ struct RecorderView: View {
       Spacer()
       Button { camera.flip() } label: {
         Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 20, weight: .semibold)).frame(width: 50, height: 50)
-          .background(Color.black.opacity(0.45), in: Circle()).foregroundStyle(.white)
+          .background(Color.black.opacity(0.45), in: Circle()).foregroundStyle(.white).rotationEffect(.degrees(iconAngle))
       }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing || !camera.ready)
     }.padding(.horizontal, 28)
   }
@@ -398,7 +411,7 @@ struct RecorderView: View {
     if camera.recording { UIImpactFeedbackGenerator(style: .medium).impactOccurred(); camera.stopRecording(); return }
     guard let owner = cloud.email else { open(.account); return }
     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-    panel = nil
+    withAnimation(.easeOut(duration: 0.15)) { panel = nil }
     camera.record(owner: owner, aspect: tools.aspect, look: LookPreset.named(camera.lookID))
   }
   private func open(_ destination: CowboyPortal) { camera.close(); portal = destination }

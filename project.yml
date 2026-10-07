@@ -15,9 +15,11 @@ settings:
     INFOPLIST_KEY_UIRequiresFullScreen: YES
     INFOPLIST_KEY_UILaunchScreen_Generation: YES
     INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
-    INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-    MARKETING_VERSION: "0.5.3"
-    CURRENT_PROJECT_VERSION: "10"
+    INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+    DEVELOPMENT_LANGUAGE: pt-BR
+    INFOPLIST_KEY_CFBundleDevelopmentRegion: pt-BR
+    MARKETING_VERSION: "0.5.4"
+    CURRENT_PROJECT_VERSION: "11"
 targets:
   CowboyRec:
     type: application

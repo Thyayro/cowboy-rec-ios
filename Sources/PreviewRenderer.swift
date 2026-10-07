@@ -1,6 +1,7 @@
 import CoreImage
 import Metal
 import MetalKit
+import QuartzCore
 import SwiftUI
 
 // Preview drawn from the SAME stabilized frames that go to the file (what you see is what is recorded), with the
@@ -12,6 +13,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   let context: CIContext
   private let lock = NSLock()
   private var pending: CVPixelBuffer?
+  private var pendingPTS: Double?
+  private var frozen = false
+  private var dropFrames = 0
+  // zoom sem atraso: a estabilização entrega o quadro ~0,3–1 s depois; o zoom da tela usa o zoom de AGORA sobre o quadro
+  // atrasado (escala = zoom agora ÷ zoom no instante em que o quadro foi captado). O arquivo não muda.
+  var zoomNow: (() -> Double?)?
+  private var zoomHistory: [(Double, Double)] = []
   private var cube: Data?
   private var cubeSize = 33
   private var orientation: CGImagePropertyOrientation = .right
@@ -25,7 +33,22 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let device { context = CIContext(mtlDevice: device, options: options) } else { context = CIContext(options: options) }
     super.init()
   }
-  func push(_ buffer: CVPixelBuffer) { lock.lock(); pending = buffer; lock.unlock() }
+  func push(_ buffer: CVPixelBuffer, pts: Double? = nil) {
+    lock.lock(); defer { lock.unlock() }
+    if frozen { return }
+    if dropFrames > 0 { dropFrames -= 1; return }
+    pending = buffer; pendingPTS = pts
+  }
+  // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
+  func freeze() { lock.lock(); frozen = true; pending = nil; lock.unlock() }
+  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); lock.unlock() }
+  private func zoomAt(_ t: Double) -> Double? {
+    guard let first = zoomHistory.first else { return nil }
+    if t <= first.0 { return first.1 }
+    var last = first
+    for e in zoomHistory { if e.0 > t { let k = (t - last.0) / max(0.0001, e.0 - last.0); return last.1 + (e.1 - last.1) * k }; last = e }
+    return last.1
+  }
   func setCube(_ data: Data?, size: Int) { lock.lock(); cube = data; cubeSize = size; lock.unlock() }
   func setOrientation(_ value: CGImagePropertyOrientation, mirrored mirror: Bool) { lock.lock(); orientation = value; mirrored = mirror; lock.unlock() }
   func currentCube() -> (Data?, Int) { lock.lock(); defer { lock.unlock() }; return (cube, cubeSize) }
@@ -45,16 +68,27 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
 
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
   func draw(in view: MTKView) {
-    lock.lock(); let buffer = pending; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored; lock.unlock()
+    let now = CACurrentMediaTime()
+    let zNow = zoomNow?()
+    lock.lock()
+    if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
+    let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
+    let zFrame = pts.flatMap { zoomAt($0) }
+    lock.unlock()
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
     var image = Self.oriented(buffer, orient, mirrored: mirror)
+    var k = 1.0
+    if let zNow, let zFrame, zFrame > 0 { k = max(0.3, min(6, zNow / zFrame)); if abs(k - 1) < 0.004 { k = 1 } }
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
-    image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    let fit = CGRect(x: (target.width - image.extent.width * scale) / 2, y: (target.height - image.extent.height * scale) / 2, width: image.extent.width * scale, height: image.extent.height * scale)
+    image = image.transformed(by: CGAffineTransform(scaleX: scale * k, y: scale * k))
+    image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
+    if k < 1 { image = image.clampedToExtent() }
+    image = image.cropped(to: fit)
     image = Self.filtered(image, cube: cube, size: size)
-    image = image.transformed(by: CGAffineTransform(translationX: (target.width - image.extent.width) / 2 - image.extent.minX, y: (target.height - image.extent.height) / 2 - image.extent.minY))
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
@@ -66,12 +100,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   }
 
   // First frame of a take -> small JPEG for the cloud library (with the same LUT, so Log takes show in Rec.709).
-  func thumbnail(_ buffer: CVPixelBuffer, orientation: CGImagePropertyOrientation, mirrored: Bool) -> Data? {
+  func thumbnail(_ buffer: CVPixelBuffer, orientation: CGImagePropertyOrientation, mirrored: Bool, applyCube: Bool = true) -> Data? {
     var image = Self.oriented(buffer, orientation, mirrored: mirrored)
     let scale = 360 / max(1, image.extent.width)
     image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-    let (cube, size) = currentCube()
-    image = Self.filtered(image, cube: cube, size: size)
+    if applyCube { let (cube, size) = currentCube(); image = Self.filtered(image, cube: cube, size: size) }
     image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
     guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
     return context.jpegRepresentation(of: image, colorSpace: space, options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.8])
