@@ -364,7 +364,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       zoomObservation?.invalidate(); rotationObservation?.invalidate()
       device = cam; base = nativeBase; selectedProfile = chosen; requestedHDR = wantsHDR; requestedLog = wantsLog; requestedCodec = encoding; configured = true
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
-      rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil)
+      DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
         guard let self else { return }
         let value = Double(cam.videoZoomFactor / nativeBase), raw = Double(cam.videoZoomFactor)
@@ -616,6 +616,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // ---- gravar: direto na nuvem
   func record(owner: String, aspect: String, look: LookPreset) {
     let convert = convertRec709, bitrate = Self.bitrates[max(0, min(Self.bitrates.count - 1, bitrateChoice))].bps
+    let horizon: Double? = rotation.map { Double($0.videoRotationAngleForHorizonLevelCapture) }   // lido na thread principal
     queue.async {
       guard self.configured, self.session.isRunning, !self.isRecording, let cam = self.device else { return }
       do {
@@ -628,7 +629,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         // AAC estéreo explícito: o "recomendado" do iPhone 16 pode ser áudio espacial (APAC/4 canais), que o MP4 fragmentado recusa
         let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 256000]
         let isFront = cam.position == .front
-        let angle: Double = isFront ? 0 : Double(self.rotation?.videoRotationAngleForHorizonLevelCapture ?? CGFloat(self.previewAngle))
+        let angle: Double = isFront ? 0 : (horizon ?? self.previewAngle)
         let transform = CGAffineTransform(rotationAngle: CGFloat(angle * .pi / 180))
         Diag.step("record-start", ["fmt": self.selectedProfile.label, "log": self.requestedLog, "codec": self.requestedCodec.rawValue, "angle": angle, "video": String(String(describing: videoSettings).prefix(600))])
         var writer: SegmentWriter
