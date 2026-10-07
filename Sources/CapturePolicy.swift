@@ -9,6 +9,10 @@ struct NativeCaptureProfile: Hashable, Identifiable, Sendable {
     let resolution = width == 3840 && height == 2160 ? "4K" : width == 1920 && height == 1080 ? "1080p" : width == 1280 && height == 720 ? "720p" : "\(width)×\(height)"
     return "\(resolution) · \(String(format: "%g", fps)) fps"
   }
+  var short: String {
+    let resolution = width == 3840 ? "4K" : width == 1920 ? "HD" : width == 1280 ? "720" : "\(height)p"
+    return "\(resolution) · \(String(format: "%g", fps.rounded()))"
+  }
   static let main = NativeCaptureProfile(width: 3840,height: 2160,fps: 60)
 }
 struct NativeFrameRange: Sendable { let min: Double; let max: Double }
@@ -20,6 +24,7 @@ struct NativeFormatDescriptor: Sendable {
   let hdr: Bool
   let stabilized: Bool
   var log: Bool = false
+  var tenBit: Bool = false
   func supports(_ p: NativeCaptureProfile,hdr requestedHDR: Bool,log requestedLog: Bool = false) -> Bool {
     width == p.width && height == p.height && (!requestedHDR || hdr) && (!requestedLog || log) && ranges.contains { $0.min <= p.fps+0.001 && $0.max >= p.fps-0.001 }
   }
@@ -37,9 +42,13 @@ enum NativeCapturePolicy {
     }
     return choices.sorted { a,b in a.width*a.height == b.width*b.height ? a.fps < b.fps : a.width*a.height > b.width*b.height }
   }
+  // Never trades resolution/fps for stabilization. Among formats that give exactly the profile: the one that supports the
+  // strongest stabilization first, then 10-bit only when Log/HDR needs it (8-bit SDR is lighter for the encoder and upload).
   static func select(_ profile: NativeCaptureProfile,hdr: Bool,formats: [NativeFormatDescriptor],log: Bool = false) -> Int? {
+    let wantTen = hdr || log
+    let score = { (f: NativeFormatDescriptor) -> Int in (f.stabilized ? 2 : 0) + (f.tenBit == wantTen ? 1 : 0) }
     let matches=formats.filter { $0.supports(profile,hdr:hdr,log:log) }
-    return (matches.first(where: { $0.stabilized }) ?? matches.first)?.index
+    return matches.sorted { a,b in score(a) == score(b) ? a.index < b.index : score(a) > score(b) }.first?.index
   }
 }
 

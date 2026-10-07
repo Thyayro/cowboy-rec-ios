@@ -12,7 +12,7 @@ jobs:
       - name: Generate project
         run: brew install xcodegen && xcodegen generate
       - name: Verify native format policy
-        run: swiftc Sources/CapturePolicy.swift Tests/CapturePolicyTests.swift -o /tmp/cowboy-capture-policy && /tmp/cowboy-capture-policy
+        run: swiftc Sources/CapturePolicy.swift Sources/ColorMath.swift Tests/CapturePolicyTests.swift -o /tmp/cowboy-capture-policy && /tmp/cowboy-capture-policy
       - name: Build native camera
         run: xcodebuild -project CowboyRec.xcodeproj -scheme CowboyRec -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
       - name: Package unsigned IPA

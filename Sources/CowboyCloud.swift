@@ -16,6 +16,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
   var email: String?
   var status = "Entre na conta Cowboy antes de gravar"
   private var cookie = ""
+  var credential: String? { cookie.isEmpty ? nil : cookie }
   private var busy = false
   private var queueRevision = 0
   private let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CowboyNativePending")
@@ -45,6 +46,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
       guard let owner = me["email"] as? String, !owner.isEmpty else { throw CloudError.message("Faça login no Cowboy") }
       email = owner
       status = "Conta: \(owner)"
+      CloudStream.shared.resume(owner: owner)
       await resume()
     } catch { email = nil; status = error.localizedDescription }
   }

@@ -11,11 +11,13 @@ settings:
     GENERATE_INFOPLIST_FILE: YES
     INFOPLIST_KEY_NSCameraUsageDescription: "O Cowboy usa a câmera nativa do iPhone para gravar com estabilização."
     INFOPLIST_KEY_NSMicrophoneUsageDescription: "O Cowboy grava áudio junto do vídeo."
+    INFOPLIST_KEY_UIStatusBarHidden: YES
+    INFOPLIST_KEY_UIRequiresFullScreen: YES
     INFOPLIST_KEY_UILaunchScreen_Generation: YES
     INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
     INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-    MARKETING_VERSION: "0.4.0"
-    CURRENT_PROJECT_VERSION: "6"
+    MARKETING_VERSION: "0.5.0"
+    CURRENT_PROJECT_VERSION: "7"
 targets:
   CowboyRec:
     type: application
