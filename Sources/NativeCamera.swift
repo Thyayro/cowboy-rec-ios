@@ -188,6 +188,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var lookID = UserDefaults.standard.string(forKey: "look") ?? "natural"
   @Published var rawLog = false
   @Published var droppedFrames = 0
+  @Published var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
   // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
   @Published var bake709 = UserDefaults.standard.object(forKey: "bake709") as? Bool ?? true { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
   @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
@@ -376,7 +377,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if fastOK, fastOut.availableVideoPixelFormatTypes.contains(sub) { fastOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: sub] }
       if cam.isVirtualDevice { cam.setPrimaryConstituentDeviceSwitchingBehavior(.auto, restrictedSwitchingBehaviorConditions: []) }
       let nativeBase = displayBase(cam)
-      let relative = zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor / base) : 1)
+      let relative = zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor / base) : Double(cam.minAvailableVideoZoomFactor / nativeBase))
       cam.videoZoomFactor = max(cam.minAvailableVideoZoomFactor, min(CGFloat(relative) * nativeBase, cam.maxAvailableVideoZoomFactor))
       if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
       if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = true }
@@ -389,7 +390,14 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       else if connection.isVideoRotationAngleSupported(0) { connection.videoRotationAngle = 0 }
       if connection.isVideoMirroringSupported { connection.automaticallyAdjustsVideoMirroring = false; connection.isVideoMirrored = false }
       if fastOK, let fc = fastOut.connection(with: .video) {
-        if fc.isVideoStabilizationSupported { fc.preferredVideoStabilizationMode = .off }
+        // prévia: estabilização de baixa latência (a da câmera do iPhone); a Extrema fica só no arquivo
+        var light: AVCaptureVideoStabilizationMode = .off
+        for m in [AVCaptureVideoStabilizationMode.previewOptimized, .standard] where cam.activeFormat.isVideoStabilizationModeSupported(m) { light = m; break }
+        if fc.isVideoStabilizationSupported {
+          if CowboyObjC.catching({ fc.preferredVideoStabilizationMode = light }) != nil { _ = CowboyObjC.catching { fc.preferredVideoStabilizationMode = .standard } }
+        }
+        let lightName = Self.label(light)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Diag.step("preview-stab", ["asked": lightName, "active": Self.label(fc.activeVideoStabilizationMode)]) }
         if isFront, fc.isVideoRotationAngleSupported(previewAngle) { fc.videoRotationAngle = previewAngle } else if fc.isVideoRotationAngleSupported(0) { fc.videoRotationAngle = 0 }
         if fc.isVideoMirroringSupported { fc.automaticallyAdjustsVideoMirroring = false; fc.isVideoMirrored = false }
       }
@@ -467,7 +475,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let goFront = self.device?.position != .front
       let target = goFront ? self.availableDevices.first { $0.position == .front } : self.defaultBack()
       guard let target else { throw self.failure("Câmera indisponível") }
-      try self.configure(cameraID: target.uniqueID, zoom: 1)
+      try self.configure(cameraID: target.uniqueID, zoom: goFront ? 1 : 0.5)
     }
   }
   func selectProfile(_ id: String) {
@@ -491,6 +499,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       } else { self.configureStabilization() }
     }
   }
+  func setLightPreview(_ value: Bool) { UserDefaults.standard.set(value, forKey: "lightPreview"); renderer.lightPreview = value; publish { self.lightPreview = value } }
   func setBitrate(_ value: Int) { UserDefaults.standard.set(value, forKey: "bitrate"); publish { self.bitrateChoice = value } }
   // interface girou (retrato/deitado): a prévia acompanha; o arquivo usa o ângulo do horizonte travado ao começar
   func setPreviewAngle(_ angle: Double) {

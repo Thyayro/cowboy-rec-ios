@@ -27,7 +27,12 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var fastBuffer: CVPixelBuffer?
   private var fastPTS: Double?
   private var lastZoomMove = 0.0
-  private var crop = 1.12
+  // PRÉVIA SEM ATRASO (padrão, como a câmera do iPhone): a tela mostra a saída em tempo real com estabilização leve, no
+  // enquadramento do arquivo (corte medido); o arquivo continua com a estabilização Extrema. Zoom e troca de lente na hora.
+  var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
+  private var fastFresh = false
+  private var fastAt = 0.0
+  private var crop = 1.06
   private var cropSamples: [Double] = []
   private var calibFast: (pts: Double, image: CGImage)?
   private var calibBusy = false
@@ -63,8 +68,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   func pushFast(_ buffer: CVPixelBuffer, pts: Double) {
     lock.lock()
     if frozen { lock.unlock(); return }
-    fastBuffer = buffer; fastPTS = pts
+    fastBuffer = buffer; fastPTS = pts; fastFresh = true
     let now = CACurrentMediaTime()
+    fastAt = now
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib
     if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
@@ -98,7 +104,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
   func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; lock.unlock() }
-  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); crop = 1.12; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
+  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); crop = 1.06; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
     if t <= first.0 { return first.1 }
@@ -133,7 +139,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let zFrame = pts.flatMap { zoomAt($0) }
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = crop
     if let a = zoomHistory.dropLast().last, let b = zoomHistory.last, abs(a.1 - b.1) > 0.0005 { lastZoomMove = now }
+    let live = lightPreview && fast != nil && now - fastAt < 0.5
+    let liveFrame: CVPixelBuffer? = live && fastFresh ? fast : nil
+    if live { fastFresh = false; pending = nil }
     lock.unlock()
+    if live {
+      guard let liveFrame else { return }
+      drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror)
+      return
+    }
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
@@ -170,6 +184,26 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = Self.filtered(image, cube: cube, size: size)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
+    let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
+    destination.isFlipped = true
+    _ = try? context.startTask(toRender: image, to: destination)
+    commandBuffer.present(drawable)
+    commandBuffer.commit()
+    frames += 1
+  }
+
+  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool) {
+    guard let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+    let target = view.drawableSize
+    guard target.width > 0, target.height > 0 else { return }
+    var image = Self.oriented(buffer, orient, mirrored: mirror)
+    let fitScale = min(target.width / image.extent.width, target.height / image.extent.height)
+    let fit = CGRect(x: (target.width - image.extent.width * fitScale) / 2, y: (target.height - image.extent.height * fitScale) / 2, width: image.extent.width * fitScale, height: image.extent.height * fitScale)
+    let sc = fitScale * max(1, crop)
+    image = image.transformed(by: CGAffineTransform(scaleX: sc, y: sc))
+    image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY)).cropped(to: fit)
+    image = Self.filtered(image, cube: cube, size: size)
+    image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target)))
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)
