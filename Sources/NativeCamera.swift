@@ -624,9 +624,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         Diag.step("record-tap", ["codec": self.requestedCodec.rawValue, "fmt": self.selectedProfile.label, "log": self.requestedLog])
         var (videoSettings, how) = self.writerVideoSettings(cam)
         var compression = (videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any]) ?? [:]
-        compression[AVVideoMaxKeyFrameIntervalDurationKey] = 1.0
-        compression[AVVideoExpectedSourceFrameRateKey] = Int(self.selectedProfile.fps.rounded())
-        if let bitrate { compression[AVVideoAverageBitRateKey] = bitrate }
+        let codecName = (videoSettings[AVVideoCodecKey] as? AVVideoCodecType)?.rawValue ?? (videoSettings[AVVideoCodecKey] as? String) ?? ""
+        if codecName == AVVideoCodecType.hevc.rawValue || codecName == AVVideoCodecType.h264.rawValue {
+          compression[AVVideoMaxKeyFrameIntervalDurationKey] = 1.0
+          compression[AVVideoExpectedSourceFrameRateKey] = Int(self.selectedProfile.fps.rounded())
+          if let bitrate { compression[AVVideoAverageBitRateKey] = bitrate }
+          else if let rec = compression[AVVideoAverageBitRateKey] as? Int, rec > 120_000_000 { compression[AVVideoAverageBitRateKey] = 120_000_000 }
+        }
         videoSettings[AVVideoCompressionPropertiesKey] = compression
         // AAC estéreo explícito: o "recomendado" do iPhone 16 pode ser áudio espacial (APAC/4 canais), que o MP4 fragmentado recusa
         let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 256000]
@@ -696,14 +700,19 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private func writerVideoSettings(_ cam: AVCaptureDevice) -> ([String: Any], String) {
     var codecs: [AVVideoCodecType] = []
     _ = CowboyObjC.catching { codecs = self.videoOut.availableVideoCodecTypesForAssetWriter(writingTo: .mp4) }
-    var codec = requestedCodec
-    if !codecs.isEmpty && !codecs.contains(codec) { codec = codecs.contains(.hevc) ? .hevc : codecs[0] }
-    for type in [AVFileType.mp4, .mov] {
-      var got: [String: Any]?
-      let ex = CowboyObjC.catching { got = self.videoOut.recommendedVideoSettings(forVideoCodecType: codec, assetWriterOutputFileType: type) }
-      if let ex { Diag.step("recommended-fail", ["type": type.rawValue, "codec": codec.rawValue, "err": ex]) }
-      if ex == nil, let got, got[AVVideoWidthKey] != nil { return (got, "recomendado-" + (type == .mp4 ? "mp4" : "mov")) }
-    }
+    // HEVC/H.264 sempre: o "recomendado" do iPhone em Apple Log é ProRes 422 HQ (apch, 760 Mb/s — medido 07/10), que não
+    // sobe ao vivo e não aceita quadro-chave por segundo. O codificador HEVC 10 bits aceita os quadros Log do mesmo jeito.
+    let codec: AVVideoCodecType = requestedCodec == .h264 ? .h264 : .hevc
+    if codecs.contains(codec) {
+      for type in [AVFileType.mp4, .mov] {
+        var got: [String: Any]?
+        let ex = CowboyObjC.catching { got = self.videoOut.recommendedVideoSettings(forVideoCodecType: codec, assetWriterOutputFileType: type) }
+        if let ex { Diag.step("recommended-fail", ["type": type.rawValue, "codec": codec.rawValue, "err": ex]) }
+        if ex == nil, let got, got[AVVideoWidthKey] != nil, (got[AVVideoCodecKey] as? AVVideoCodecType) == codec || (got[AVVideoCodecKey] as? String) == codec.rawValue {
+          return (got, "recomendado-" + (type == .mp4 ? "mp4" : "mov"))
+        }
+      }
+    } else { Diag.step("codec-manual", ["codecs": codecs.map { $0.rawValue }.joined(separator: ",")], send: true) }
     let d = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
     let w = Int(d.width), h = Int(d.height), fps = selectedProfile.fps
     let bitrate = max(8_000_000, min(100_000_000, Int(Double(w * h) * fps * 0.12)))
