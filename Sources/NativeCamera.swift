@@ -5,19 +5,40 @@ import QuartzCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-// Gravador fragmentado: AVAssetWriter no perfil HLS fMP4 entrega init + um fragmento por segundo em memória — cada um vai
-// direto pra fila de envio da nuvem (CloudStream). Nenhum arquivo de vídeo inteiro no iPhone.
+// Gravador: (1) NUVEM — AVAssetWriter no perfil HLS fMP4 entrega init + um fragmento por segundo em memória, cada um vai
+// direto pra fila de envio (CloudStream); (2) ARQUIVO — se o iPhone recusar o modo fragmentado, grava um .mov no aparelho
+// (fragmentado a cada 2 s, sobrevive a travamento) que sobe ao parar. Toda chamada que o AVFoundation pode recusar com
+// exceção passa pelo CowboyObjC.catching: vira mensagem, o app não fecha.
 final class SegmentWriter: NSObject, AVAssetWriterDelegate, @unchecked Sendable {
   private let writer: AVAssetWriter
   private let video: AVAssetWriterInput
-  private let audio: AVAssetWriterInput?
+  private var audio: AVAssetWriterInput?
   private var start: CMTime?
+  let fileURL: URL?
   private(set) var dropped = 0
+  private(set) var error: String?
   var onSegment: ((Data) -> Void)?
-  init(video videoSettings: [String: Any], audio audioSettings: [String: Any]?, transform: CGAffineTransform) throws {
-    writer = AVAssetWriter(contentType: UTType(AVFileType.mp4.rawValue) ?? .mpeg4Movie)
-    writer.outputFileTypeProfile = .mpeg4AppleHLS
-    writer.preferredOutputSegmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
+  static func make(video videoSettings: [String: Any], audio audioSettings: [String: Any]?, transform: CGAffineTransform, file: URL?) throws -> SegmentWriter {
+    var made: SegmentWriter?
+    var thrown: Error?
+    let ex = CowboyObjC.catching {
+      do { made = try SegmentWriter(video: videoSettings, audio: audioSettings, transform: transform, file: file) } catch { thrown = error }
+    }
+    if let ex { throw NSError(domain: "CowboyWriter", code: 2, userInfo: [NSLocalizedDescriptionKey: ex]) }
+    if let thrown { throw thrown }
+    guard let made else { throw NSError(domain: "CowboyWriter", code: 3, userInfo: [NSLocalizedDescriptionKey: "gravador não criado"]) }
+    return made
+  }
+  private init(video videoSettings: [String: Any], audio audioSettings: [String: Any]?, transform: CGAffineTransform, file: URL?) throws {
+    fileURL = file
+    if let file {
+      writer = try AVAssetWriter(outputURL: file, fileType: .mov)
+      writer.movieFragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
+    } else {
+      writer = AVAssetWriter(contentType: UTType(AVFileType.mp4.rawValue) ?? .mpeg4Movie)
+      writer.outputFileTypeProfile = .mpeg4AppleHLS
+      writer.preferredOutputSegmentInterval = CMTime(seconds: 1, preferredTimescale: 600)
+    }
     video = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
     video.expectsMediaDataInRealTime = true
     video.transform = transform
@@ -26,32 +47,47 @@ final class SegmentWriter: NSObject, AVAssetWriterDelegate, @unchecked Sendable 
     if let audioSettings {
       let a = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
       a.expectsMediaDataInRealTime = true
-      if writer.canAdd(a) { writer.add(a); audio = a } else { audio = nil }
-    } else { audio = nil }
+      if writer.canAdd(a) { writer.add(a); audio = a }
+    }
     super.init()
-    writer.delegate = self
+    if file == nil { writer.delegate = self }
   }
+  var hasAudio: Bool { audio != nil }
   var started: Bool { start != nil }
-  var failed: Error? { writer.status == .failed ? writer.error : nil }
+  var failed: String? { error ?? (writer.status == .failed ? (writer.error?.localizedDescription ?? "falhou") : nil) }
   func appendVideo(_ sample: CMSampleBuffer) {
+    guard error == nil else { return }
     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
     if start == nil {
-      writer.initialSegmentStartTime = pts
-      guard writer.startWriting() else { return }
-      writer.startSession(atSourceTime: pts); start = pts
+      var ok = false
+      let ex = CowboyObjC.catching {
+        if self.fileURL == nil { self.writer.initialSegmentStartTime = pts }
+        ok = self.writer.startWriting()
+        if ok { self.writer.startSession(atSourceTime: pts) }
+      }
+      if let ex { error = ex; return }
+      guard ok else { error = writer.error?.localizedDescription ?? "não começou a gravar"; return }
+      start = pts
     }
     guard writer.status == .writing else { return }
-    if video.isReadyForMoreMediaData { if !video.append(sample) { dropped += 1 } } else { dropped += 1 }
+    if video.isReadyForMoreMediaData {
+      var appended = false
+      if let ex = CowboyObjC.catching({ appended = self.video.append(sample) }) { error = ex; return }
+      if !appended { dropped += 1 }
+    } else { dropped += 1 }
   }
   func appendAudio(_ sample: CMSampleBuffer) {
-    guard let start, let audio, writer.status == .writing, CMSampleBufferGetPresentationTimeStamp(sample) >= start, audio.isReadyForMoreMediaData else { return }
-    audio.append(sample)
+    guard error == nil, let start, let audio, writer.status == .writing, CMSampleBufferGetPresentationTimeStamp(sample) >= start, audio.isReadyForMoreMediaData else { return }
+    if let ex = CowboyObjC.catching({ _ = audio.append(sample) }) { error = ex }
   }
   func finish(_ done: @escaping @Sendable (Bool) -> Void) {
-    guard start != nil, writer.status == .writing else { writer.cancelWriting(); done(false); return }
-    video.markAsFinished(); audio?.markAsFinished()
+    guard start != nil, writer.status == .writing else { _ = CowboyObjC.catching { self.writer.cancelWriting() }; done(false); return }
     let w = writer
-    w.finishWriting { done(w.status == .completed) }
+    let ex = CowboyObjC.catching {
+      self.video.markAsFinished(); self.audio?.markAsFinished()
+      w.finishWriting { done(w.status == .completed) }
+    }
+    if ex != nil { done(false) }
   }
   func assetWriter(_ writer: AVAssetWriter, didOutputSegmentData segmentData: Data, segmentType: AVAssetSegmentType, segmentReport: AVAssetSegmentReport?) {
     onSegment?(segmentData)
@@ -82,6 +118,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // gravação (somente dataQueue)
   private var writer: SegmentWriter?
   private var recCid: String?
+  private var recOwner: String?
   private var recStart: CMTime?
   private var recAngle: Double = 90
   private var recFront = false
@@ -588,10 +625,27 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         compression[AVVideoExpectedSourceFrameRateKey] = Int(self.selectedProfile.fps.rounded())
         if let bitrate { compression[AVVideoAverageBitRateKey] = bitrate }
         videoSettings[AVVideoCompressionPropertiesKey] = compression
-        let audioSettings = self.audioOut.recommendedAudioSettingsForAssetWriter(writingTo: .mp4)
+        // AAC estéreo explícito: o "recomendado" do iPhone 16 pode ser áudio espacial (APAC/4 canais), que o MP4 fragmentado recusa
+        let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 256000]
         let isFront = cam.position == .front
         let angle: Double = isFront ? 0 : Double(self.rotation?.videoRotationAngleForHorizonLevelCapture ?? CGFloat(self.previewAngle))
-        let writer = try SegmentWriter(video: videoSettings, audio: audioSettings, transform: CGAffineTransform(rotationAngle: CGFloat(angle * .pi / 180)))
+        let transform = CGAffineTransform(rotationAngle: CGFloat(angle * .pi / 180))
+        Diag.step("record-start", ["fmt": self.selectedProfile.label, "log": self.requestedLog, "codec": self.requestedCodec.rawValue, "angle": angle, "video": String(String(describing: videoSettings).prefix(600))])
+        var writer: SegmentWriter
+        var localFile: URL?
+        do { writer = try SegmentWriter.make(video: videoSettings, audio: audioSettings, transform: transform, file: nil) }
+        catch {
+          // o iPhone recusou o modo "direto na nuvem": grava em arquivo e sobe ao parar (não perde a tomada)
+          Diag.step("writer-stream-fail", ["err": error.localizedDescription])
+          let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CowboyCaptures")
+          try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+          let file = dir.appendingPathComponent(UUID().uuidString + ".mov")
+          writer = try SegmentWriter.make(video: videoSettings, audio: audioSettings, transform: transform, file: file)
+          localFile = file
+          let why = error.localizedDescription
+          self.publish { self.status = "Modo direto na nuvem recusado pelo iPhone (\(why)) — gravando no aparelho e subindo ao parar" }
+        }
+        Diag.step("writer-ok", ["mode": localFile == nil ? "nuvem" : "arquivo", "audio": writer.hasAudio], send: false)
         let mode = self.videoOut.connection(with: .video)?.activeVideoStabilizationMode ?? .off
         let profile = self.selectedProfile
         let colorProfile = self.requestedLog ? "applelog" : self.requestedHDR ? "hlg" : "rec709"
@@ -601,6 +655,16 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let body: [String: Any] = ["label": self.name(cam), "mime": "video/mp4", "settings": meta, "stabilization": ["enabled": false], "facing": isFront ? "user" : "environment",
           "convert": (colorProfile != "rec709" && convert) ? "keep" : "none", "aspect": aspect, "look": lookBody, "recorded_at": ISO8601DateFormatter().string(from: Date())]
         let f = DateFormatter(); f.locale = Locale(identifier: "pt_BR"); f.timeZone = TimeZone(identifier: "America/Sao_Paulo"); f.dateFormat = "dd/MM HH:mm"
+        if let localFile {
+          try JSONEncoder().encode(owner).write(to: localFile.appendingPathExtension("owner"), options: .atomic)
+          let m = NativeCaptureMetadata(width: profile.width, height: profile.height, frameRate: profile.fps, hdr: self.requestedHDR, codec: self.requestedCodec.rawValue, lens: self.name(cam), stabilization: Self.label(mode), colorProfile: colorProfile, convertRec709: convert, captureMode: "avfoundation-file")
+          try JSONEncoder().encode(m).write(to: localFile.appendingPathExtension("capture"), options: .atomic)
+          self.dataQueue.async {
+            self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = true; self.gyro = nil; self.elapsedMs = 0
+            self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
+          }
+          return
+        }
         let cid = CloudStream.shared.begin(owner: owner, title: "iPhone \(f.string(from: Date()))", body: body)
         if !look.neutral {
           let text = ColorMath.cubeText(title: "Cowboy \(look.label)") { ColorMath.grade($0, look.p) }
@@ -616,13 +680,28 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           MotionHub.shared.attach(gyro)
           self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
         }
-      } catch { self.publish { self.status = error.localizedDescription } }
+      } catch {
+        Diag.step("record-fail", ["err": error.localizedDescription])
+        let why = error.localizedDescription
+        self.publish { self.status = "Não começou a gravar: \(why)" }
+      }
     }
   }
   func stopRecording() {
     dataQueue.async {
-      guard let writer = self.writer, let cid = self.recCid else { return }
-      self.writer = nil; self.recCid = nil
+      guard let writer = self.writer else { return }
+      self.writer = nil
+      if let file = writer.fileURL {
+        let owner = self.recOwner; self.recOwner = nil
+        self.publish { self.recording = false; self.finishing = true }
+        writer.finish { ok in
+          Diag.step("stop-file", ["ok": ok])
+          self.publish { self.finishing = false; if ok { self.onSaved?(file, owner) } else { self.recoverableFile = file; self.status = "A gravação terminou com erro — arquivo mantido no aparelho" } }
+        }
+        return
+      }
+      guard let cid = self.recCid else { return }
+      self.recCid = nil
       let gyro = self.gyro; self.gyro = nil; MotionHub.shared.attach(nil)
       let duration = self.elapsedMs, dropped = writer.dropped
       if let meta = self.spaceMeta?() {
@@ -634,6 +713,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         gyro?.close()
         if (gyro?.lines ?? 0) == 0 { try? FileManager.default.removeItem(at: CloudStream.shared.sideFile(cid, kind: "gcsv")) }
         CloudStream.shared.close(cid, durationMs: duration)
+        Diag.step("stop-stream", ["ok": ok, "ms": duration, "dropped": dropped])
         self.publish { self.finishing = false; if !ok { self.status = "A gravação terminou com erro — o que já subiu está salvo na nuvem" } }
       }
     }
@@ -668,8 +748,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if now - lastPublish > 0.25 {
       lastPublish = now
       let e = Double(elapsedMs) / 1000, d = writer.dropped, failed = writer.failed
-      publish { self.elapsed = e; self.droppedFrames = d; if let failed { self.status = "Gravador: \(failed.localizedDescription)" } }
-      if failed != nil { stopRecording() }
+      publish { self.elapsed = e; self.droppedFrames = d; if let failed { self.status = "Gravador: \(failed)" } }
+      if let failed { Diag.step("writer-error", ["err": failed]); stopRecording() }
     }
   }
   func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {}

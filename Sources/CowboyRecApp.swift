@@ -104,6 +104,7 @@ struct RecorderView: View {
     .sheet(isPresented: $settings) { settingsSheet }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
     .task {
+      Diag.install(); Diag.step("open")
       UIDevice.current.beginGeneratingDeviceOrientationNotifications()
       UIApplication.shared.isIdleTimerDisabled = true
       CloudStream.shared.cookieProvider = { await MainActor.run { CowboyCloud.shared.credential } }
