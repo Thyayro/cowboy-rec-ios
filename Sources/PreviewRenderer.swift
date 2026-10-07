@@ -26,7 +26,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // estabilizado alcançou -> volta pra ele. O arquivo é sempre o estabilizado.
   private var fastBuffer: CVPixelBuffer?
   private var fastPTS: Double?
-  private var fastUntil = 0.0
+  private var lastZoomMove = 0.0
   private var crop = 1.12
   private var cropSamples: [Double] = []
   private var calibFast: (pts: Double, image: CGImage)?
@@ -65,7 +65,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if frozen { lock.unlock(); return }
     fastBuffer = buffer; fastPTS = pts
     let now = CACurrentMediaTime()
-    let calm = now - fastUntil > 1.2   // zoom parado há um tempo: dá pra medir o corte
+    let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib
     if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
     lock.unlock()
@@ -132,6 +132,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0) }
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = crop
+    if let a = zoomHistory.dropLast().last, let b = zoomHistory.last, abs(a.1 - b.1) > 0.0005 { lastZoomMove = now }
     lock.unlock()
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
@@ -142,19 +143,28 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * scale) / 2, y: (target.height - image.extent.height * scale) / 2, width: image.extent.width * scale, height: image.extent.height * scale)
-    if k != 1 { lock.lock(); fastUntil = now + 0.15; lock.unlock() }
-    lock.lock(); let useFast = now < fastUntil && fast != nil; lock.unlock()
-    if useFast, let fast {
-      // zoom em movimento: quadro de AGORA, sem estabilização, cortado igual ao estabilizado
-      var f = Self.oriented(fast, orient, mirrored: mirror)
-      let kf = (zNow != nil && zFast != nil && zFast! > 0) ? max(0.5, min(3, zNow! / zFast!)) : 1
-      let sF = min(target.width / f.extent.width, target.height / f.extent.height) * cropNow * max(1, kf)
-      f = f.transformed(by: CGAffineTransform(scaleX: sF, y: sF))
-      image = f.transformed(by: CGAffineTransform(translationX: fit.midX - f.extent.midX, y: fit.midY - f.extent.midY))
-    } else {
-      let kk = max(1, k)   // sem fonte rápida: só o zoom in é adiantado (o out espera o quadro real — nunca borda inventada)
-      image = image.transformed(by: CGAffineTransform(scaleX: scale * kk, y: scale * kk))
-      image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
+    // Uma fonte só (o quadro ESTABILIZADO, igual ao arquivo) com o zoom de agora: o zoom in amplia o quadro na hora.
+    // No zoom out o quadro estabilizado (atrasado) ainda não tem a borda nova: só essa borda vem do quadro em tempo real
+    // (saída sem estabilização, no mesmo enquadramento — corte medido pelo Vision), com emenda suave de poucos pixels.
+    // Sem troca de fonte (não pula) e sem pixel inventado (não repete nem borra).
+    image = image.transformed(by: CGAffineTransform(scaleX: scale * k, y: scale * k))
+    image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
+    if k < 1 {
+      if let fast {
+        var f = Self.oriented(fast, orient, mirrored: mirror)
+        let kf = (zNow != nil && zFast != nil && zFast! > 0) ? max(0.5, min(2, zNow! / zFast!)) : 1
+        let sF = min(target.width / f.extent.width, target.height / f.extent.height) * cropNow * kf
+        f = f.transformed(by: CGAffineTransform(scaleX: sF, y: sF))
+        f = f.transformed(by: CGAffineTransform(translationX: fit.midX - f.extent.midX, y: fit.midY - f.extent.midY)).cropped(to: fit)
+        let feather = max(2, min(10, image.extent.width * 0.012))
+        let mask = CIImage(color: CIColor(red: 1, green: 1, blue: 1)).cropped(to: image.extent.insetBy(dx: feather, dy: feather))
+          .applyingGaussianBlur(sigma: Double(feather) / 2).cropped(to: fit)
+        image = image.applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: f, kCIInputMaskImageKey: mask])
+      } else {
+        // sem a saída em tempo real: não inventa borda — mostra o quadro no zoom em que ele foi captado (espera o real)
+        image = Self.oriented(buffer, orient, mirrored: mirror).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
+      }
     }
     image = image.cropped(to: fit)
     image = Self.filtered(image, cube: cube, size: size)
