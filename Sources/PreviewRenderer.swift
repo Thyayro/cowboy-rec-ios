@@ -3,6 +3,7 @@ import Metal
 import MetalKit
 import QuartzCore
 import SwiftUI
+import Vision
 
 // Preview drawn from the SAME stabilized frames that go to the file (what you see is what is recorded), with the
 // display LUT (Apple Log/HLG -> Rec.709 + look) applied on the GPU. No color management: code values in, code values out,
@@ -20,6 +21,20 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // atrasado (escala = zoom agora ÷ zoom no instante em que o quadro foi captado). O arquivo não muda.
   var zoomNow: (() -> Double?)?
   private var zoomHistory: [(Double, Double)] = []
+  // ZOOM PERFEITO: enquanto o zoom se mexe, a tela mostra a saída SEM estabilização (tempo real, quadro inteiro, sem borda
+  // inventada), no mesmo enquadramento do estabilizado (corte do estabilizador medido sozinho pelo Vision); parou e o quadro
+  // estabilizado alcançou -> volta pra ele. O arquivo é sempre o estabilizado.
+  private var fastBuffer: CVPixelBuffer?
+  private var fastPTS: Double?
+  private var fastUntil = 0.0
+  private var crop = 1.12
+  private var cropSamples: [Double] = []
+  private var calibFast: (pts: Double, image: CGImage)?
+  private var calibBusy = false
+  private var nextCalib = 0.0
+  private let calibQueue = DispatchQueue(label: "cowboy.preview.calib", qos: .utility)
+  var onCrop: ((Double) -> Void)?
+  var hasFast: Bool { lock.lock(); defer { lock.unlock() }; return fastBuffer != nil }
   private var cube: Data?
   private var cubeSize = 33
   private var orientation: CGImagePropertyOrientation = .right
@@ -34,14 +49,56 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     super.init()
   }
   func push(_ buffer: CVPixelBuffer, pts: Double? = nil) {
-    lock.lock(); defer { lock.unlock() }
-    if frozen { return }
-    if dropFrames > 0 { dropFrames -= 1; return }
+    lock.lock()
+    if frozen { lock.unlock(); return }
+    if dropFrames > 0 { dropFrames -= 1; lock.unlock(); return }
     pending = buffer; pendingPTS = pts
+    var match: (pts: Double, image: CGImage)?
+    if let cf = calibFast, let pts {
+      if abs(cf.pts - pts) < 0.004 { match = cf; calibFast = nil } else if pts > cf.pts + 0.1 { calibFast = nil; calibBusy = false }
+    }
+    lock.unlock()
+    if let match { calibQueue.async { self.register(stabilized: buffer, fast: match.image) } }
+  }
+  func pushFast(_ buffer: CVPixelBuffer, pts: Double) {
+    lock.lock()
+    if frozen { lock.unlock(); return }
+    fastBuffer = buffer; fastPTS = pts
+    let now = CACurrentMediaTime()
+    let calm = now - fastUntil > 1.2   // zoom parado há um tempo: dá pra medir o corte
+    let go = calm && !calibBusy && now >= nextCalib
+    if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
+    lock.unlock()
+    if go { calibQueue.async { if let img = self.small(buffer) { self.lock.lock(); self.calibFast = (pts, img); self.lock.unlock() } else { self.lock.lock(); self.calibBusy = false; self.lock.unlock() } } }
+  }
+  private func small(_ buffer: CVPixelBuffer) -> CGImage? {
+    var img = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+    let s = 480 / max(1, img.extent.width)
+    img = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
+    return context.createCGImage(img, from: img.extent, format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+  }
+  // mesma hora de captura nas duas saídas -> homografia entre o quadro estabilizado e o cru -> escala = corte do estabilizador
+  private func register(stabilized: CVPixelBuffer, fast: CGImage) {
+    defer { lock.lock(); calibBusy = false; lock.unlock() }
+    guard let stab = small(stabilized) else { return }
+    let request = VNHomographicImageRegistrationRequest(targetedCGImage: fast, options: [:])
+    guard (try? VNImageRequestHandler(cgImage: stab, options: [:]).perform([request])) != nil,
+      let obs = request.results?.first as? VNImageHomographicAlignmentObservation else { return }
+    let m = obs.warpTransform
+    let det = Double(abs(m.columns.0.x * m.columns.1.y - m.columns.1.x * m.columns.0.y))
+    guard det > 0.0001 else { return }
+    var c = det.squareRoot(); if c < 1 { c = 1 / c }
+    guard c >= 1, c <= 1.8 else { return }
+    lock.lock()
+    cropSamples.append(c); if cropSamples.count > 7 { cropSamples.removeFirst() }
+    let sorted = cropSamples.sorted(); crop = sorted[sorted.count / 2]
+    let value = crop, first = cropSamples.count == 3
+    lock.unlock()
+    if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; lock.unlock() }
-  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); lock.unlock() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; lock.unlock() }
+  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); crop = 1.12; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
     if t <= first.0 { return first.1 }
@@ -74,6 +131,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
     let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0) }
+    let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = crop
     lock.unlock()
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
@@ -84,17 +142,19 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * scale) / 2, y: (target.height - image.extent.height * scale) / 2, width: image.extent.width * scale, height: image.extent.height * scale)
-    let base = image
-    image = image.transformed(by: CGAffineTransform(scaleX: scale * k, y: scale * k))
-    image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
-    if k < 1 {
-      // abrindo o zoom: o quadro atrasado ainda não tem a borda nova. Em volta dele vai o mesmo quadro no tamanho cheio,
-      // desfocado e escurecido (nada de pixel repetido); some sozinho quando o quadro real (já aberto) chega.
-      var bg = base.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-      bg = bg.transformed(by: CGAffineTransform(translationX: fit.midX - bg.extent.midX, y: fit.midY - bg.extent.midY))
-      bg = bg.clampedToExtent().applyingGaussianBlur(sigma: 18).cropped(to: fit)
-      bg = bg.applyingFilter("CIColorControls", parameters: [kCIInputBrightnessKey: -0.18, kCIInputSaturationKey: 0.7])
-      image = image.composited(over: bg)
+    if k != 1 { lock.lock(); fastUntil = now + 0.15; lock.unlock() }
+    lock.lock(); let useFast = now < fastUntil && fast != nil; lock.unlock()
+    if useFast, let fast {
+      // zoom em movimento: quadro de AGORA, sem estabilização, cortado igual ao estabilizado
+      var f = Self.oriented(fast, orient, mirrored: mirror)
+      let kf = (zNow != nil && zFast != nil && zFast! > 0) ? max(0.5, min(3, zNow! / zFast!)) : 1
+      let sF = min(target.width / f.extent.width, target.height / f.extent.height) * cropNow * max(1, kf)
+      f = f.transformed(by: CGAffineTransform(scaleX: sF, y: sF))
+      image = f.transformed(by: CGAffineTransform(translationX: fit.midX - f.extent.midX, y: fit.midY - f.extent.midY))
+    } else {
+      let kk = max(1, k)   // sem fonte rápida: só o zoom in é adiantado (o out espera o quadro real — nunca borda inventada)
+      image = image.transformed(by: CGAffineTransform(scaleX: scale * kk, y: scale * kk))
+      image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
     }
     image = image.cropped(to: fit)
     image = Self.filtered(image, cube: cube, size: size)

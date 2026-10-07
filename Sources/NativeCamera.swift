@@ -104,6 +104,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private let dataQueue = DispatchQueue(label: "cowboy.native.data", qos: .userInteractive)
   private let videoOut = AVCaptureVideoDataOutput()
   private let audioOut = AVCaptureAudioDataOutput()
+  private let fastOut = AVCaptureVideoDataOutput()   // prévia do zoom: sem estabilização, tempo real (nunca vai pro arquivo)
+  private let fastQueue = DispatchQueue(label: "cowboy.native.fast", qos: .userInteractive)
+  private var fastOK = false
   private var device: AVCaptureDevice?
   private var base: CGFloat = 1
   private var configured = false
@@ -353,6 +356,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         videoOut.alwaysDiscardsLateVideoFrames = false
         videoOut.setSampleBufferDelegate(self, queue: dataQueue)
         audioOut.setSampleBufferDelegate(self, queue: dataQueue)
+        if session.canAddOutput(fastOut) {
+          session.addOutput(fastOut); fastOut.alwaysDiscardsLateVideoFrames = true; fastOut.setSampleBufferDelegate(self, queue: fastQueue); fastOK = true
+        }
+        Diag.step("fast-output", ["ok": fastOK])
       }
       session.sessionPreset = .inputPriority
       cam.activeFormat = cam.formats[index]
@@ -366,6 +373,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // os quadros chegam no formato nativo do sensor (10 bits no Log/HLG), sem conversão
       let sub = CMFormatDescriptionGetMediaSubType(cam.activeFormat.formatDescription)
       if videoOut.availableVideoPixelFormatTypes.contains(sub) { videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: sub] }
+      if fastOK, fastOut.availableVideoPixelFormatTypes.contains(sub) { fastOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: sub] }
       if cam.isVirtualDevice { cam.setPrimaryConstituentDeviceSwitchingBehavior(.auto, restrictedSwitchingBehaviorConditions: []) }
       let nativeBase = displayBase(cam)
       let relative = zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor / base) : 1)
@@ -380,11 +388,17 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if isFront, connection.isVideoRotationAngleSupported(previewAngle) { connection.videoRotationAngle = previewAngle }
       else if connection.isVideoRotationAngleSupported(0) { connection.videoRotationAngle = 0 }
       if connection.isVideoMirroringSupported { connection.automaticallyAdjustsVideoMirroring = false; connection.isVideoMirrored = false }
+      if fastOK, let fc = fastOut.connection(with: .video) {
+        if fc.isVideoStabilizationSupported { fc.preferredVideoStabilizationMode = .off }
+        if isFront, fc.isVideoRotationAngleSupported(previewAngle) { fc.videoRotationAngle = previewAngle } else if fc.isVideoRotationAngleSupported(0) { fc.videoRotationAngle = 0 }
+        if fc.isVideoMirroringSupported { fc.automaticallyAdjustsVideoMirroring = false; fc.isVideoMirrored = false }
+      }
       zoomObservation?.invalidate(); rotationObservation?.invalidate()
       device = cam; base = nativeBase; selectedProfile = chosen; requestedHDR = wantsHDR; requestedLog = wantsLog; requestedCodec = encoding; configured = true
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
+      renderer.onCrop = { c in Diag.step("crop-calib", ["crop": String(format: "%.3f", c)]) }
       zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
         guard let self else { return }
         let value = Double(cam.videoZoomFactor / nativeBase), raw = Double(cam.videoZoomFactor)
@@ -486,6 +500,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       guard let cam = self.device else { return }
       let isFront = cam.position == .front
       if isFront, !self.isRecording, let c = self.videoOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
+      if isFront, self.fastOK, let c = self.fastOut.connection(with: .video), c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
       self.renderer.setOrientation(isFront ? .up : Self.orientation(angle), mirrored: isFront)
       let dims = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
       let portrait = angle == 90 || angle == 270
@@ -657,7 +672,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         Diag.step("record-tap", ["codec": self.requestedCodec.rawValue, "fmt": self.selectedProfile.label, "log": self.requestedLog])
         let source: SourceColor = self.requestedLog ? .appleLog : self.requestedHDR ? .hlg : .sdr
         let bakeFn = self.bake709 ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
-        let baker = bakeFn.flatMap { LutBaker(transform: $0) }
+        let incoming = (self.videoOut.videoSettings?[kCVPixelBufferPixelFormatTypeKey as String] as? NSNumber)?.uint32Value ?? CMFormatDescriptionGetMediaSubType(cam.activeFormat.formatDescription)
+        if bakeFn != nil && !LutBaker.supports(incoming) { Diag.step("bake-unsupported", ["fmt": incoming]) }
+        let baker = LutBaker.supports(incoming) ? bakeFn.flatMap { LutBaker(transform: $0) } : nil
         if bakeFn != nil && baker == nil { Diag.step("bake-init-fail") }
         var (videoSettings, how) = self.writerVideoSettings(cam, bake: baker != nil)
         var compression = (videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any]) ?? [:]
@@ -815,13 +832,20 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
   // ---- quadros
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    if output === fastOut {
+      if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) { renderer.pushFast(pb, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) }
+      return
+    }
     if output === audioOut { meter(sampleBuffer); if !stopping { writer?.appendAudio(sampleBuffer) }; return }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     if let pixel { renderer.push(pixel, pts: pts.seconds) }
     guard let writer, !stopping else { return }
     var baked: CMSampleBuffer?
-    if let recBaker { baked = recBaker.convert(sampleBuffer) }
+    if let recBaker {
+      baked = recBaker.convert(sampleBuffer)
+      if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
+    }
     writer.appendVideo(baked ?? sampleBuffer)
     if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds) }
     if let s = recStart { elapsedMs = Int((pts - s).seconds * 1000) }

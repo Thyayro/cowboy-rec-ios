@@ -36,12 +36,13 @@ final class LutBaker: @unchecked Sendable {
     float4 a = prm[0];   // escala Y, piso Y, escala C, centro C (faixa de vídeo da fonte)
     float4 m = prm[1];   // matriz da fonte: Cr->R, Cb->G, Cr->G, Cb->B
     float n = prm[2].x;  // lado do cubo
-    float2 cc = cIn.read(gid).rg;
-    float cb = (cc.r - a.w) * a.z, cr = (cc.g - a.w) * a.z;
+    bool sub420 = prm[2].y > 1.5;   // fonte 4:2:0 (cor a cada 2 linhas) ou 4:2:2 (cor em toda linha — Apple Log do 16 Pro)
     float sumCb = 0.0, sumCr = 0.0;
     for (uint dy = 0; dy < 2; dy++) {
       for (uint dx = 0; dx < 2; dx++) {
         uint2 p = gid * 2 + uint2(dx, dy);
+        float2 cc = cIn.read(uint2(p.x / 2, sub420 ? p.y / 2 : p.y)).rg;
+        float cb = (cc.r - a.w) * a.z, cr = (cc.g - a.w) * a.z;
         float y = (yIn.read(p).r - a.y) * a.x;
         float3 rgb = clamp(float3(y + m.x * cr, y - m.y * cb - m.z * cr, y + m.w * cb), 0.0, 1.0);
         float3 o = lut.sample(s, (rgb * (n - 1.0) + 0.5) / n).rgb;
@@ -87,15 +88,20 @@ final class LutBaker: @unchecked Sendable {
     return t
   }
   private func fail(_ why: String) -> CMSampleBuffer? { failures += 1; lastError = why; return nil }
+  static let tenBit: Set<OSType> = [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr10BiPlanarFullRange]
+  static let eightBit: Set<OSType> = [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8BiPlanarFullRange]
+  static let fullRange: Set<OSType> = [kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_422YpCbCr8BiPlanarFullRange]
+  static let is422: Set<OSType> = [kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr10BiPlanarFullRange, kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8BiPlanarFullRange]
+  // o formato dos quadros que a câmera vai entregar é conferido ANTES de gravar: sem suporte, o arquivo sobe como Log
+  static func supports(_ f: OSType) -> Bool { tenBit.contains(f) || eightBit.contains(f) }
 
   // quadro convertido com o mesmo tempo do original; nil = não deu (quem chama grava o original e conta a falha)
   func convert(_ sample: CMSampleBuffer) -> CMSampleBuffer? {
     guard let src = CMSampleBufferGetImageBuffer(sample) else { return fail("sem imagem") }
     let fmt = CVPixelBufferGetPixelFormatType(src)
-    let ten = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
-    let eight = fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    let ten = Self.tenBit.contains(fmt), eight = Self.eightBit.contains(fmt)
     guard ten || eight, CVPixelBufferGetPlaneCount(src) == 2 else { return fail("formato \(fmt)") }
-    let full = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    let full = Self.fullRange.contains(fmt), four22 = Self.is422.contains(fmt)
     let w = CVPixelBufferGetWidth(src), h = CVPixelBufferGetHeight(src)
     if pool == nil || dims != (w, h) { makePool(w, h) }
     guard let pool else { return fail("sem pool") }
@@ -117,7 +123,7 @@ final class LutBaker: @unchecked Sendable {
     if !full && !ten { range = SIMD4<Float>(255.0 / 219.0, 16.0 / 255.0, 255.0 / 224.0, 128.0 / 255.0) }
     let rec2020 = SIMD4<Float>(1.4746, 0.16455, 0.57135, 1.8814), rec709 = SIMD4<Float>(1.5748, 0.1873, 0.4681, 1.8556)
     let matrix = ten ? rec2020 : rec709
-    var prm: [SIMD4<Float>] = [range, matrix, SIMD4(Float(lutN), 0, 0, 0)]
+    var prm: [SIMD4<Float>] = [range, matrix, SIMD4(Float(lutN), four22 ? 1 : 2, 0, 0)]
     guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return fail("comando") }
     enc.setComputePipelineState(pipeline)
     enc.setTexture(yIn, index: 0); enc.setTexture(cIn, index: 1); enc.setTexture(lut, index: 2); enc.setTexture(yOut, index: 3); enc.setTexture(cOut, index: 4)
