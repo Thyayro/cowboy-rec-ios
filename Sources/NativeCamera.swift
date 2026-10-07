@@ -420,6 +420,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // igualar câmeras: lente ativa a cada instante (o quadro atrasado do arquivo procura a lente pelo próprio horário)
       let match = lensMatch ?? LensMatch(deviceKey: cam.deviceType.rawValue)
       lensMatch = match; renderer.lensMatch = match
+      match.motion = { MotionHub.shared.rotationSpeed() }
       match.onLearn = { [weak self] lens, c in
         guard let self else { return }
         let st = match.status(); self.publish { self.lensMatchStatus = st }
@@ -432,7 +433,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
       } else { match.lensChanged(LensMatch.name(cam.deviceType)) }
       let st0 = match.status()
-      DispatchQueue.main.async { self.zoomDriver.attach(cam); self.lensMatchStatus = st0 }
+      zoomDriver.attach(cam)
+      DispatchQueue.main.async { self.lensMatchStatus = st0 }
       renderer.onCrop = { c in Diag.step("crop-calib", ["crop": String(format: "%.3f", c)]) }
       zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
         guard let self else { return }
@@ -580,8 +582,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   // pinça/roda: segue o dedo com uma rampa rápida (suaviza sem atraso perceptível)
-  func followZoom(_ display: Double) { DispatchQueue.main.async { self.zoomDriver.follow(CGFloat(display) * self.base) } }
-  func selectZoom(_ value: Double) { DispatchQueue.main.async { self.zoomDriver.glide(to: CGFloat(value) * self.base) } }
+  func followZoom(_ display: Double) { zoomDriver.follow(CGFloat(display) * base) }
+  func endZoomGesture() { zoomDriver.endFollow() }
+  func selectZoom(_ value: Double) { zoomDriver.glide(to: CGFloat(value) * base) }
   func setLensMatch(_ on: Bool) { lensMatch?.setEnabled(on); lensMatchOn = on }
   func resetLensMatch() { lensMatch?.reset(); lensMatchStatus = [:] }
   func setZoom(_ value: Double) { followZoom(value) }
@@ -871,7 +874,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // ---- quadros
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     if output === fastOut {
-      if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) { renderer.pushFast(pb, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) }
+      let t = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+      zoomDriver.frameTick(t)   // pinça: um passo de zoom por quadro capturado
+      if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) { renderer.pushFast(pb, pts: t) }
       return
     }
     if output === audioOut { meter(sampleBuffer); if !stopping { writer?.appendAudio(sampleBuffer) }; return }

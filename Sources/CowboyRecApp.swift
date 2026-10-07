@@ -73,7 +73,7 @@ struct RecorderView: View {
             .gesture(MagnifyGesture().onChanged { v in
               if pinchStart == nil { pinchStart = camera.zoom }
               camera.followZoom(clampZoom((pinchStart ?? 1) * v.magnification))
-            }.onEnded { _ in pinchStart = nil })
+            }.onEnded { _ in pinchStart = nil; camera.endZoomGesture() })
           if let p = focusPoint {
             RoundedRectangle(cornerRadius: 3).stroke(gold, lineWidth: 1.5).frame(width: 74, height: 74).position(p).allowsHitTesting(false)
           }
@@ -342,7 +342,7 @@ struct RecorderView: View {
     .simultaneousGesture(DragGesture(minimumDistance: 10).onChanged { v in
       if dialStart == nil { dialStart = camera.zoom }
       camera.followZoom(clampZoom((dialStart ?? 1) * pow(2, -Double(v.translation.width) / 110)))
-    }.onEnded { _ in dialStart = nil })
+    }.onEnded { _ in dialStart = nil; camera.endZoomGesture() })
     .disabled(!camera.ready)
     .opacity(camera.zoomPresets.isEmpty ? 0 : 1)
   }

@@ -74,7 +74,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let now = CACurrentMediaTime()
     fastAt = now
     let wantStats = lensMatch?.enabled == true && now >= nextStats
-    if wantStats { nextStats = now + 0.07 }
+    if wantStats { nextStats = now + 0.03 }
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib
     if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
@@ -99,7 +99,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       sum += c; lum.append(c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722)
     }
     lum.sort()
-    return FrameStats(mean: sum / Float(W * H), p20: lum[lum.count / 5], p80: lum[lum.count * 4 / 5])
+    return FrameStats(mean: sum / Float(W * H), p25: lum[lum.count / 4], p75: lum[lum.count * 3 / 4])
   }
   static func matched(_ image: CIImage, _ m: LensCorrection) -> CIImage {
     if m.isIdentity { return image }

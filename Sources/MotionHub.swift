@@ -26,6 +26,12 @@ final class MotionHub: @unchecked Sendable {
       log?.write(motion)
     }
   }
+  // velocidade de giro do aparelho agora (rad/s)
+  func rotationSpeed() -> Double {
+    lock.lock(); let m = latest; lock.unlock()
+    guard let r = m?.rotationRate else { return 0 }
+    return (r.x * r.x + r.y * r.y + r.z * r.z).squareRoot()
+  }
   func stop() { lock.lock(); manager.stopDeviceMotionUpdates(); latest = nil; lock.unlock() }
   func attach(_ log: GyroLog?) { lock.lock(); self.log = log; lock.unlock() }
 

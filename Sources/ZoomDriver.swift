@@ -2,67 +2,50 @@ import AVFoundation
 import QuartzCore
 import UIKit
 
-// ZOOM COMO O DA CÂMERA DO IPHONE: um controlador preso ao relógio da tela (60–120 Hz) ajusta o zoom A CADA QUADRO.
-// - pinça/roda: segue o dedo com amortecimento crítico em escala logarítmica (velocidade constante entre 0,5×, 1× e 5×);
-// - toque numa lente: curva suave (acelera e freia) de ~0,45 s.
-// Antes cada movimento do dedo reiniciava um `ramp` do AVFoundation — cada recomeço era um degrau ("tremendo escala").
-final class ZoomDriver: NSObject {
+// ZOOM COMO O DA CÂMERA DO IPHONE, no ritmo dos QUADROS da câmera (não da tela):
+// - toque numa lente: UMA rampa nativa do AVFoundation (o ISP aplica em sincronia com cada quadro, escala progressiva e
+//   contínua, velocidade constante em escala logarítmica); nunca é reiniciada no meio;
+// - pinça/roda: o alvo segue o dedo e o zoom anda um passo amortecido POR QUADRO capturado (chamado pela saída de vídeo).
+// 0.5.9 atualizava a 120 Hz pela tela com a câmera a 60 qps: passos irregulares no meio da escala.
+final class ZoomDriver: @unchecked Sendable {
   weak var device: AVCaptureDevice?
-  private var link: CADisplayLink?
-  private var target: CGFloat = 1
-  private var path: (from: CGFloat, to: CGFloat, t0: CFTimeInterval, dur: Double)?
-  private var last: CFTimeInterval = 0
-  var onChange: ((CGFloat) -> Void)?
+  private let lock = NSLock()
+  private var target: CGFloat?
+  private var lastTick = 0.0
 
-  func attach(_ d: AVCaptureDevice) {
-    device = d; target = d.videoZoomFactor; path = nil
+  func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; lock.unlock() }
+  private func clamp(_ d: AVCaptureDevice, _ z: CGFloat) -> CGFloat { max(d.minAvailableVideoZoomFactor, min(d.maxAvailableVideoZoomFactor, z)) }
+  private func configure(_ d: AVCaptureDevice, _ body: () -> Void) {
+    _ = CowboyObjC.catching { if (try? d.lockForConfiguration()) != nil { body(); d.unlockForConfiguration() } }
   }
-  private func clamp(_ z: CGFloat) -> CGFloat {
-    guard let d = device else { return z }
-    return max(d.minAvailableVideoZoomFactor, min(d.maxAvailableVideoZoomFactor, z))
-  }
-  // segue (gesto): o alvo muda continuamente e o zoom acompanha amortecido
-  func follow(_ factor: CGFloat) { path = nil; target = clamp(factor); start() }
-  // vai até (lente): curva com aceleração e freio
-  func glide(to factor: CGFloat, seconds: Double = 0.45) {
+  // gesto: só atualiza o alvo; quem anda é o tick de cada quadro
+  func follow(_ factor: CGFloat) {
+    lock.lock(); defer { lock.unlock() }
     guard let d = device else { return }
-    let to = clamp(factor), from = d.videoZoomFactor
-    guard abs(log(Double(to / from))) > 0.002 else { return }
-    let dur = max(0.18, min(0.7, seconds * (0.55 + 0.45 * min(1, abs(log2(Double(to / from))) / 2))))
-    path = (from, to, CACurrentMediaTime(), dur); target = to; start()
+    if target == nil { configure(d) { if d.isRampingVideoZoom { d.cancelVideoZoomRamp() } } }
+    target = clamp(d, factor)
   }
-  private func start() {
-    if link == nil {
-      let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
-      l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
-      l.add(to: .main, forMode: .common); link = l; last = CACurrentMediaTime()
-    }
+  func endFollow() {}   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
+  // lente: rampa nativa única
+  func glide(to factor: CGFloat, seconds: Double = 0.42) {
+    lock.lock(); target = nil; let d = device; lock.unlock()
+    guard let d else { return }
+    let to = clamp(d, factor), from = d.videoZoomFactor
+    let stops = abs(log2(Double(to / from)))
+    guard stops > 0.003 else { return }
+    let rate = Float(max(0.8, stops / max(0.2, seconds * (0.6 + 0.4 * min(1, stops / 2)))))
+    configure(d) { d.ramp(toVideoZoomFactor: to, withRate: rate) }
   }
-  func stop() { link?.invalidate(); link = nil; path = nil }
-  @objc private func tick(_ l: CADisplayLink) {
-    guard let d = device else { stop(); return }
-    let now = CACurrentMediaTime(), dt = min(0.05, max(0.001, now - last)); last = now
-    let current = d.videoZoomFactor
-    var next: CGFloat
-    if let p = path {
-      let k = min(1, (now - p.t0) / p.dur)
-      let e = k < 0.5 ? 4 * k * k * k : 1 - pow(-2 * k + 2, 3) / 2   // easeInOutCubic
-      next = CGFloat(exp(log(Double(p.from)) + (log(Double(p.to)) - log(Double(p.from))) * e))
-      if k >= 1 { path = nil }
-    } else {
-      let diff = log(Double(target / current))
-      if abs(diff) < 0.0008 { stop(); return }
-      next = CGFloat(exp(log(Double(current)) + diff * (1 - exp(-dt / 0.075))))
-    }
-    next = clamp(next)
-    guard abs(next - current) > 0.00005 else { if path == nil { stop() }; return }
-    _ = CowboyObjC.catching {
-      if (try? d.lockForConfiguration()) != nil {
-        if d.isRampingVideoZoom { d.cancelVideoZoomRamp() }
-        d.videoZoomFactor = next
-        d.unlockForConfiguration()
-      }
-    }
-    onChange?(next)
+  // um passo por quadro capturado (fila da saída de vídeo)
+  func frameTick(_ t: Double) {
+    lock.lock()
+    guard let d = device, let tgt = target else { lock.unlock(); return }
+    let dt = lastTick == 0 ? 1.0 / 60 : min(0.05, max(0.004, t - lastTick)); lastTick = t
+    lock.unlock()
+    let cur = d.videoZoomFactor
+    let diff = log(Double(tgt / cur))
+    guard abs(diff) > 0.0006 else { return }
+    let next = clamp(d, CGFloat(exp(log(Double(cur)) + diff * (1 - exp(-dt / 0.07)))))
+    configure(d) { d.videoZoomFactor = next }
   }
 }
