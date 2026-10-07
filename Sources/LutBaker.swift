@@ -111,9 +111,12 @@ final class LutBaker: @unchecked Sendable {
     else { return fail("textura") }
     // faixa da fonte (normalizada pelo máximo do código) e matriz: Rec.2020 nas fontes 10 bits (Log/HLG), Rec.709 no SDR
     let maxCode: Float = ten ? 1023 : 255
-    let range: SIMD4<Float> = full ? SIMD4(1, 0, 1, (ten ? 512 : 128) / maxCode)
-      : (ten ? SIMD4(1023 / 876, 64 / 1023, 1023 / 896, 512 / 1023) : SIMD4(255 / 219, 16 / 255, 255 / 224, 128 / 255))
-    let matrix: SIMD4<Float> = ten ? SIMD4(1.4746, 0.16455, 0.57135, 1.8814) : SIMD4(1.5748, 0.1873, 0.4681, 1.8556)
+    let center: Float = (ten ? 512 : 128) / maxCode
+    var range = SIMD4<Float>(1, 0, 1, center)
+    if !full && ten { range = SIMD4<Float>(1023.0 / 876.0, 64.0 / 1023.0, 1023.0 / 896.0, 512.0 / 1023.0) }
+    if !full && !ten { range = SIMD4<Float>(255.0 / 219.0, 16.0 / 255.0, 255.0 / 224.0, 128.0 / 255.0) }
+    let rec2020 = SIMD4<Float>(1.4746, 0.16455, 0.57135, 1.8814), rec709 = SIMD4<Float>(1.5748, 0.1873, 0.4681, 1.8556)
+    let matrix = ten ? rec2020 : rec709
     var prm: [SIMD4<Float>] = [range, matrix, SIMD4(Float(lutN), 0, 0, 0)]
     guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return fail("comando") }
     enc.setComputePipelineState(pipeline)
