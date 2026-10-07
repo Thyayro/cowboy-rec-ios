@@ -33,7 +33,9 @@ final class ZoomDriver: @unchecked Sendable {
     let to = clamp(d, factor), from = d.videoZoomFactor
     let stops = abs(log2(Double(to / from)))
     guard stops > 0.003 else { return }
-    let rate = Float(max(0.8, stops / max(0.2, seconds * (0.6 + 0.4 * min(1, stops / 2)))))
+    let spread: Double = 0.6 + 0.4 * min(1.0, stops / 2.0)
+    let duration: Double = max(0.2, seconds * spread)
+    let rate = Float(max(0.8, stops / duration))
     configure(d) { d.ramp(toVideoZoomFactor: to, withRate: rate) }
   }
   // um passo por quadro capturado (fila da saída de vídeo)
