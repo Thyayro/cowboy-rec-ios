@@ -658,6 +658,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let source: SourceColor = self.requestedLog ? .appleLog : self.requestedHDR ? .hlg : .sdr
         let bakeFn = self.bake709 ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
         let baker = bakeFn.flatMap { LutBaker(transform: $0) }
+        if bakeFn != nil && baker == nil { Diag.step("bake-init-fail") }
         var (videoSettings, how) = self.writerVideoSettings(cam, bake: baker != nil)
         var compression = (videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any]) ?? [:]
         let codecName = (videoSettings[AVVideoCodecKey] as? AVVideoCodecType)?.rawValue ?? (videoSettings[AVVideoCodecKey] as? String) ?? ""
