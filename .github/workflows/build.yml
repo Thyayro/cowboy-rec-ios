@@ -14,11 +14,7 @@ jobs:
       - name: Verify native format policy
         run: swiftc Sources/CapturePolicy.swift Sources/ColorMath.swift Tests/CapturePolicyTests.swift -o /tmp/cowboy-capture-policy && /tmp/cowboy-capture-policy
       - name: Verify Metal shader (compiled at runtime on the iPhone)
-        run: |
-          python3 -c "import re;s=open('Sources/LutBaker.swift').read();m=re.search(r'static let shader = \"\"\"
-(.*?)
-  \"\"\"',s,re.S);open('/tmp/bake.metal','w').write(m.group(1))"
-          xcrun -sdk iphoneos metal -c /tmp/bake.metal -o /tmp/bake.air && echo SHADER OK
+        run: python3 tools/extract_shader.py /tmp/bake.metal && xcrun -sdk iphoneos metal -c /tmp/bake.metal -o /tmp/bake.air && echo SHADER OK
       - name: Build native camera
         run: xcodebuild -project CowboyRec.xcodeproj -scheme CowboyRec -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
       - name: Package unsigned IPA
