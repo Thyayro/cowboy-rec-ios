@@ -190,6 +190,18 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
   static let thumbURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("last_thumb.jpg")
   private var recBaker: LutBaker?
+  // parar na hora: o toque derruba a gravação imediatamente (quadros que chegarem depois não entram)
+  private let stopLock = NSLock()
+  private var stopRequested = false
+  // medidor de áudio: pico por canal (dBFS), atualizado ~20×/s, gravando ou não
+  @Published var audioLevels: [Float] = [-80]
+  @Published var audioPeakHold: [Float] = [-80]
+  @Published var audioClip = false
+  private var meterAcc: [Float] = []
+  private var meterLast = 0.0
+  private var holdValues: [Float] = []
+  private var holdAt: [Double] = []
+  private var clipAt = 0.0
   @Published var recoverableFile: URL?
   var onSaved: ((URL, String?) -> Void)?
   var spaceMeta: (() -> [String: Any])?
@@ -692,6 +704,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           let m = NativeCaptureMetadata(width: profile.width, height: profile.height, frameRate: profile.fps, hdr: self.requestedHDR, codec: self.requestedCodec.rawValue, lens: self.name(cam), stabilization: Self.label(mode), colorProfile: colorProfile, convertRec709: convert, captureMode: "avfoundation-file")
           try JSONEncoder().encode(m).write(to: localFile.appendingPathExtension("capture"), options: .atomic)
           self.dataQueue.async {
+            self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
             self.recBaker = baker
             self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = nil; self.elapsedMs = 0
             self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
@@ -709,6 +722,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           CloudStream.shared.push(cid, data, durationMs: self.elapsedMs)
         }
         self.dataQueue.async {
+          self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
           self.recBaker = baker
           self.writer = writer; self.recCid = cid; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = gyro; self.elapsedMs = 0
           MotionHub.shared.attach(gyro)
@@ -755,10 +769,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     return (settings, bake ? "manual-709" : "manual")
   }
   func stopRecording() {
+    stopLock.lock(); stopRequested = true; stopLock.unlock()
+    publish { if self.recording { self.recording = false; self.finishing = true } }
     dataQueue.async {
-      guard let writer = self.writer else { return }
+      guard let writer = self.writer else { self.publish { self.finishing = false }; return }
       self.writer = nil
-      if let b = self.recBaker, b.failures > 0 { Diag.step("bake-failures", ["n": b.failures]) }
+      if let b = self.recBaker, b.failures > 0 { Diag.step("bake-failures", ["n": b.failures, "err": b.lastError]) }
       self.recBaker = nil
       if let file = writer.fileURL {
         let owner = self.recOwner; self.recOwner = nil
@@ -798,11 +814,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
   // ---- quadros
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-    if output === audioOut { writer?.appendAudio(sampleBuffer); return }
+    if output === audioOut { meter(sampleBuffer); if !stopping { writer?.appendAudio(sampleBuffer) }; return }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     if let pixel { renderer.push(pixel, pts: pts.seconds) }
-    guard let writer else { return }
+    guard let writer, !stopping else { return }
     var baked: CMSampleBuffer?
     if let recBaker { baked = recBaker.convert(sampleBuffer) }
     writer.appendVideo(baked ?? sampleBuffer)
@@ -829,6 +845,48 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {}
+  private var stopping: Bool { stopLock.lock(); defer { stopLock.unlock() }; return stopRequested }
+
+  // ---- medidor: lê as amostras REAIS do microfone (as mesmas que vão pro arquivo), pico por canal
+  private func meter(_ sample: CMSampleBuffer) {
+    guard let desc = CMSampleBufferGetFormatDescription(sample), let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(desc) else { return }
+    let asbd = asbdPtr.pointee
+    let channels = max(1, Int(asbd.mChannelsPerFrame)), isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0, bits = Int(asbd.mBitsPerChannel)
+    let nonInterleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+    var sizeNeeded = 0
+    CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, bufferListSizeNeededOut: &sizeNeeded, bufferListOut: nil, bufferListSize: 0, blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil)
+    guard sizeNeeded > 0 else { return }
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: sizeNeeded, alignment: 16); defer { raw.deallocate() }
+    let abl = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+    var block: CMBlockBuffer?
+    guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, bufferListSizeNeededOut: nil, bufferListOut: abl, bufferListSize: sizeNeeded, blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: &block) == noErr else { return }
+    var peaks = [Float](repeating: 0, count: channels)
+    for (bi, buf) in UnsafeMutableAudioBufferListPointer(abl).enumerated() {
+      guard let data = buf.mData else { continue }
+      let chInBuf = nonInterleaved ? 1 : max(1, Int(buf.mNumberChannels))
+      if isFloat && bits == 32 {
+        let n = Int(buf.mDataByteSize) / 4, p = data.bindMemory(to: Float.self, capacity: n)
+        for i in 0..<n { let c = nonInterleaved ? bi : i % chInBuf; if c < channels { peaks[c] = max(peaks[c], abs(p[i])) } }
+      } else if bits == 16 {
+        let n = Int(buf.mDataByteSize) / 2, p = data.bindMemory(to: Int16.self, capacity: n)
+        for i in 0..<n { let c = nonInterleaved ? bi : i % chInBuf; if c < channels { peaks[c] = max(peaks[c], Float(abs(Int(p[i]))) / 32768) } }
+      } else if bits == 32 {
+        let n = Int(buf.mDataByteSize) / 4, p = data.bindMemory(to: Int32.self, capacity: n)
+        for i in 0..<n { let c = nonInterleaved ? bi : i % chInBuf; if c < channels { peaks[c] = max(peaks[c], Float(abs(Double(p[i]))) / 2147483648) } }
+      }
+    }
+    if meterAcc.count != channels { meterAcc = [Float](repeating: 0, count: channels); holdValues = [Float](repeating: -80, count: channels); holdAt = [Double](repeating: 0, count: channels) }
+    for c in 0..<channels { meterAcc[c] = max(meterAcc[c], peaks[c]) }
+    let now = CACurrentMediaTime()
+    if peaks.contains(where: { $0 >= 0.989 }) { clipAt = now }
+    guard now - meterLast >= 0.05 else { return }
+    meterLast = now
+    let db = meterAcc.map { $0 > 0 ? max(-80, 20 * log10($0)) : -80 }
+    for c in 0..<channels where db[c] >= holdValues[c] || now - holdAt[c] > 1.5 { holdValues[c] = db[c]; holdAt[c] = now }
+    meterAcc = [Float](repeating: 0, count: channels)
+    let hold = holdValues, clip = now - clipAt < 1.5
+    publish { self.audioLevels = db; self.audioPeakHold = hold; self.audioClip = clip }
+  }
 
   // Capturas antigas (.mov da versão anterior / modo AR) continuam pela fila de arquivos.
   func recoverSaved(owner: String) {

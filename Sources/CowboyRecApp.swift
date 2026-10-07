@@ -138,7 +138,7 @@ struct RecorderView: View {
   private func videoRect(_ size: CGSize) -> CGRect {
     let full = CGRect(origin: .zero, size: size)
     guard size.height > size.width else { return Geometry.fit(camera.videoSize, in: full) }
-    let top = (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.keyWindow?.safeAreaInsets.top ?? 47) + 62
+    let top = (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.keyWindow?.safeAreaInsets.top ?? 47) + 74
     let area = CGRect(x: 0, y: top, width: size.width, height: max(100, size.height - top))
     var r = Geometry.fit(camera.videoSize, in: area)
     r.origin.y = area.minY
@@ -183,10 +183,11 @@ struct RecorderView: View {
         }
         Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(.white.opacity(0.12), in: Circle()).foregroundStyle(.white) }.disabled(camera.recording)
       }
+      AudioMeter(levels: camera.audioLevels, holds: camera.audioPeakHold, clip: camera.audioClip)
       Text(statusLine).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.75)).lineLimit(1).minimumScaleFactor(0.8)
     }
     .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
-    .frame(height: 62, alignment: .top)
+    .frame(height: 74, alignment: .top)
     .background(Color.black.ignoresSafeArea(edges: .top))
   }
   private var statusLine: String {
@@ -424,5 +425,33 @@ struct RecorderView: View {
     let angle: Double = o == .landscapeLeft ? 180 : o == .landscapeRight ? 0 : o == .portraitUpsideDown ? 270 : 90
     if angle != interfaceAngle { interfaceAngle = angle }
     camera.setPreviewAngle(angle)
+  }
+}
+
+// Medidor de áudio: uma barra por canal, verde até -12 dB, amarelo até -6, vermelho acima; traço = pico dos últimos 1,5 s;
+// "CLIP" acende se estourar. Escala -60…0 dBFS.
+struct AudioMeter: View {
+  let levels: [Float]
+  let holds: [Float]
+  let clip: Bool
+  private func x(_ db: Float) -> CGFloat { CGFloat(max(0, min(1, (db + 60) / 60))) }
+  var body: some View {
+    HStack(spacing: 6) {
+      Image(systemName: "mic.fill").font(.system(size: 9, weight: .bold)).foregroundStyle(levels.allSatisfy { $0 <= -79 } ? Color.red : .white.opacity(0.8))
+      VStack(spacing: 2) {
+        ForEach(Array(levels.enumerated()), id: \.offset) { i, db in
+          GeometryReader { g in
+            ZStack(alignment: .leading) {
+              Capsule().fill(Color.white.opacity(0.12))
+              LinearGradient(stops: [.init(color: .green, location: 0), .init(color: .green, location: 0.78), .init(color: .yellow, location: 0.86), .init(color: .red, location: 0.95)], startPoint: .leading, endPoint: .trailing)
+                .mask(alignment: .leading) { Capsule().frame(width: g.size.width * x(db)) }
+              if i < holds.count { Rectangle().fill(Color.white).frame(width: 2).offset(x: max(0, g.size.width * x(holds[i]) - 2)) }
+            }
+          }.frame(height: levels.count > 1 ? 3 : 5)
+        }
+      }
+      Text(clip ? "CLIP" : String(format: "%.0f", max(-60, levels.max() ?? -80)))
+        .font(.system(size: 9, weight: .heavy, design: .monospaced)).foregroundStyle(clip ? Color.red : .white.opacity(0.75)).frame(width: 30, alignment: .trailing)
+    }.frame(height: 12).padding(.horizontal, 2)
   }
 }

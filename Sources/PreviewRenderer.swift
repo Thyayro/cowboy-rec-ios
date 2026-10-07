@@ -84,9 +84,18 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * scale) / 2, y: (target.height - image.extent.height * scale) / 2, width: image.extent.width * scale, height: image.extent.height * scale)
+    let base = image
     image = image.transformed(by: CGAffineTransform(scaleX: scale * k, y: scale * k))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
-    if k < 1 { image = image.clampedToExtent() }
+    if k < 1 {
+      // abrindo o zoom: o quadro atrasado ainda não tem a borda nova. Em volta dele vai o mesmo quadro no tamanho cheio,
+      // desfocado e escurecido (nada de pixel repetido); some sozinho quando o quadro real (já aberto) chega.
+      var bg = base.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+      bg = bg.transformed(by: CGAffineTransform(translationX: fit.midX - bg.extent.midX, y: fit.midY - bg.extent.midY))
+      bg = bg.clampedToExtent().applyingGaussianBlur(sigma: 18).cropped(to: fit)
+      bg = bg.applyingFilter("CIColorControls", parameters: [kCIInputBrightnessKey: -0.18, kCIInputSaturationKey: 0.7])
+      image = image.composited(over: bg)
+    }
     image = image.cropped(to: fit)
     image = Self.filtered(image, cube: cube, size: size)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
