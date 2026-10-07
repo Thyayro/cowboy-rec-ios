@@ -54,10 +54,11 @@ struct RecorderView: View {
     ZStack {
       Color.black.ignoresSafeArea()
       GeometryReader { geo in
-        let full = CGRect(origin: .zero, size: geo.size)
-        let video = Geometry.fit(camera.videoSize, in: full)
+        let video = videoRect(geo.size)
         ZStack {
           MetalPreview(renderer: camera.renderer)
+            .frame(width: max(1, video.width), height: max(1, video.height))
+            .position(x: video.midX, y: video.midY)
           CameraOverlay(video: video, interfaceAngle: interfaceAngle, tools: tools, camera: camera)
           Color.clear.contentShape(Rectangle())
             .onTapGesture(coordinateSpace: .local) { p in
@@ -128,6 +129,17 @@ struct RecorderView: View {
     }
   }
 
+  // em pé: a imagem começa logo abaixo da faixa de cima (como a câmera do iPhone); deitado: centralizada na tela inteira
+  private func videoRect(_ size: CGSize) -> CGRect {
+    let full = CGRect(origin: .zero, size: size)
+    guard size.height > size.width else { return Geometry.fit(camera.videoSize, in: full) }
+    let top = (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.keyWindow?.safeAreaInsets.top ?? 47) + 62
+    let area = CGRect(x: 0, y: top, width: size.width, height: max(100, size.height - top))
+    var r = Geometry.fit(camera.videoSize, in: area)
+    r.origin.y = area.minY
+    return r
+  }
+
   // ---------------------------------------------------------------- controles (respeitam a área segura)
   private var controls: some View {
     VStack(spacing: 0) {
@@ -169,6 +181,7 @@ struct RecorderView: View {
       Text(statusLine).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.75)).lineLimit(1).minimumScaleFactor(0.8)
     }
     .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
+    .frame(height: 62, alignment: .top)
     .background(Color.black.ignoresSafeArea(edges: .top))
   }
   private var statusLine: String {

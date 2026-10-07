@@ -36,6 +36,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     var memBytes: Int { mem.values.reduce(0) { $0 + $1.count } }
   }
 
+  static let origin = URL(string: "https://cowboy-editor.ybguyl.easypanel.host")!
   var cookieProvider: (() async -> String?)?
   private let lock = NSLock()
   private var takes: [Take] = []
@@ -266,13 +267,14 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     var disk = 0
     for t in takes { for s in t.disk { disk += (try? t.dir.appendingPathComponent(String(format: "%06d.m4s", s)).resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0 } }
     lock.unlock()
-    publish { self.pendingMB = Double(mem + disk) / 1_048_576; self.diskMB = Double(disk) / 1_048_576 }
+    let total = Double(mem + disk) / 1_048_576, onDisk = Double(disk) / 1_048_576
+    publish { self.pendingMB = total; self.diskMB = onDisk }
   }
   private func setHealth(_ h: Health, _ text: String) { lock.lock(); netDown = h == .offline; lock.unlock(); publish { self.health = h; self.line = text } }
   var uploadMbps: Double { rate * 8 / 1_000_000 }
 
   private func call(_ path: String, method: String = "GET", json: [String: Any]? = nil, data: Data? = nil, cookie: String, type: String? = nil) async throws -> (Int, [String: Any]) {
-    var request = URLRequest(url: URL(string: path, relativeTo: CowboyCloud.origin)!.absoluteURL)
+    var request = URLRequest(url: URL(string: path, relativeTo: Self.origin)!.absoluteURL)
     request.httpMethod = method
     request.setValue(cookie, forHTTPHeaderField: "Cookie")
     request.setValue(type ?? (json == nil ? "application/octet-stream" : "application/json"), forHTTPHeaderField: "Content-Type")
