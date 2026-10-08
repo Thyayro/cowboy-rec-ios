@@ -1,0 +1,138 @@
+import CoreVideo
+import Foundation
+
+// Teste do build (roda no Mac do GitHub antes de gerar o app): a calibração do zoom da prévia estabilizada tem que
+// (1) medir escala entre miniaturas com erro < 0,4%; (2) achar a trava verdadeira (±5 ms) de uma câmera simulada com
+// quadros renderizados, jitter de entrega e tremor; (3) na verificação, a tela com a trava ficar quieta depois que o zoom
+// para (salto ≤ 0,4%, deriva ≤ 0,6%) e a conta antiga mostrar o vai-e-volta. Se não passar, o app não sai.
+enum LutBaker { static let tenBit: Set<OSType> = [] }   // só pra compilar ZoomKernel.swift sozinho
+
+struct RNG { var s: UInt64; mutating func next() -> Double { s = s &* 6364136223846793005 &+ 1442695040888963407; return Double(s >> 11) / Double(1 << 53) }
+  mutating func normal() -> Double { let u = max(1e-12, next()), v = next(); return (-2 * log(u)).squareRoot() * cos(2 * .pi * v) } }
+
+final class Scene {
+  let W = 768, H = 432
+  var px: [Float]
+  init(seed: UInt64) {
+    var rng = RNG(s: seed)
+    px = [Float](repeating: 0, count: W * H)
+    for cell in [6, 12, 24, 48, 96] {   // ruído de valor em oitavas (textura "natural")
+      let gw = W / cell + 2, gh = H / cell + 2
+      var g = [Float](repeating: 0, count: gw * gh)
+      for i in 0..<g.count { g[i] = Float(rng.normal()) }
+      let amp = Float(cell) / 96
+      for y in 0..<H { for x in 0..<W {
+        let fx = Float(x) / Float(cell), fy = Float(y) / Float(cell)
+        let ix = Int(fx), iy = Int(fy), ax = fx - Float(ix), ay = fy - Float(iy)
+        let v = (g[iy * gw + ix] * (1 - ax) + g[iy * gw + ix + 1] * ax) * (1 - ay) + (g[(iy + 1) * gw + ix] * (1 - ax) + g[(iy + 1) * gw + ix + 1] * ax) * ay
+        px[y * W + x] += v * amp
+      } }
+    }
+    let mn = px.min()!, mx = px.max()!
+    for i in 0..<px.count { px[i] = (px[i] - mn) / (mx - mn) }
+  }
+  // miniatura 96×54 (média 8×8) do quadro com zoom z (bruto) e deslocamento (fração), como ZoomImage.thumb
+  func thumb(_ z: Double, _ tx: Double, _ ty: Double, noise: Double, _ rng: inout RNG) -> [Float] {
+    let w = 96, h = 54, sub = 8
+    var out = [Float](repeating: 0, count: w * h)
+    let span = 0.45 / (z / 2.0)
+    for y in 0..<h { for x in 0..<w {
+      var acc: Float = 0
+      for sy in 0..<sub { for sx in 0..<sub {
+        let u = ((Double(x) + (Double(sx) + 0.5) / Double(sub)) / Double(w) - 0.5) * span + 0.5 + tx
+        let v = ((Double(y) + (Double(sy) + 0.5) / Double(sub)) / Double(h) - 0.5) * span + 0.5 + ty
+        let ix = min(W - 1, max(0, Int(u * Double(W)))), iy = min(H - 1, max(0, Int(v * Double(H))))
+        acc += px[iy * W + ix]
+      } }
+      out[y * w + x] = acc / Float(sub * sub) * (1 - 0.4 * Float(((Double(x) + 0.5) / 96 - 0.5) * ((Double(x) + 0.5) / 96 - 0.5) * 4)) + Float(rng.normal() * noise)
+    } }
+    return out
+  }
+}
+
+func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { print("FALHA " + msg); exit(1) } }
+
+@main struct ZoomCalibTests {
+  static func main() {
+    let scene = Scene(seed: 7)
+    var rng = RNG(s: 99)
+    // (1) medida de escala
+    var worst = 0.0
+    for z in [2.6, 3.0] { for r in [1.0, 1.012, 1.04, 1.1, 1.25] {
+      let a = ZoomImage.prep(scene.thumb(z, 0, 0, noise: 0.004, &rng))
+      let b = ZoomImage.prep(scene.thumb(z * r, 0.002, -0.001, noise: 0.004, &rng))
+      let m = ZoomImage.vsRef(a, b, lo: 0.75, hi: 1.35)
+      worst = max(worst, abs(m.z / r - 1))
+    } }
+    check(worst < 0.004, String(format: "medida de escala entre miniaturas: pior erro %.3f%%", worst * 100))
+
+    // (2)+(3) câmera simulada: 60 qps, valor posto no retorno de cada quadro (38 ms ± 4), trava verdadeira, estabilizado L
+    for trueLag in [-0.012, 0.018, 0.045] {
+      let fps = 60.0, L = 0.62
+      func simulate(_ kind: String, z0: Double, z1: Double, fittedLag: Double?) -> CalibWindow {
+        var setLog: [(Double, Double)] = [(-5, z0)]
+        let n0 = 40
+        var zc = z0
+        var cb: [Double] = []
+        for n in 0..<260 {
+          let p = Double(n) / fps
+          let c = p + 0.038 + (rng.next() - 0.5) * 0.008
+          cb.append(c)
+          guard n >= n0 else { continue }
+          var v = zc
+          switch kind {
+          case "degrau": v = z1
+          case "clique":
+            let dur = abs(log2(z1 / z0)) / max(0.8, abs(log2(z1 / z0)) / max(0.2, 0.42 * (0.6 + 0.4 * min(1, abs(log2(z1 / z0)) / 2))))
+            let k = min(1, (p - Double(n0) / fps) / dur + 1 / 60 / dur); v = z0 * pow(z1 / z0, k)
+          default:   // pinça: alvo sobe em 0,5 s, passo amortecido por quadro
+            let tgt = z0 * pow(z1 / z0, min(1, (p - Double(n0) / fps) / 0.5))
+            if abs(log(tgt / zc)) > 0.0006 { v = exp(log(zc) + log(tgt / zc) * (1 - exp(-(1 / fps) / 0.07))) }   // = ZoomDriver.frameTick
+          }
+          if abs(v - zc) > 1e-9 { setLog.append((c, v)); zc = v }
+        }
+        let content: (Double) -> Double = { p in ZoomLag.at(setLog, p - trueLag) ?? z0 }
+        var stab: [(Double, [Float])] = []
+        var jx = 0.0, jy = 0.0
+        for n in 0..<260 {
+          let p = Double(n) / fps
+          jx = jx * 0.9 + rng.normal() * 0.0004; jy = jy * 0.9 + rng.normal() * 0.0004
+          stab.append((p, scene.thumb(content(p), jx, jy, noise: 0.004, &rng)))
+        }
+        // tela a 60 Hz: histórico (propriedade = último valor posto) e quadro estabilizado mais novo ampliado
+        var hist: [(Double, Double)] = []
+        var shown: [(pts: Double, k: Double, kOld: Double, at: Double)] = []
+        var lastShown = -1.0
+        for d in 0..<300 {
+          let t = Double(d) / 60 + 0.005
+          let zNow = ZoomLag.at(setLog, t) ?? z0
+          hist.append((t, zNow))
+          guard let f = stab.last(where: { $0.0 + L <= t }), f.0 > lastShown else { continue }
+          lastShown = f.0
+          var kOld = 1.0
+          if let zf = ZoomLag.hist(hist, f.0), zf > 0 { kOld = max(1, min(6, zNow / zf)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
+          var k = kOld
+          if let lag = fittedLag, let zk = ZoomLag.at(setLog, f.0 - lag), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
+          shown.append((f.0, k, kOld, t))
+        }
+        let sets = setLog.dropFirst()
+        return CalibWindow(name: kind, stab: stab, fast: [], setLog: setLog, hist: hist, shown: shown, tFirst: sets.first!.0, tLast: sets.last!.0)
+      }
+      var pairs: [(PairMeas, CalibWindow)] = []
+      for (kind, a, b) in [("degrau", 2.6, 3.25), ("degrau", 3.25, 2.6), ("clique", 2.6, 3.4), ("clique", 3.4, 2.6), ("pinça", 2.6, 3.4)] {
+        let w = simulate(kind, z0: a, z1: b, fittedLag: nil)
+        for m in ZoomCalibMath.neighborRatios(w.stab, from: w.tFirst - 0.15, to: w.tLast + 0.25) where m.conf >= 0.04 { pairs.append((m, w)) }
+      }
+      guard let best = ZoomCalibMath.bestLag(pairs) else { check(false, "ajuste sem pares"); return }
+      let old = ZoomCalibMath.lagError(pairs, nil)
+      check(abs(best.0 - trueLag) <= 0.005, String(format: "trava verdadeira %+.0f ms -> achada %+.0f ms (%d pares; erro %.2e × antiga %.2e)", trueLag * 1000, best.0 * 1000, best.2, best.1, old.0))
+      for (kind, a, b) in [("clique", 2.6, 3.4), ("pinça", 2.6, 3.4)] {
+        let w = simulate(kind, z0: a, z1: b, fittedLag: best.0)
+        let j = ZoomCalibMath.screenJumps(w)
+        check(j.n >= 15 && j.new.0 <= 0.004 && j.new.1 <= 0.006,
+          String(format: "trava %+.0f ms, %@: tela NOVA salto %.2f%% deriva %.2f%% | antiga salto %.2f%% deriva %.2f%% (%d pares)", trueLag * 1000, kind, j.new.0 * 100, j.new.1 * 100, j.old.0 * 100, j.old.1 * 100, j.n))
+      }
+    }
+    print("TESTE DO ZOOM OK")
+  }
+}

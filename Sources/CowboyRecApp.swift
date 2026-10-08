@@ -112,12 +112,12 @@ struct RecorderView: View {
       .preferredColorScheme(.dark)
     }
     .sheet(isPresented: $settings) { settingsSheet }
-    .alert("Teste automático do zoom", isPresented: $askSelfTest) {
-      Button("Iniciar (~1 min)") { camera.runZoomSelfTest() }
-      Button("Agora não", role: .cancel) {}
-    } message: { Text("Apoie o celular parado, apontado pra uma cena com detalhes. O app faz os cliques de zoom sozinho; no fim, VOCÊ faz 3 pinças. Ele mede quadro a quadro se a imagem para quieta.") }
+    .alert("Calibrar o zoom (45 s)", isPresented: $askSelfTest) {
+      Button("Calibrar agora") { camera.runZoomCalibration() }
+      Button("Depois", role: .cancel) {}
+    } message: { Text("Apoie o celular PARADO num lugar iluminado, apontado pra algo com detalhes, e não toque. O app faz uns zooms sozinho, mede na imagem e só liga a correção do zoom se ela provar que a imagem para quieta.") }
     .onChange(of: camera.ready) { _, ok in
-      if ok && !UserDefaults.standard.bool(forKey: "selftest_072") { UserDefaults.standard.set(true, forKey: "selftest_072"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
+      if ok && !UserDefaults.standard.bool(forKey: "zoomcalib_075") { UserDefaults.standard.set(true, forKey: "zoomcalib_075"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
     }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
     .task {
@@ -421,7 +421,7 @@ struct RecorderView: View {
           Text(stream.line.isEmpty ? "Sem envios pendentes" : stream.line).font(.caption)
           if stream.pendingMB > 0.5 { Text(String(format: "Na fila: %.0f MB (%.0f MB guardados no iPhone)", stream.pendingMB, stream.diskMB)).font(.caption) }
           Button("Retomar envios") { Task { await cloud.refresh(); CloudStream.shared.kick() } }
-          Button("Testar o zoom (~1 min)") { settings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { camera.runZoomSelfTest() } }.disabled(camera.recording)
+          Button("Calibrar o zoom (45 s, celular parado)") { settings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { camera.runZoomCalibration() } }.disabled(camera.recording)
         }
         Section("Conta e biblioteca") {
           Text(cloud.email ?? "Você ainda não entrou na conta")

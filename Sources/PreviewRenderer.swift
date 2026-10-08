@@ -33,10 +33,12 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var fastFresh = false
   private let eis = PreviewEIS()
   private var fastCorr = (0.0, 0.0)
-  // prévia estabilizada: zoom do conteúdo do quadro = zoom pedido defasado/suavizado como o aparelho aplica (aprendido na
-  // imagem — ver ZoomTiming). Sem aprendizado ainda: igual à conta antiga.
-  let timing = ZoomTiming()
-  private var shownK: [(Double, Double)] = []   // ampliação usada na tela por quadro estabilizado (medição do estacionar)
+  // prévia estabilizada: zoom que cada quadro carrega pelo REGISTRO exato do ZoomDriver + trava calibrada no aparelho
+  // (ZoomLag/ZoomCalibration); nil = sem calibração aprovada: conta antiga. Só a thread da tela lê e escreve.
+  let calibRec = ZoomCalibRecorder()
+  var frameZoom: ((Double) -> Double?)?
+  // por quadro estabilizado desenhado: ampliação usada, a que a conta antiga daria e a hora (medição do estacionar/calibração)
+  private var shownK: [(pts: Double, k: Double, kOld: Double, at: Double)] = []
   var lensMatch: LensMatch?
   var aligner: SwitchAligner?
   // NUNCA fila de medições: cada medição segura um quadro da câmera; acumuladas, os quadros acabam e a câmera para (0.6.1)
@@ -56,8 +58,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // sozinha por 1–2 s ("estacionar"). Agora: 5 medidas ao abrir a câmera -> mediana -> fixo até trocar câmera/formato.
   private var cropFrozen = false
   var displayCrop: Double { lock.lock(); defer { lock.unlock() }; return shownCrop }
-  func displayK(at t: Double) -> Double? { lock.lock(); defer { lock.unlock() }; return shownK.last(where: { abs($0.0 - t) < 0.004 })?.1 }
-  private func historyCopy() -> [(Double, Double)] { lock.lock(); defer { lock.unlock() }; return zoomHistory }
+  func displayK(at t: Double) -> Double? { lock.lock(); defer { lock.unlock() }; return shownK.last(where: { abs($0.pts - t) < 0.004 })?.k }
+  func zoomHistorySnapshot() -> [(Double, Double)] { lock.lock(); defer { lock.unlock() }; return zoomHistory }
+  func shownSnapshot() -> [(pts: Double, k: Double, kOld: Double, at: Double)] { lock.lock(); defer { lock.unlock() }; return shownK }
+  func clearShown() { lock.lock(); shownK.removeAll(); lock.unlock() }
   var displayShake: (Double, Double) { lock.lock(); defer { lock.unlock() }; return fastCorr }
   private var calibFast: (pts: Double, image: CGImage)?
   private var calibBusy = false
@@ -77,8 +81,6 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let options: [CIContextOption: Any] = [.workingColorSpace: NSNull(), .outputColorSpace: NSNull(), .cacheIntermediates: false]
     if let device { context = CIContext(mtlDevice: device, options: options) } else { context = CIContext(options: options) }
     super.init()
-    timing.history = { [weak self] in self?.historyCopy() ?? [] }
-    timing.lensAt = { [weak self] t in self?.aligner?.lensAt?(t) ?? "" }
   }
   func push(_ buffer: CVPixelBuffer, pts: Double? = nil) {
     lock.lock()
@@ -93,7 +95,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if abs(cf.pts - pts) < 0.004 { match = cf; calibFast = nil } else if pts > cf.pts + 0.1 { calibFast = nil; calibBusy = false }
     }
     lock.unlock()
-    if !lightPreview, let pts { timing.submit(buffer, pts: pts) }   // só a miniatura aqui (≈0,2 ms)
+    if let pts, calibRec.active { calibRec.feed(buffer, pts: pts, stabilized: true) }
     if let match { calibQueue.async { self.register(stabilized: buffer, fast: match.image) } }
     if wantStab, let pts, let al = aligner {
       stabQueue.async {
@@ -103,6 +105,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     }
   }
   func pushFast(_ buffer: CVPixelBuffer, pts: Double) {
+    if calibRec.active { calibRec.feed(buffer, pts: pts, stabilized: false) }
     // estabilização própria da tela (só deslocamento; cega ao zoom) — calculada aqui, antes de mostrar
     lock.lock(); let fr = frozen; eis.margin = max(0.01, min(0.035, (crop - 1) / 2 - 0.006)); lock.unlock()
     if fr { return }
@@ -194,7 +197,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); timing.reset() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -239,8 +242,6 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
     let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0) }
-    let th = timing.params
-    let zModel = pts.map { ZoomTiming.model(zoomHistory, $0, th.d, th.tau) }
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
@@ -261,10 +262,12 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
     var image = Self.oriented(buffer, orient, mirrored: mirror)
-    var k = 1.0
-    // zoom do conteúdo = pedido defasado/suavizado como o aparelho aplica (aprendido); nunca < 1 (zoom out: quadro como está)
-    if let zNow, let zc = (zModel ?? zFrame), zc > 0 { k = max(1, min(6, zNow / zc)); if abs(k - 1) < (th.learned ? 0.0005 : 0.004) { k = 1 } }
-    if let pts { lock.lock(); shownK.append((pts, k)); if shownK.count > 400 { shownK.removeFirst(shownK.count - 400) }; lock.unlock() }
+    // ampliação = zoom pedido agora ÷ zoom do conteúdo do quadro; nunca < 1 (zoom out: o quadro como está, sem borda inventada)
+    var kOld = 1.0
+    if let zNow, let zFrame, zFrame > 0 { kOld = max(1, min(6, zNow / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
+    var k = kOld
+    if let zNow, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
+    if let pts { lock.lock(); shownK.append((pts, k, kOld, now)); if shownK.count > 600 { shownK.removeFirst(shownK.count - 600) }; lock.unlock() }
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * scale) / 2, y: (target.height - image.extent.height * scale) / 2, width: image.extent.width * scale, height: image.extent.height * scale)
