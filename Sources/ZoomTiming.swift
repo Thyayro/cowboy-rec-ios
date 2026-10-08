@@ -24,8 +24,12 @@ final class ZoomTiming: @unchecked Sendable {
   private var learnedN: Int
   var history: (() -> [(Double, Double)])?     // zoom pedido (hora, valor) — cópia
   var lensAt: ((Double) -> String)?
-  var boundaries: [Double] = []                 // zoom bruto onde troca lente/modo do sensor (fora da medida)
-  var onReport: ((String) -> Void)?
+  // zoom bruto onde troca lente/modo do sensor (fora da medida) e aviso pro diagnóstico — trocados pela fila da câmera,
+  // lidos pela fila própria: sempre pela trava
+  private var _bounds: [Double] = []
+  private var _report: ((String) -> Void)?
+  var boundaries: [Double] { get { lock.lock(); defer { lock.unlock() }; return _bounds } set { lock.lock(); _bounds = newValue; lock.unlock() } }
+  var onReport: ((String) -> Void)? { get { lock.lock(); defer { lock.unlock() }; return _report } set { lock.lock(); _report = newValue; lock.unlock() } }
   // só na fila própria
   private var prev: (pts: Double, img: [Float], lens: String)?
   private var pairs: [(pa: Double, pb: Double, r: Double, conf: Float)] = []
@@ -78,7 +82,8 @@ final class ZoomTiming: @unchecked Sendable {
     if abs(log(b / a)) > 1e-4 {
       moving += 1
       let lo0 = min(a, b), hi0 = max(a, b)
-      let crosses = boundaries.contains { $0 > lo0 * 0.999 && $0 < hi0 * 1.001 }
+      let bs = boundaries
+      let crosses = bs.contains { $0 > lo0 * 0.999 && $0 < hi0 * 1.001 }
       guard !skipMeasure, pv.lens == lens, !crosses else { return }
       let cur = params
       var lo = Double.infinity, hi = 0.0
