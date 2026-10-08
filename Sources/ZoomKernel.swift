@@ -187,6 +187,14 @@ enum ZoomCalibMath {
     }
     return out
   }
+  // "tela quieta": 99% dos erros no nível do ruído da medida e nenhum do tamanho de um quadro trocado (≈1,4% num clique);
+  // com centenas de pares o MAIOR erro de puro ruído já passa de 3σ, por isso o máximo tem folga maior
+  static func quiet(_ res: [Double], _ floor: Double) -> Bool {
+    guard !res.isEmpty else { return false }
+    let a = res.map { abs($0) }.sorted()
+    let p99 = a[min(a.count - 1, Int(Double(a.count) * 0.99))]
+    return p99 <= max(3 * floor, 0.004) && a.last! <= max(6 * floor, 0.008)
+  }
   static func huber(_ x: Double) -> Double { let a = abs(x); return a < 0.01 ? a * a : 0.01 * (2 * a - 0.01) }
   // erro médio das razões medidas × previstas (trava = registro exato; nil = conta antiga pelo histórico da tela)
   static func lagError(_ pairs: [(PairMeas, CalibWindow)], _ lag: Double?) -> (Double, Int) {
@@ -233,7 +241,7 @@ enum ZoomCalibMath {
     let floor = still.count >= 5 ? ms(still).squareRoot() : 0.002
     let eN = ms(rn), eO = ms(ro)
     let mN = rn.map { abs($0) }.max() ?? .infinity, mO = ro.map { abs($0) }.max() ?? .infinity
-    let ok = rn.count >= 20 && eN <= 0.7 * eO && mN <= max(3 * floor, 0.004)
+    let ok = rn.count >= 20 && eN <= 0.7 * eO && quiet(rn, floor)
     return (ok, eN, eO, mN, mO, floor, rn.count)
   }
 
@@ -299,7 +307,7 @@ enum ZoomCalibMath {
     let eN = ms(rn), eO = ms(ro), mN = rn.map { abs($0) }.max() ?? .infinity, mO = ro.map { abs($0) }.max() ?? .infinity
     let spread = (lags.max() ?? 0) - (lags.min() ?? 0)
     guard let g = bestLag(gs) else { return (nil, "sem ajuste") }
-    let ok = rn.count >= 30 && eN <= 0.7 * eO && mN <= max(3 * floor, 0.004) && spread <= 0.012
+    let ok = rn.count >= 30 && eN <= 0.7 * eO && quiet(rn, floor) && spread <= 0.012
     let txt = String(format: "gestos %d pares %d | trava %+.0fms (dobras %+.0f…%+.0f) | erro nova %.2e antiga %.2e | maior nova %.2f%% antiga %.2f%% | ruído %.2f%%",
                      gs.count, rn.count, g.0 * 1000, (lags.min() ?? 0) * 1000, (lags.max() ?? 0) * 1000, eN, eO, mN * 100, mO * 100, floor * 100)
     return (ok ? g.0 : nil, (ok ? "LIGA " : "ainda não ") + txt)
