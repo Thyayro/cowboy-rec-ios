@@ -42,6 +42,12 @@ final class SwitchAligner: @unchecked Sendable {
       for dy in (c.dy - 1)...(c.dy + 1) { for dx in (c.dx - 1)...(c.dx + 1) { let e = cost(ref, img, s, Float(dx) / Float(w), Float(dy) / Float(h)); if e < best.e { best = (s, dx, dy, e) } } } }
     return best.s
   }
+  func geometry(_ stream: String, at t: Double) -> SwitchGeometry {
+    lock.lock(); defer { lock.unlock() }
+    guard let tr = transitions[stream]?.last(where: { $0.t0 <= t }), t - tr.t0 < Self.glide, lensAt?(t) == tr.lens else { return .identity }
+    let k = Float(1 - (t - tr.t0) / Self.glide)
+    return tr.g.mix(k * k * (3 - 2 * k))
+  }
   func feed(_ stream: String, t: Double, luma: [Float]) {
     guard luma.count == Self.w * Self.h, let lens = lensAt?(t) else { return }
     let img = Self.normalize(luma)
