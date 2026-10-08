@@ -107,8 +107,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private let fastOut = AVCaptureVideoDataOutput()   // prévia do zoom: sem estabilização, tempo real (nunca vai pro arquivo)
   private let fastQueue = DispatchQueue(label: "cowboy.native.fast", qos: .userInteractive)
   private var fastOK = false
-  private var device: AVCaptureDevice?
-  private var base: CGFloat = 1
+  private(set) var device: AVCaptureDevice?
+  private(set) var base: CGFloat = 1
   private var configured = false
   private var zoomObservation: NSKeyValueObservation?
   private var rotationObservation: NSKeyValueObservation?
