@@ -120,7 +120,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if fr { return }
     // durante o zoom a imagem muda de tamanho: a medida de tremor erraria e depois "voltaria" — segura enquanto o zoom anda
     lock.lock(); let zooming = CACurrentMediaTime() - lastZoomMove < 0.2
-    let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.4, zHistFast = zoomAt(pts + Self.contentLead) ?? 0; lock.unlock()
+    // só mede enquanto o zoom pedido mudou há pouco (o conteúdo chega ≤35 ms adiantado e o quadro rápido chega ~40 ms depois):
+    // parado, o quadro não muda mais — medir só somaria ruído (e trocaria a referência à toa: degrau de ~1%)
+    let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.15, zHistFast = zoomAt(pts + Self.contentLead) ?? 0; lock.unlock()
     if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving) }
     let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming) : (0, 0)
     lock.lock()

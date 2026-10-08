@@ -261,7 +261,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     // (5) ZOOM REAL MEDIDO NA SAÍDA RÁPIDA (0.7.9): o iPhone aplica o zoom ADIANTADO em relação ao registrado, e o
     // adiantamento VARIA por gesto (0–35 ms, medido na tela do aparelho). A conta da 0.7.8 (registrado + 25 ms) erra nos
     // extremos; o rastreador mede o zoom real nos quadros rápidos e a tela tem que parar quieta. No escuro: não pode piorar.
-    for useKey in [false, true] { print(useKey ? "   --- medindo contra REFERÊNCIA" : "   --- medindo contra o VIZINHO")
+    for seed in [1, 2, 3] { print("   --- sorteio de ruído \(seed)"); rng = RNG(s: UInt64(1000 + seed * 77))
     for (lead, contrast) in [(0.0, 1.0), (0.018, 1.0), (0.035, 1.0), (0.035, 0.25)] {
       for kind in ["clique", "pinça"] {
         let fps = 60.0, L = 0.55, z0 = 2.6, z1 = 3.4, T0 = 0.6
@@ -279,7 +279,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         var tEnd = T0 + 0.2
         while tEnd < 6 && abs(zProp(tEnd + 0.05) / zProp(tEnd) - 1) > 1e-6 { tEnd += 1 / fps }
         func content(_ p: Double) -> Double { zProp(p + lead) }
-        let track = FastZoomTracker(); track.useKey = useKey
+        let track = FastZoomTracker()
         var hist: [(Double, Double)] = []
         var fi = 0, lastShown = -1.0
         var newN: [Double] = [], oldN: [Double] = []
@@ -293,7 +293,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
             let p = Double(fi) / fps
             jx = jx * 0.95 + rng.normal() * 0.0006; jy = jy * 0.95 + rng.normal() * 0.0006
             let arrive = p + 0.038
-            let moving = abs(log(zProp(arrive) / zProp(arrive - 0.4))) > 1e-6
+            let moving = abs(log(zProp(arrive) / zProp(arrive - 0.15))) > 1e-6   // = app: pedido mudou nos últimos 150 ms
             var th: [Float]? = nil
             if moving { th = scene.thumb(content(p), jx, jy, noise: 0.0, &rng).map { Float(0.5) + ($0 - Float(0.5)) * Float(contrast) + Float(rng.normal() * 0.004) } }
             track.step(pts: p, zHist: ZoomLag.hist(hist, p + 0.025) ?? z0, thumb: th, moving: moving)
@@ -335,7 +335,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
       }
     }
     }
-    if softFail { print("FALHA (comparação dos medidores)"); exit(1) }
+    if softFail { print("FALHA (zoom medido em algum sorteio)"); exit(1) }
     print("TESTE DO ZOOM OK")
   }
 }
