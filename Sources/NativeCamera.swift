@@ -195,6 +195,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   static let thumbURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("last_thumb.jpg")
   private var recBaker: LutBaker?
   let zoomDriver = ZoomDriver()
+  // redutor de ruído (no áudio que vai pro arquivo): médio por padrão
+  let noise = NoiseReducer(level: NoiseReducer.Level(rawValue: UserDefaults.standard.object(forKey: "noise") as? Int ?? 2) ?? .medium)
+  @Published var noiseLevel = NoiseReducer.Level(rawValue: UserDefaults.standard.object(forKey: "noise") as? Int ?? 2) ?? .medium
+  func setNoise(_ l: NoiseReducer.Level) { noise.setLevel(l); noiseLevel = l; UserDefaults.standard.set(l.rawValue, forKey: "noise"); Diag.step("noise", ["level": l.label], send: false) }
   private var constituentObservation: NSKeyValueObservation?
   private(set) var lensMatch: LensMatch?
   @Published var lensMatchOn = UserDefaults.standard.object(forKey: "lensMatch") as? Bool ?? true
@@ -884,7 +888,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) { renderer.pushFast(pb, pts: t) }
       return
     }
-    if output === audioOut { meter(sampleBuffer); if !stopping { writer?.appendAudio(sampleBuffer) }; return }
+    if output === audioOut {
+      meter(sampleBuffer)
+      let clean = noise.process(sampleBuffer)   // roda sempre (a estimativa do ruído fica pronta antes de gravar)
+      if !stopping { writer?.appendAudio(clean ?? sampleBuffer) }
+      return
+    }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     if let pixel { renderer.push(pixel, pts: pts.seconds) }

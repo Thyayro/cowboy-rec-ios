@@ -48,6 +48,7 @@ struct RecorderView: View {
   @State private var focusPoint: CGPoint?
   @State private var toast: String?
   @State private var iconAngle: Double = 0
+  @State private var noisePanel = false
   @Environment(\.scenePhase) private var phase
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 1, green: 0.8, blue: 0)
@@ -185,11 +186,19 @@ struct RecorderView: View {
         }
         Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(.white.opacity(0.12), in: Circle()).foregroundStyle(.white) }.disabled(camera.recording)
       }
-      AudioMeter(levels: camera.audioLevels, holds: camera.audioPeakHold, clip: camera.audioClip)
+      AudioMeter(levels: camera.audioLevels, holds: camera.audioPeakHold, clip: camera.audioClip, noiseOn: camera.noiseLevel != .off) { withAnimation(.easeOut(duration: 0.15)) { noisePanel.toggle() } }
+      if noisePanel {
+        HStack(spacing: 6) {
+          Text("Redutor de ruído").font(.system(size: 11, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
+          ForEach(NoiseReducer.Level.allCases, id: \.rawValue) { l in
+            pill(l.label, camera.noiseLevel == l) { camera.setNoise(l); DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { withAnimation { noisePanel = false } } }
+          }
+        }.padding(.vertical, 2)
+      }
       Text(statusLine).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.75)).lineLimit(1).minimumScaleFactor(0.8)
     }
     .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
-    .frame(height: 74, alignment: .top)
+    .frame(height: noisePanel ? 112 : 74, alignment: .top)
     .background(Color.black.ignoresSafeArea(edges: .top))
   }
   private var statusLine: String {
@@ -444,10 +453,18 @@ struct AudioMeter: View {
   let levels: [Float]
   let holds: [Float]
   let clip: Bool
+  var noiseOn = false
+  var onMic: () -> Void = {}
   private func x(_ db: Float) -> CGFloat { CGFloat(max(0, min(1, (db + 60) / 60))) }
   var body: some View {
     HStack(spacing: 6) {
-      Image(systemName: "mic.fill").font(.system(size: 9, weight: .bold)).foregroundStyle(levels.allSatisfy { $0 <= -79 } ? Color.red : .white.opacity(0.8))
+      Button(action: onMic) {
+        HStack(spacing: 2) {
+          Image(systemName: "mic.fill").font(.system(size: 10, weight: .bold))
+          if noiseOn { Image(systemName: "waveform.badge.minus").font(.system(size: 9, weight: .bold)) }
+        }.foregroundStyle(levels.allSatisfy { $0 <= -79 } ? Color.red : noiseOn ? Color(red: 1, green: 0.8, blue: 0) : .white.opacity(0.8))
+        .padding(.horizontal, 6).padding(.vertical, 3).background(.white.opacity(0.12), in: Capsule())
+      }.buttonStyle(.plain)
       VStack(spacing: 2) {
         ForEach(Array(levels.enumerated()), id: \.offset) { i, db in
           GeometryReader { g in
