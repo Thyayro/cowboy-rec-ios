@@ -309,6 +309,15 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         func spread(_ x: [Double]) -> Double { guard let mx = x.max(), let mn = x.min(), let l = x.last else { return 1 }; return (mx - mn) / l }
         let dn = spread(newN), dO = spread(oldN)
         let c = track.counts
+        if contrast >= 0.5 && dn > 0.01 {   // diagnóstico: erro do medidor contra o zoom verdadeiro, por quadro rápido
+          var line: [String] = []
+          var p = T0 - 0.1
+          while p < tEnd + 0.2 {
+            if let r = track.ratio(newestOver: p) { let truth = content(Double(fi - 1) / fps) / content(p); line.append(String(format: "%.0f:%+.2f", (p - T0) * 1000, (r / truth - 1) * 100)) }
+            p += 1 / fps
+          }
+          print("     erro do medidor por quadro (ms desde o início: %): " + line.joined(separator: " "))
+        }
         if contrast >= 0.5 {
           check(dn <= 0.01, String(format: "zoom medido, adiantamento %.0f ms, %@: tela REAL depois de parar — medido %.2f%% × conta da 0.7.8 %.2f%% (medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
         } else {
