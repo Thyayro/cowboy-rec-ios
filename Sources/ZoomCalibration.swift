@@ -92,24 +92,15 @@ extension NativeCamera {
     if let w = await window("clique", { self.selectZoom(1.7) }) { verW.append(w) }
     selectZoom(1.3); await sleep(2.8)
     if let w = await window("pinça", { await pinch() }) { verW.append(w) }
-    let checks: [(String, (Double, Double), (Double, Double), Int)] = await withCheckedContinuation { cont in
-      DispatchQueue.global(qos: .userInitiated).async {
-        cont.resume(returning: verW.map { w in let j = ZoomCalibMath.screenJumps(w); return (w.name, j.new, j.old, j.n) })
-      }
+    let v = await withCheckedContinuation { cont in
+      DispatchQueue.global(qos: .userInitiated).async { cont.resume(returning: ZoomCalibMath.verify(verW, lag: fit.lag)) }
     }
-    var ok = checks.count == 2
-    var parts: [String] = []
-    for c in checks {
-      let pass = c.3 >= 15 && c.1.0 <= max(0.004, 0.5 * c.2.0) && c.1.1 <= max(0.006, 0.5 * c.2.1)
-      ok = ok && pass
-      parts.append(String(format: "%@: antes salto %.2f%% deriva %.2f%% | agora salto %.2f%% deriva %.2f%% (%d pares) %@",
-        c.0, c.2.0 * 100, c.2.1 * 100, c.1.0 * 100, c.1.1 * 100, c.3, pass ? "OK" : "NÃO"))
-    }
-    Diag.step("zoom-calib", ["resultado": ok ? "LIGADO" : "NÃO PROVOU — mantém", "trava_ms": String(format: "%.0f", fit.lag * 1000), "verificacao": parts.joined(separator: " · ")])
+    let ok = v.ok && verW.count == 2
+    Diag.step("zoom-calib", ["resultado": ok ? "LIGADO" : "NÃO PROVOU — mantém", "trava_ms": String(format: "%.0f", fit.lag * 1000),
+      "verificacao": String(format: "pares %d | erro nova %.2e antiga %.2e | maior nova %.2f%% antiga %.2f%% | ruído %.2f%%", v.n, v.eNew, v.eOld, v.maxNew * 100, v.maxOld * 100, v.floor * 100)])
     if ok {
       ZoomLag.save(fit.lag); setFrameLag(fit.lag)
-      let before = checks.map { max($0.2.0, $0.2.1) }.max() ?? 0, after = checks.map { max($0.1.0, $0.1.1) }.max() ?? 0
-      await finish(String(format: "Zoom calibrado ✓ — escala ao parar: antes %.1f%%, agora %.1f%%", before * 100, after * 100))
+      await finish(String(format: "Zoom calibrado ✓ — maior erro de escala entre quadros: antes %.1f%%, agora %.1f%%", v.maxOld * 100, v.maxNew * 100))
     } else {
       setFrameLag(previousLag)
       await finish("Calibração não provou melhora — ficou como estava (resultado enviado pra análise).")

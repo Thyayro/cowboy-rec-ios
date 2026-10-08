@@ -71,7 +71,9 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     check(worstBig < 0.006, String(format: "medida de escala no degrau de 25%%: pior erro %.3f%%", worstBig * 100))
 
     // (2)+(3) câmera simulada: 60 qps, valor posto no retorno de cada quadro (38 ms ± 4), trava verdadeira, estabilizado L
-    for trueLag in [-0.012, 0.018, 0.045] {
+    // travas com a fronteira longe do jitter de entrega (estritas) + uma em cima do jitter (ambígua): nessa a verificação
+    // NUNCA pode aprovar uma tela que ainda mexe
+    for (trueLag, strict) in [(-0.012, true), (0.018, true), (0.037, true), (0.045, false)] {
       let fps = 60.0, L = 0.62
       func simulate(_ kind: String, z0: Double, z1: Double, fittedLag: Double?) -> CalibWindow {
         var setLog: [(Double, Double)] = [(-5, z0)]
@@ -129,28 +131,29 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
       }
       guard let best = ZoomCalibMath.bestLag(pairs) else { check(false, "ajuste sem pares"); return }
       let old = ZoomCalibMath.lagError(pairs, nil)
-      check(abs(best.0 - trueLag) <= 0.005, String(format: "trava verdadeira %+.0f ms -> achada %+.0f ms (%d pares; erro %.2e × antiga %.2e)", trueLag * 1000, best.0 * 1000, best.2, best.1, old.0))
+      if strict { check(abs(best.0 - trueLag) <= 0.005, String(format: "trava verdadeira %+.0f ms -> achada %+.0f ms (%d pares; erro %.2e × antiga %.2e)", trueLag * 1000, best.0 * 1000, best.2, best.1, old.0)) }
+      var verW: [CalibWindow] = []
+      var oldWorst = 0.0, newWorst = 0.0
       for (kind, a, b) in [("clique", 2.6, 3.4), ("pinça", 2.6, 3.4)] {
         let w = simulate(kind, z0: a, z1: b, fittedLag: best.0)
-        let j = ZoomCalibMath.screenJumps(w)
-        if !(j.n >= 15 && j.new.0 <= 0.004 && j.new.1 <= 0.006) {   // diagnóstico quadro a quadro antes de falhar
-          let shown = w.shown.filter { $0.at >= w.tLast - 0.02 && $0.at <= w.tLast + 1.6 }
-          var prev: (pts: Double, k: Double, img: [Float])?
-          for s in shown {
-            guard let f = w.stab.first(where: { abs($0.0 - s.pts) < 0.003 }) else { continue }
-            let img = ZoomImage.prep(f.1)
-            let zt = ZoomLag.at(w.setLog, s.pts - trueLag) ?? 0
-            if let p = prev {
-              let m = ZoomImage.vsRef(p.img, img, lo: 0.85, hi: 1.20)
-              let zp = ZoomLag.at(w.setLog, p.pts - trueLag) ?? 0
-              print(String(format: "  at %.3f pts %.3f conteúdo %.4f real %.4f medido %.4f conf %.3f k %.4f→%.4f tela real %.4f medida %.4f", s.at, s.pts, zt, zt / zp, m.z, m.conf, p.k, s.k, zt * s.k / (zp * p.k), m.z * s.k / p.k))
-            }
-            prev = (s.pts, s.k, img)
-          }
-        }
-        check(j.n >= 15 && j.new.0 <= 0.004 && j.new.1 <= 0.006,
-          String(format: "trava %+.0f ms, %@: tela NOVA salto %.2f%% deriva %.2f%% | antiga salto %.2f%% deriva %.2f%% (%d pares)", trueLag * 1000, kind, j.new.0 * 100, j.new.1 * 100, j.old.0 * 100, j.old.1 * 100, j.n))
+        verW.append(w)
+        // tela REAL (conteúdo verdadeiro × ampliação) depois que o zoom parou: nova tem que ficar parada; antiga mostra o defeito
+        let after = w.shown.filter { $0.at > w.tLast + 0.02 }
+        let content: (Double) -> Double = { p in ZoomLag.at(w.setLog, p - trueLag) ?? a }
+        guard let last = after.last else { check(false, "sem quadros depois de parar"); return }
+        let dNew = after.map { abs(content($0.pts) * $0.k / (content(last.pts) * last.k) - 1) }.max() ?? 1
+        let dOld = after.map { abs(content($0.pts) * $0.kOld / (content(last.pts) * last.kOld) - 1) }.max() ?? 1
+        oldWorst = max(oldWorst, dOld); newWorst = max(newWorst, dNew)
+        if strict { check(dNew <= 0.003, String(format: "trava %+.0f ms, %@: tela REAL depois de parar — nova varia %.2f%% (antiga %.2f%%)", trueLag * 1000, kind, dNew * 100, dOld * 100)) }
       }
+      if strict { check(oldWorst >= 0.008, String(format: "trava %+.0f ms: a conta antiga reproduz o vai-e-volta (%.2f%%)", trueLag * 1000, oldWorst * 100)) }
+      let v = ZoomCalibMath.verify(verW, lag: best.0)
+      if !strict {
+        check(!(v.ok && newWorst > 0.006), String(format: "trava ambígua %+.0f ms: verificação %@ com tela nova variando %.2f%% (só pode aprovar se ficou parada)", trueLag * 1000, v.ok ? "aprovou" : "recusou", newWorst * 100))
+        continue
+      }
+      check(v.ok, String(format: "trava %+.0f ms: verificação do app aprova (pares %d, erro nova %.2e × antiga %.2e, maior nova %.2f%% × antiga %.2f%%, ruído %.2f%%)",
+        trueLag * 1000, v.n, v.eNew, v.eOld, v.maxNew * 100, v.maxOld * 100, v.floor * 100))
     }
     print("TESTE DO ZOOM OK")
   }

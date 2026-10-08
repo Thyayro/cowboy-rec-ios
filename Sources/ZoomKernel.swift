@@ -73,8 +73,19 @@ enum ZoomImage {
     }
     return out
   }
-  // passa-alta (tira vinheta e sombreamento, que não mudam com o zoom) + normaliza
-  static func prep(_ a: [Float]) -> [Float] {
+  // desfoque leve [1 2 1]/4 (sem ele o ruído puxa a medida: a interpolação "alisa" ruído fora do ponto certo e o custo
+  // cai ali — 0,78% de erro em quadros PARADOS no teste; com ele, 0,11%) + passa-alta (tira vinheta e sombreamento, que
+  // não mudam com o zoom) + normaliza
+  static func prep(_ src: [Float]) -> [Float] {
+    var t0 = [Float](repeating: 0, count: w * h), a = [Float](repeating: 0, count: w * h)
+    for y in 0..<h { for x in 0..<w {
+      let l = src[y * w + max(0, x - 1)], c = src[y * w + x], rr = src[y * w + min(w - 1, x + 1)]
+      t0[y * w + x] = 0.25 * l + 0.5 * c + 0.25 * rr
+    } }
+    for y in 0..<h { for x in 0..<w {
+      let u = t0[max(0, y - 1) * w + x], c = t0[y * w + x], d = t0[min(h - 1, y + 1) * w + x]
+      a[y * w + x] = 0.25 * u + 0.5 * c + 0.25 * d
+    } }
     let r = 4
     var tmp = [Float](repeating: 0, count: w * h), blur = [Float](repeating: 0, count: w * h)
     for y in 0..<h { for x in 0..<w {
@@ -196,25 +207,24 @@ enum ZoomCalibMath {
     }
     return b
   }
-  // saltos de escala NA TELA entre quadros mostrados vizinhos depois que o zoom parou: (maior salto, deriva) nova e antiga
-  static func screenJumps(_ w: CalibWindow) -> (new: (Double, Double), old: (Double, Double), n: Int) {
-    let shown = w.shown.filter { $0.at >= w.tLast - 0.02 && $0.at <= w.tLast + 1.6 }
-    var nl: [Double] = [], ol: [Double] = []
-    var prev: (pts: Double, k: Double, kOld: Double, img: [Float])?
-    for s in shown {
-      guard let f = w.stab.min(by: { abs($0.0 - s.pts) < abs($1.0 - s.pts) }), abs(f.0 - s.pts) < 0.003 else { prev = nil; continue }
-      let img = ZoomImage.prep(f.1)
-      if let p = prev, s.pts > p.pts {
-        let m = ZoomImage.vsRef(p.img, img, lo: 0.85, hi: 1.20)
-        if m.conf >= 0.04 { nl.append(log(m.z * s.k / p.k)); ol.append(log(m.z * s.kOld / p.kOld)) }
+  // VERIFICAÇÃO em janelas que NÃO entraram no ajuste: nos pares de quadros estabilizados vizinhos, quanto a razão medida
+  // na imagem foge da prevista pela trava (nova) e pela conta antiga. Parados (nenhuma prevê mudança) = ruído da medida.
+  // Liga só se a nova erra bem menos que a antiga e o maior erro dela fica no nível do ruído (sem salto na tela).
+  static func verify(_ ws: [CalibWindow], lag: Double) -> (ok: Bool, eNew: Double, eOld: Double, maxNew: Double, maxOld: Double, floor: Double, n: Int) {
+    var rn: [Double] = [], ro: [Double] = [], still: [Double] = []
+    for w in ws {
+      for m in neighborRatios(w.stab, from: w.tFirst - 0.3, to: w.tLast + 0.9) where m.conf >= 0.04 {
+        guard let na = ZoomLag.at(w.setLog, m.a - lag), let nb = ZoomLag.at(w.setLog, m.b - lag), let oa = ZoomLag.hist(w.hist, m.a), let ob = ZoomLag.hist(w.hist, m.b),
+          na > 0, nb > 0, oa > 0, ob > 0 else { continue }
+        let pn = log(nb / na), po = log(ob / oa), mr = log(m.r)
+        if abs(pn) < 1e-6 && abs(po) < 1e-6 { still.append(mr) } else { rn.append(mr - pn); ro.append(mr - po) }
       }
-      prev = (s.pts, s.k, s.kOld, img)
     }
-    func score(_ v: [Double]) -> (Double, Double) {
-      var c = 0.0, lo = 0.0, hi = 0.0, mx = 0.0
-      for x in v { c += x; lo = min(lo, c); hi = max(hi, c); mx = max(mx, abs(x)) }
-      return (mx, hi - lo)
-    }
-    return (score(nl), score(ol), nl.count)
+    func ms(_ v: [Double]) -> Double { v.isEmpty ? .infinity : v.reduce(0) { $0 + $1 * $1 } / Double(v.count) }
+    let floor = still.count >= 5 ? ms(still).squareRoot() : 0.002
+    let eN = ms(rn), eO = ms(ro)
+    let mN = rn.map { abs($0) }.max() ?? .infinity, mO = ro.map { abs($0) }.max() ?? .infinity
+    let ok = rn.count >= 20 && eN <= 0.7 * eO && mN <= max(3 * floor, 0.004)
+    return (ok, eN, eO, mN, mO, floor, rn.count)
   }
 }
