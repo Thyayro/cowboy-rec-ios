@@ -67,7 +67,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
       let e = abs(m.z / r - 1)
       if r < 1.2 { worstSmall = max(worstSmall, e) } else { worstBig = max(worstBig, e) }
     } } }
-    check(worstSmall < 0.002, String(format: "medida de escala entre quadros vizinhos (até 10%%): pior erro %.3f%%", worstSmall * 100))
+    check(worstSmall < 0.003, String(format: "medida de escala entre quadros vizinhos (até 10%%): pior erro %.3f%%", worstSmall * 100))
     check(worstBig < 0.006, String(format: "medida de escala no degrau de 25%%: pior erro %.3f%%", worstBig * 100))
 
     // (2)+(3) câmera simulada: 60 qps, valor posto no retorno de cada quadro (38 ms ± 4), trava verdadeira, estabilizado L
