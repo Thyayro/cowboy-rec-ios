@@ -116,8 +116,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     img = img.transformed(by: CGAffineTransform(scaleX: CGFloat(W) / img.extent.width, y: CGFloat(H) / img.extent.height))
     img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
     if useCube { let (cube, size) = currentCube(); img = Self.filtered(img, cube: cube, size: size) }
+    // via CGImage: linha 0 = TOPO do quadro (mesma convenção do shader e do alinhamento)
+    guard let cg = context.createCGImage(img, from: CGRect(x: 0, y: 0, width: W, height: H), format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB()),
+      let data = cg.dataProvider?.data, let base = CFDataGetBytePtr(data), cg.bitsPerPixel == 32 else { return nil }
     var bytes = [UInt8](repeating: 0, count: W * H * 4)
-    context.render(img, toBitmap: &bytes, rowBytes: W * 4, bounds: CGRect(x: 0, y: 0, width: W, height: H), format: .RGBA8, colorSpace: nil)
+    for y in 0..<min(H, cg.height) { for x in 0..<min(W, cg.width) { let o = y * cg.bytesPerRow + x * 4, d = (y * W + x) * 4; bytes[d] = base[o]; bytes[d + 1] = base[o + 1]; bytes[d + 2] = base[o + 2]; bytes[d + 3] = base[o + 3] } }
     var sum = SIMD3<Float>(0, 0, 0); var lum = [Float](); lum.reserveCapacity(W * H)
     for i in stride(from: 0, to: bytes.count, by: 4) {
       let c = SIMD3<Float>(Float(bytes[i]), Float(bytes[i + 1]), Float(bytes[i + 2])) / 255
