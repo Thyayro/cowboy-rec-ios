@@ -26,7 +26,7 @@ enum ZoomLag {
   // zoom que o quadro captado em p carrega, pelo registro de valores postos
   static func model(_ sets: [(Double, Double)], _ p: Double, _ f: ZoomFit) -> Double? {
     if f.tau < 0.001 { return at(sets, p - f.lag) }
-    let step = max(0.004, f.tau / 8)
+    let step = 0.004   // passo fino: com suavização o quadro depende continuamente do tempo (passo grosso enviesa ~3 ms)
     var acc = 0.0, ws = 0.0, u = 0.0
     while u < 5 * f.tau {
       guard let z = at(sets, p - f.lag - u), z > 0 else { break }
@@ -235,10 +235,11 @@ enum ZoomCalibMath {
       var c: [(Double, Double, Int)] = []
       var l = b0.0 - 0.07
       while l <= b0.0 + 0.0201 { let r = errAt(ZoomFit(lag: l, tau: tau)); if r.1 > 0 { c.append((l, r.0, r.1)) }; l += 0.004 }
-      if let m = plateauCenter(c), m.1 < best.1 * (best.0.tau > 0 ? 1 : 0.9) { best = (ZoomFit(lag: m.0, tau: tau), m.1, m.2) }
+      // com suavização o erro varia contínuo com a trava (sem faixa equivalente): vale o mínimo
+      if let m = c.min(by: { $0.1 < $1.1 }), m.1 < best.1 * (best.0.tau > 0 ? 1 : 0.9) { best = (ZoomFit(lag: m.0, tau: tau), m.1, m.2) }
     }
     if best.0.tau > 0 {
-      for dl in stride(from: -0.004, through: 0.0041, by: 0.001) { for dt in [-0.007, 0, 0.007] {
+      for dl in stride(from: -0.006, through: 0.0061, by: 0.001) { for dt in [-0.01, -0.005, 0, 0.005, 0.01] {
         let f = ZoomFit(lag: best.0.lag + dl, tau: max(0.005, best.0.tau + dt)); let r = errAt(f)
         if r.1 > 0 && r.0 < best.1 { best = (f, r.0, r.1) }
       } }
