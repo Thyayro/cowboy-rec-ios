@@ -291,7 +291,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
             let arrive = p + 0.038
             let moving = abs(log(zProp(arrive) / zProp(arrive - 0.4))) > 1e-6
             var th: [Float]? = nil
-            if moving { th = scene.thumb(content(p), jx, jy, noise: 0.004, &rng).map { Float(0.5) + ($0 - Float(0.5)) * Float(contrast) } }
+            if moving { th = scene.thumb(content(p), jx, jy, noise: 0.0, &rng).map { Float(0.5) + ($0 - Float(0.5)) * Float(contrast) + Float(rng.normal() * 0.004) } }
             track.step(pts: p, zHist: ZoomLag.hist(hist, p + 0.025) ?? z0, thumb: th, moving: moving)
             fi += 1
           }
@@ -313,7 +313,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         let cs = track.confs.sorted()
         let rs = track.resids.sorted()
         if !cs.isEmpty { print(String(format: "     medida (contraste %.2f, %@): confiança mediana %.3f | resíduo mín %.3f mediana %.3f máx %.3f", contrast, kind, cs[cs.count / 2], rs.first!, rs[rs.count / 2], rs.last!)) }
-        if contrast >= 0.5 && dn > 0.01 {   // diagnóstico: erro do medidor contra o zoom verdadeiro, por quadro rápido
+        if dn > 0.009 || dn > dO + 0.004 {   // diagnóstico: erro do medidor contra o zoom verdadeiro, por quadro rápido
           var line: [String] = []
           var p = T0 - 0.1
           while p < tEnd + 0.2 {
