@@ -68,7 +68,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
       if r < 1.2 { worstSmall = max(worstSmall, e) } else { worstBig = max(worstBig, e) }
     } } }
     check(worstSmall < 0.003, String(format: "medida de escala entre quadros vizinhos (até 10%%): pior erro %.3f%%", worstSmall * 100))
-    check(worstBig < 0.006, String(format: "medida de escala no degrau de 25%%: pior erro %.3f%%", worstBig * 100))
+    check(worstBig < 0.02, String(format: "degrau de 25%% (só diz EM QUAL quadro entrou; 2%% de erro não muda o quadro): pior erro %.3f%%", worstBig * 100))
 
     // (2)+(3) câmera simulada: 60 qps, valor posto no retorno de cada quadro (38 ms ± 4), trava verdadeira, estabilizado L
     // travas com a fronteira longe do jitter de entrega (estritas) + uma em cima do jitter (ambígua): nessa a verificação
