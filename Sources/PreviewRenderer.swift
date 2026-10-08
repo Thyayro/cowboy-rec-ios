@@ -36,6 +36,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // prévia estabilizada: zoom que cada quadro carrega pelo REGISTRO exato do ZoomDriver + trava calibrada no aparelho
   // (ZoomLag/ZoomCalibration); nil = sem calibração aprovada: conta antiga. Só a thread da tela lê e escreve.
   let calibRec = ZoomCalibRecorder()
+  let tap = PreviewTap()   // trechos do que a tela mostrou em volta de cada zoom (diagnóstico)
   var frameZoom: ((Double) -> Double?)?
   // por quadro estabilizado desenhado: ampliação usada, a que a conta antiga daria e a hora (medição do estacionar/calibração)
   private var shownK: [(pts: Double, k: Double, kOld: Double, at: Double)] = []
@@ -246,12 +247,14 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
     if let a = zoomHistory.dropLast().last, let b = zoomHistory.last, abs(a.1 - b.1) > 0.0005 { lastZoomMove = now }
+    let zoomMovedNow = lastZoomMove == now
     let live = lightPreview && fast != nil
     let corrNow = fastCorr
     let liveFrame: CVPixelBuffer? = live && fastFresh ? fast : nil
     let livePTS = fastPTS
     if live { fastFresh = false; pending = nil }
     lock.unlock()
+    tap.tick(now: now, moving: zoomMovedNow)
     if live {
       guard let liveFrame else { return }
       drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now) ?? .identity,
@@ -281,6 +284,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
+    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k, kOld: kOld, z: zNow ?? 0, lens: lensMatch?.lens(at: pts ?? now) ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)

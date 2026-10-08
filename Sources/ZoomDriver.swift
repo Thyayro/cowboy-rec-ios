@@ -72,7 +72,7 @@ final class ZoomDriver: @unchecked Sendable {
   func endFollow() { lock.lock(); gestureDir = 0; gestureRef = 0; traceUntil = lastTick + 1.2; trace = []; lock.unlock() }   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: deslizamento com velocidade constante (em potências de 2), um valor por quadro
   @discardableResult func glide(to factor: CGFloat, seconds: Double = 0.42) -> Double {
-    lock.lock(); target = nil; gestureDir = 0; gestureRef = 0; let d = device; let ticking = CACurrentMediaTime() - lastTickWall < 0.25; lock.unlock()
+    lock.lock(); target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
     guard let d else { return 0 }
     let to = clamp(d, factor), from = d.videoZoomFactor
     let stops = abs(log2(Double(to / from)))
@@ -81,8 +81,9 @@ final class ZoomDriver: @unchecked Sendable {
     let duration: Double = max(0.2, seconds * spread)
     let rate = max(0.8, stops / duration)
     let dur = stops / rate
-    if ticking { lock.lock(); glidePlan = (from, to, dur, nil); lock.unlock() }
-    else { configure(d) { d.ramp(toVideoZoomFactor: to, withRate: Float(rate)) } }   // sem quadros chegando: rampa nativa
+    // rampa nativa (0.7.7): o deslizamento por quadro (0.7.5–0.7.6) deixou o foco estranho na troca de lente — a rampa do
+    // AVFoundation prepara a próxima câmera; o registro exato fica só pra pinça
+    configure(d) { d.ramp(toVideoZoomFactor: to, withRate: Float(rate)) }
     return dur
   }
   // degrau direto (calibração)

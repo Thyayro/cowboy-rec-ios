@@ -478,7 +478,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
       let bounds = (cam.isVirtualDevice ? cam.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue } : []) + cam.activeFormat.secondaryNativeResolutionZoomFactors.map { Double($0) }
-      DispatchQueue.main.async { self.setFrameLag(ZoomLag.load()); self.zoomBoundaries = bounds; self.startZoomAutoLearn() }
+      DispatchQueue.main.async {
+        self.setFrameLag(ZoomLag.load()); self.zoomBoundaries = bounds
+        // aprendizado em segundo plano DESLIGADO (0.7.7): no aparelho os pares tinham saltos de 8–28% que nenhum modelo de
+        // atraso explica (trocas de lente); só gastava processador. Primeiro: ver o que a tela mostra.
+        self.renderer.tap.allowed = { [weak self] in guard let self else { return false }; return !self.recording && !self.renderer.lightPreview }
+        self.renderer.tap.onClip = { data in Diag.postClip(data) }
+      }
       DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
         Diag.step("zoom-lag-state", ["trava_ms": ZoomLag.load()?.text ?? "nenhuma (conta antiga)", "previa": self.renderer.lightPreview ? "sem atraso" : "estabilizada"])
       }

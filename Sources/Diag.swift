@@ -25,6 +25,12 @@ enum Diag {
     r.httpMethod = "POST"; r.httpBody = data.prefix(7900); r.setValue("text/plain", forHTTPHeaderField: "Content-Type")
     URLSession.shared.dataTask(with: r).resume()
   }
+  // trecho da prévia (PreviewTap) — corpo grande, endpoint próprio
+  static func postClip(_ data: Data) {
+    var r = URLRequest(url: URL(string: "https://cowboy-editor.ybguyl.easypanel.host/api/rec-diag-clip")!)
+    r.httpMethod = "POST"; r.httpBody = data; r.setValue("text/plain", forHTTPHeaderField: "Content-Type")
+    URLSession.shared.dataTask(with: r).resume()
+  }
   static func model() -> String {
     var info = utsname(); uname(&info)
     return withUnsafeBytes(of: &info.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
