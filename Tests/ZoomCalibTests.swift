@@ -133,6 +133,21 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
       for (kind, a, b) in [("clique", 2.6, 3.4), ("pinça", 2.6, 3.4)] {
         let w = simulate(kind, z0: a, z1: b, fittedLag: best.0)
         let j = ZoomCalibMath.screenJumps(w)
+        if !(j.n >= 15 && j.new.0 <= 0.004 && j.new.1 <= 0.006) {   // diagnóstico quadro a quadro antes de falhar
+          let shown = w.shown.filter { $0.at >= w.tLast - 0.02 && $0.at <= w.tLast + 1.6 }
+          var prev: (pts: Double, k: Double, img: [Float])?
+          for s in shown {
+            guard let f = w.stab.first(where: { abs($0.0 - s.pts) < 0.003 }) else { continue }
+            let img = ZoomImage.prep(f.1)
+            let zt = ZoomLag.at(w.setLog, s.pts - trueLag) ?? 0
+            if let p = prev {
+              let m = ZoomImage.vsRef(p.img, img, lo: 0.85, hi: 1.20)
+              let zp = ZoomLag.at(w.setLog, p.pts - trueLag) ?? 0
+              print(String(format: "  at %.3f pts %.3f conteúdo %.4f real %.4f medido %.4f conf %.3f k %.4f→%.4f tela real %.4f medida %.4f", s.at, s.pts, zt, zt / zp, m.z, m.conf, p.k, s.k, zt * s.k / (zp * p.k), m.z * s.k / p.k))
+            }
+            prev = (s.pts, s.k, img)
+          }
+        }
         check(j.n >= 15 && j.new.0 <= 0.004 && j.new.1 <= 0.006,
           String(format: "trava %+.0f ms, %@: tela NOVA salto %.2f%% deriva %.2f%% | antiga salto %.2f%% deriva %.2f%% (%d pares)", trueLag * 1000, kind, j.new.0 * 100, j.new.1 * 100, j.old.0 * 100, j.old.1 * 100, j.n))
       }
