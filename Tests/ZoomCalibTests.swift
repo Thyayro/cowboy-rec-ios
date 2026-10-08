@@ -310,6 +310,8 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         func spread(_ x: [Double]) -> Double { guard let mx = x.max(), let mn = x.min(), let l = x.last else { return 1 }; return (mx - mn) / l }
         let dn = spread(newN), dO = spread(oldN)
         let c = track.counts
+        let cs = track.confs.sorted()
+        if !cs.isEmpty { print(String(format: "     confiança da medida (contraste %.2f, %@): mín %.3f mediana %.3f máx %.3f", contrast, kind, cs.first!, cs[cs.count / 2], cs.last!)) }
         if contrast >= 0.5 && dn > 0.01 {   // diagnóstico: erro do medidor contra o zoom verdadeiro, por quadro rápido
           var line: [String] = []
           var p = T0 - 0.1

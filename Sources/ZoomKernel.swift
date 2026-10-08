@@ -378,6 +378,7 @@ final class FastZoomTracker: @unchecked Sendable {
   private var chain: [(Double, Double)] = []   // (pts, log do zoom real acumulado)
   private var acc = 0.0, predAcc = 0.0
   private(set) var measured = 0, guessed = 0
+  private(set) var confs: [Float] = []
   func reset() { queue.async { self.prev = nil; self.key = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.predAcc = 0; self.lock.unlock() } }
   // fila da saída rápida: só enfileira (a medida roda na fila própria, em ordem)
   func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving) } }
@@ -394,6 +395,7 @@ final class FastZoomTracker: @unchecked Sendable {
         let expect = exp(predAcc - k.predAcc)                      // razão prevista contra a referência
         let lo = min(1, expect, exp(acc - k.acc)) / 1.06, hi = max(1, expect, exp(acc - k.acc)) * 1.06
         let m = ZoomImage.vsRef(k.img, img, lo: lo, hi: hi, shift: 4)
+        confs.append(m.conf); if confs.count > 400 { confs.removeFirst() }
         if m.conf >= 0.04 && m.z > lo * 1.004 && m.z < hi / 1.004 {
           next = k.acc + log(m.z); measured += 1
           if abs(log(pred)) < 1e-6 && abs(next - acc) < 0.002 { next = acc }   // parado e dentro do ruído: parado
