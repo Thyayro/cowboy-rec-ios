@@ -38,6 +38,7 @@ final class SwitchAligner: @unchecked Sendable {
     let img = Self.normalize(luma)
     lock.lock(); let prev = last[stream]; last[stream] = (lens, t, img); lock.unlock()
     guard let prev, prev.lens != lens, t - prev.t < 0.2 else { return }
+    guard (prev.lens == "ultra") != (lens == "ultra") else { return }   // só 0,5× <-> 1× (da 1× em diante não precisa)
     let r = Self.align(reference: prev.img, moving: img)
     guard r.err < r.err0 * 0.92, abs(r.g.tx) < 0.09, abs(r.g.ty) < 0.09 else { return }
     lock.lock(); transitions[stream, default: []].append((t, lens, r.g)); if transitions[stream]!.count > 12 { transitions[stream]!.removeFirst() }; lock.unlock()

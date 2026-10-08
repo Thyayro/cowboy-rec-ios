@@ -12,6 +12,7 @@ final class ZoomDriver: @unchecked Sendable {
   private let lock = NSLock()
   private var target: CGFloat?
   private var lastTick = 0.0
+  private var lastTickWall = 0.0   // quando o último quadro CHEGOU (relógio de agora)
 
   func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; lock.unlock() }
   private func clamp(_ d: AVCaptureDevice, _ z: CGFloat) -> CGFloat { max(d.minAvailableVideoZoomFactor, min(d.maxAvailableVideoZoomFactor, z)) }
@@ -26,7 +27,7 @@ final class ZoomDriver: @unchecked Sendable {
     let z = clamp(d, factor)
     target = z
     // sem quadro há mais de 120 ms (saída parada): o gesto não pode "travar" — aplica direto
-    if CACurrentMediaTime() - lastTick > 0.12 { configure(d) { d.videoZoomFactor = z } }
+    if CACurrentMediaTime() - lastTickWall > 0.25 { configure(d) { d.videoZoomFactor = z } }
   }
   func endFollow() {}   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: rampa nativa única
@@ -45,7 +46,7 @@ final class ZoomDriver: @unchecked Sendable {
   func frameTick(_ t: Double) {
     lock.lock()
     guard let d = device, let tgt = target else { lock.unlock(); return }
-    let dt = lastTick == 0 ? 1.0 / 60 : min(0.05, max(0.004, t - lastTick)); lastTick = t
+    let dt = lastTick == 0 ? 1.0 / 60 : min(0.05, max(0.004, t - lastTick)); lastTick = t; lastTickWall = CACurrentMediaTime()
     lock.unlock()
     let cur = d.videoZoomFactor
     let diff = log(Double(tgt / cur))

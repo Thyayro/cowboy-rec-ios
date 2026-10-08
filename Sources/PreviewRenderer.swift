@@ -43,6 +43,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var nextStats = 0.0
   private var fastAt = 0.0
   private var crop = 1.06
+  private var shownCrop = 0.0          // corte usado na tela: segue a medida devagar (sem "ajuste" depois do zoom)
+  private var shownCropAt = 0.0
   private var cropSamples: [Double] = []
   private var calibFast: (pts: Double, image: CGImage)?
   private var calibBusy = false
@@ -169,7 +171,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
   func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; lock.unlock() }
-  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); crop = 1.06; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
+  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
     if t <= first.0 { return first.1 }
@@ -213,7 +215,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
     let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0) }
-    let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = crop
+    if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
+    shownCropAt = now
+    let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
     if let a = zoomHistory.dropLast().last, let b = zoomHistory.last, abs(a.1 - b.1) > 0.0005 { lastZoomMove = now }
     let live = lightPreview && fast != nil
     let liveFrame: CVPixelBuffer? = live && fastFresh ? fast : nil
