@@ -327,7 +327,8 @@ struct RecorderView: View {
   // ---------------------------------------------------------------- zoom: lentes (rampa contínua) + roda (arrastar) + pinça
   private func clampZoom(_ z: Double) -> Double { max(camera.minimumZoom, min(camera.maximumZoom, z)) }
   private var activePreset: Double? {
-    camera.zoomPresets.min { abs(log($0 / max(0.01, camera.zoom))) < abs(log($1 / max(0.01, camera.zoom))) }
+    if camera.ultraLock, let first = camera.zoomPresets.first, first < 0.99 { return first }
+    return camera.zoomPresets.min { abs(log($0 / max(0.01, camera.zoom))) < abs(log($1 / max(0.01, camera.zoom))) }
   }
   private var lensBar: some View {
     HStack(spacing: 6) {

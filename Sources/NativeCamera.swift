@@ -202,6 +202,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private var constituentObservation: NSKeyValueObservation?
   private(set) var lensMatch: LensMatch?
   private var aligner: SwitchAligner?
+  private var observing = false
+  // ZOOM ESTILO BLACKMAGIC: em 0,5× a pinça dá zoom SÓ na ultra-angular (lente travada); tocando 1× ou mais, o zoom cruza as
+  // lentes (ultra -> principal -> tele). Tocar 0,5 de novo volta a travar na ultra.
+  @Published var ultraLock = UserDefaults.standard.object(forKey: "ultraLock") as? Bool ?? true
   @Published var lensMatchOn = UserDefaults.standard.object(forKey: "lensMatch") as? Bool ?? true
   @Published var lensMatchStatus: [String: Int] = [:]
   // parar na hora: o toque derruba a gravação imediatamente (quadros que chegarem depois não entram)
@@ -228,10 +232,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let audio = await AVCaptureDevice.requestAccess(for: .audio)
       guard camera && audio else { publish { self.status = "Libere câmera e microfone nos Ajustes do iPhone" }; return }
       MotionHub.shared.start()
+      observeSession()
       queue.async {
         do {
           if !self.configured { try self.guarded { try self.configure() } }
           if !self.session.isRunning { self.session.startRunning() }
+          if !self.session.isRunning { self.retryRunning(0) }
           self.configureStabilization()
           self.startTelemetry()
           self.publish { self.ready = true }
@@ -240,6 +246,33 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   private func publish(_ action: @escaping @Sendable () -> Void) { DispatchQueue.main.async(execute: action) }
+  // outra tela/app (ex.: página web) pegou a câmera, ou o iOS interrompeu: volta sozinho assim que liberar
+  private func observeSession() {
+    guard !observing else { return }; observing = true
+    let nc = NotificationCenter.default
+    nc.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { [weak self] n in
+      let why = (n.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int) ?? -1
+      Diag.step("session-interrupted", ["why": why])
+      self?.publish { self?.status = "Câmera em uso por outra tela — volta sozinha" }
+    }
+    nc.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: nil) { [weak self] _ in
+      Diag.step("session-resumed")
+      self?.queue.async { guard let self else { return }; if !self.session.isRunning { self.session.startRunning() }; self.publish { self.ready = self.session.isRunning } }
+    }
+    nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil) { [weak self] n in
+      let err = (n.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.localizedDescription ?? "?"
+      Diag.step("session-error", ["err": err])
+      self?.retryRunning(0)
+    }
+  }
+  private func retryRunning(_ n: Int) {
+    queue.asyncAfter(deadline: .now() + 0.5) {
+      guard !self.session.isRunning else { self.publish { self.ready = true }; return }
+      self.session.startRunning()
+      if self.session.isRunning { Diag.step("session-restarted", ["tries": n + 1]); self.publish { self.ready = true } }
+      else if n < 20 { self.retryRunning(n + 1) }
+    }
+  }
   private func failure(_ message: String) -> NSError { NSError(domain: "CowboyCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
 
   // ---- estabilização: 0 desligada · 1 standard · 2 cinematic · 3 cinematic extended · 4 EXTREMA (cinematicExtendedEnhanced, iOS 18)
@@ -442,8 +475,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
       constituentObservation?.invalidate()
       if cam.isVirtualDevice {
-        constituentObservation = cam.observe(\.activePrimaryConstituent, options: [.initial, .new]) { cam, _ in
+        constituentObservation = cam.observe(\.activePrimaryConstituent, options: [.initial, .new]) { [weak self] cam, _ in
           match.lensChanged(LensMatch.name(cam.activePrimaryConstituent?.deviceType))
+          self?.queue.async { self?.applyLensLock(cam) }
         }
       } else { match.lensChanged(LensMatch.name(cam.deviceType)) }
       let st0 = match.status()
@@ -596,9 +630,33 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   // pinça/roda: segue o dedo com uma rampa rápida (suaviza sem atraso perceptível)
+  // 0,5×: lente travada na ultra (zoom digital nela). 1× em diante: troca de lente pelo zoom.
+  private func applyLensLock(_ cam: AVCaptureDevice) {
+    guard cam.isVirtualDevice, cam.position == .back else { return }
+    let lockUltra = ultraLock && cam.activePrimaryConstituent?.deviceType == .builtInUltraWideCamera
+    let want: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior = lockUltra ? .locked : .restricted
+    guard cam.primaryConstituentDeviceSwitchingBehavior != want else { return }
+    _ = CowboyObjC.catching {
+      if (try? cam.lockForConfiguration()) != nil {
+        cam.setPrimaryConstituentDeviceSwitchingBehavior(want, restrictedSwitchingBehaviorConditions: want == .restricted ? [.videoZoomChanged] : [])
+        cam.unlockForConfiguration()
+      }
+    }
+    Diag.step("lens-lock", ["mode": lockUltra ? "ultra" : "cruzando"], send: false)
+  }
   func followZoom(_ display: Double) { zoomDriver.follow(CGFloat(display) * base) }
   func endZoomGesture() { zoomDriver.endFollow() }
-  func selectZoom(_ value: Double) { zoomDriver.glide(to: CGFloat(value) * base) }
+  func selectZoom(_ value: Double) {
+    let toUltra = value <= 0.51
+    ultraLock = toUltra; UserDefaults.standard.set(toUltra, forKey: "ultraLock")
+    queue.async {
+      if let cam = self.device {
+        // destrava ANTES de subir (pra cruzar as lentes); voltando pra 0,5 trava quando a ultra assumir (observador acima)
+        if !toUltra { self.applyLensLock(cam) }
+      }
+      DispatchQueue.main.async { self.zoomDriver.glide(to: CGFloat(value) * self.base) }
+    }
+  }
   func setLensMatch(_ on: Bool) { lensMatch?.setEnabled(on); lensMatchOn = on }
   func resetLensMatch() { lensMatch?.reset(); lensMatchStatus = [:] }
   func setZoom(_ value: Double) { followZoom(value) }

@@ -175,9 +175,10 @@ struct CowboyAccountView: UIViewRepresentable {
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     if destination == .library {
-      // Uses the real Rec library, including its account permissions and actions.
-      let script = "let attempts=0;const open=setInterval(()=>{const b=document.getElementById('libbtn');if(b){clearInterval(open);b.click();}else if(++attempts>100)clearInterval(open);},100);"
-      config.userContentController.addUserScript(WKUserScript(source: script,injectionTime: .atDocumentEnd,forMainFrameOnly: true))
+      // Biblioteca = SÓ a galeria da VPS. A página /rec ligava a câmera dela ao abrir e tomava a câmera do app (voltava
+      // travada). Reforço: a página da biblioteca nunca recebe câmera/microfone.
+      let script = "try{if(navigator.mediaDevices){navigator.mediaDevices.getUserMedia=function(){return Promise.reject(Object.assign(new Error('câmera do app'),{name:'NotAllowedError'}))}}}catch(e){}"
+      config.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
     }
     let web = WKWebView(frame: .zero,configuration: config)
     control.web = web
@@ -186,7 +187,8 @@ struct CowboyAccountView: UIViewRepresentable {
     web.isOpaque = false
     web.backgroundColor = .black
     web.scrollView.contentInsetAdjustmentBehavior = .never
-    web.load(URLRequest(url: CowboyCloud.origin.appendingPathComponent(destination == .account ? "login" : "rec")))
+    let path = destination == .account ? "login" : destination == .library ? "rec?galeria=1" : "rec"
+    web.load(URLRequest(url: URL(string: path, relativeTo: CowboyCloud.origin)!.absoluteURL))
     return web
   }
   func updateUIView(_ uiView: WKWebView, context: Context) {}
