@@ -102,17 +102,22 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     lock.unlock()
     if let report { onFxCheck?(report) }
   }
-  // fx no instante de captura t (lock segurado): busca binária + interpolação (quadro descartado da saída rápida)
-  private func fxAt(_ t: Double) -> Double? {
+  // fx no instante de captura t (lock segurado). "exato" = veio do quadro GÊMEO da saída rápida (mesmo horário de captura) ou
+  // os vizinhos têm o mesmo fx (zoom parado). Gêmeo descartado com o zoom andando: interpolar erra até ~1,6% bem na parada
+  // (simulado 08/10) — quem chama segura o quadro anterior em vez de chutar.
+  private func fxAt(_ t: Double) -> (fx: Double, exact: Bool)? {
     guard fxValid, let first = fxHist.first, let last = fxHist.last, t >= first.0 - 0.02, t <= last.0 + 0.02 else { return nil }
     var lo = 0, hi = fxHist.count - 1
     while hi - lo > 1 { let mid = (lo + hi) / 2; if fxHist[mid].0 <= t { lo = mid } else { hi = mid } }
     let a = fxHist[lo], b = fxHist[hi]
-    if t <= a.0 { return a.1 }
-    if t >= b.0 { return b.1 }
+    if abs(a.0 - t) < 0.004 { return (a.1, true) }
+    if abs(b.0 - t) < 0.004 { return (b.1, true) }
+    if t <= a.0 { return (a.1, false) }
+    if t >= b.0 { return (b.1, false) }
     guard b.0 - a.0 < 0.15 else { return nil }
-    return a.1 * pow(b.1 / a.1, (t - a.0) / (b.0 - a.0))
+    return (a.1 * pow(b.1 / a.1, (t - a.0) / (b.0 - a.0)), abs(b.1 / a.1 - 1) < 0.0005)
   }
+  private var lastStabDraw = 0.0   // só a thread da tela
   private var calibFast: (pts: Double, image: CGImage)?
   private var calibBusy = false
   private var nextCalib = 0.0
@@ -291,7 +296,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
     let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0) }
-    let fxFrame = pts.flatMap { fxAt($0) }, fxNow = fxLatest
+    let fxHit = pts.flatMap { fxAt($0) }, fxNow = fxLatest
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
@@ -308,16 +313,19 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
         geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity, shake: corrNow)
       return
     }
+    // quadro estabilizado sem o gêmeo da saída rápida com o zoom andando: segura o anterior (até 150 ms) em vez de chutar a escala
+    if buffer != nil, fxNow != nil, let h = fxHit, !h.exact, now - lastStabDraw < 0.15 { return }
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
+    lastStabDraw = now
     // troca de lente: o mesmo alinhamento deslizante que vai pro ARQUIVO (a tela mostra o quadro do arquivo)
     var raw = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
     let geo = aligner?.geometry("stab", at: pts ?? now) ?? .identity
     if !geo.isIdentity { raw = Self.aligned(raw, geo) }
     var image = Self.orient(raw, orient, mirrored: mirror)
     var k = 1.0
-    if let fxFrame, let fxNow, fxFrame > 0 { k = fxNow / fxFrame }          // zoom REAL do quadro (intrínseca)
+    if let h = fxHit, let fxNow, h.fx > 0 { k = fxNow / h.fx }              // zoom REAL do quadro (intrínseca)
     else if let zNow, let zFrame, zFrame > 0 { k = zNow / zFrame }          // sem intrínseca: zoom pedido (conta antiga)
     k = max(1, min(6, k)); if abs(k - 1) < 0.0005 { k = 1 }   // nunca < 1 (zoom out: o quadro como está, sem borda inventada)
     if let pts { lock.lock(); shownK.append((pts, k)); if shownK.count > 400 { shownK.removeFirst(shownK.count - 400) }; lock.unlock() }
