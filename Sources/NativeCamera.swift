@@ -460,6 +460,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       lensMatch = match; renderer.lensMatch = match
       let al = aligner ?? SwitchAligner()
       aligner = al; renderer.aligner = al
+      al.onSettle = { txt in Diag.step("zoom-settle-image", ["ms:escala": String(txt.prefix(3000))]) }
+      zoomDriver.onTrace = { txt in Diag.step("zoom-settle-cmd", ["zoom": String(txt.prefix(3000))]) }
       al.lensAt = { [weak match] t in match?.lens(at: t) ?? LensMatch.reference }
       al.onAlign = { stream, g, e, e0 in Diag.step("lens-align", ["stream": stream, "s": String(format: "%.4f", g.s), "tx": String(format: "%.4f", g.tx), "ty": String(format: "%.4f", g.ty), "gain": String(format: "%.2f", e0 > 0 ? 1 - e / e0 : 0)]) }
       match.motion = { MotionHub.shared.rotationSpeed() }
@@ -645,7 +647,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     Diag.step("lens-lock", ["mode": lockUltra ? "ultra" : "cruzando"], send: false)
   }
   func followZoom(_ display: Double) { zoomDriver.follow(CGFloat(display) * base) }
-  func endZoomGesture() { zoomDriver.endFollow() }
+  func endZoomGesture() { zoomDriver.endFollow(); aligner?.startSettle(CACurrentMediaTime()) }
   func selectZoom(_ value: Double) {
     let toUltra = value <= 0.51
     ultraLock = toUltra; UserDefaults.standard.set(toUltra, forKey: "ultraLock")

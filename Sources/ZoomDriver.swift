@@ -39,7 +39,10 @@ final class ZoomDriver: @unchecked Sendable {
     // sem quadro há mais de 120 ms (saída parada): o gesto não pode "travar" — aplica direto
     if CACurrentMediaTime() - lastTickWall > 0.25 { configure(d) { d.videoZoomFactor = z } }
   }
-  func endFollow() { lock.lock(); gestureDir = 0; gestureRef = 0; lock.unlock() }   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
+  private var trace: [String] = []
+  private var traceUntil = 0.0
+  var onTrace: ((String) -> Void)?
+  func endFollow() { lock.lock(); gestureDir = 0; gestureRef = 0; traceUntil = lastTick + 1.2; trace = []; lock.unlock() }   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: rampa nativa única
   func glide(to factor: CGFloat, seconds: Double = 0.42) {
     lock.lock(); target = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
@@ -59,6 +62,12 @@ final class ZoomDriver: @unchecked Sendable {
     let dt = lastTick == 0 ? 1.0 / 60 : min(0.05, max(0.004, t - lastTick)); lastTick = t; lastTickWall = CACurrentMediaTime()
     lock.unlock()
     let cur = d.videoZoomFactor
+    lock.lock()
+    if traceUntil > 0 {
+      if t < traceUntil { trace.append(String(format: "%.4f", Double(cur))) }
+      else { let txt = "alvo \(String(format: "%.4f", Double(tgt))) | " + trace.joined(separator: " "); trace = []; traceUntil = 0; lock.unlock(); onTrace?(txt); lock.lock() }
+    }
+    lock.unlock()
     let diff = log(Double(tgt / cur))
     guard abs(diff) > 0.0006 else { return }
     let next = clamp(d, CGFloat(exp(log(Double(cur)) + diff * (1 - exp(-dt / 0.07)))))
