@@ -159,7 +159,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     }
   }
   func pushFast(_ buffer: CVPixelBuffer, pts: Double, fx: Double? = nil) {
-    if let fx { noteFx(fx, pts: pts) }
+    // quadro sem intrínseca (a ultra pode vir sem): nada de fx velho valendo — essa parte usa a conta antiga
+    if let fx { noteFx(fx, pts: pts) } else { lock.lock(); fxLatest = nil; lock.unlock() }
     // estabilização própria da tela (só deslocamento; cega ao zoom) — calculada aqui, antes de mostrar
     lock.lock(); let fr = frozen; eis.margin = max(0.01, min(0.035, (crop - 1) / 2 - 0.006)); lock.unlock()
     if fr { return }
