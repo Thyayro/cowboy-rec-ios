@@ -49,6 +49,7 @@ struct RecorderView: View {
   @State private var toast: String?
   @State private var iconAngle: Double = 0
   @State private var noisePanel = false
+  @State private var askSelfTest = false
   @Environment(\.scenePhase) private var phase
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 1, green: 0.8, blue: 0)
@@ -83,6 +84,10 @@ struct RecorderView: View {
       }
       .ignoresSafeArea()
       controls
+      if !camera.selfTest.isEmpty {
+        Text(camera.selfTest).font(.system(size: 14, weight: .semibold)).multilineTextAlignment(.center).padding(14)
+          .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 12)).padding(.horizontal, 30).allowsHitTesting(false)
+      }
       if let toast {
         Text(toast).font(.footnote).padding(.horizontal, 14).padding(.vertical, 9).background(.black.opacity(0.78), in: Capsule())
           .frame(maxHeight: .infinity, alignment: .center).allowsHitTesting(false)
@@ -106,6 +111,13 @@ struct RecorderView: View {
       .preferredColorScheme(.dark)
     }
     .sheet(isPresented: $settings) { settingsSheet }
+    .alert("Teste automático do zoom", isPresented: $askSelfTest) {
+      Button("Iniciar (25 s)") { camera.runZoomSelfTest() }
+      Button("Agora não", role: .cancel) {}
+    } message: { Text("Apoie o celular parado, apontado pra uma cena com detalhes. O app faz os zooms sozinho e mede se a imagem para quieta.") }
+    .onChange(of: camera.ready) { _, ok in
+      if ok && !UserDefaults.standard.bool(forKey: "selftest_068") { UserDefaults.standard.set(true, forKey: "selftest_068"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
+    }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
     .task {
       Diag.install(); Diag.step("open")
@@ -408,6 +420,7 @@ struct RecorderView: View {
           Text(stream.line.isEmpty ? "Sem envios pendentes" : stream.line).font(.caption)
           if stream.pendingMB > 0.5 { Text(String(format: "Na fila: %.0f MB (%.0f MB guardados no iPhone)", stream.pendingMB, stream.diskMB)).font(.caption) }
           Button("Retomar envios") { Task { await cloud.refresh(); CloudStream.shared.kick() } }
+          Button("Testar o zoom (25 s, celular parado)") { settings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { camera.runZoomSelfTest() } }.disabled(camera.recording)
         }
         Section("Conta e biblioteca") {
           Text(cloud.email ?? "Você ainda não entrou na conta")

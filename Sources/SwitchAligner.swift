@@ -25,34 +25,42 @@ final class SwitchAligner: @unchecked Sendable {
   private var transitions: [String: [(t0: Double, lens: String, g: SwitchGeometry)]] = [:]
   var lensAt: ((Double) -> String)?
   var onAlign: ((String, SwitchGeometry, Float, Float) -> Void)?
-  // diagnóstico do freio do zoom: escala real entre quadros seguidos (só a escala; deslocamento ±2 px)
-  private var settleUntil = 0.0
-  private var settle: [String] = []
-  var onSettle: ((String) -> Void)?
-  func startSettle(_ t: Double) { lock.lock(); settleUntil = t + 1.2; settle = []; lock.unlock() }
-  static func scaleStep(_ a: [Float], _ b: [Float]) -> Float {
-    var best = (s: Float(1), e: Float.infinity)
-    for si in -20...20 { let s = 1 + Float(si) * 0.001
-      for dy in -2...2 { for dx in -2...2 { let e = cost(a, b, s, Float(dx) / Float(w), Float(dy) / Float(h)); if e < best.e { best = (s, e) } } } }
+  // MEDIÇÃO DO ESTACIONAR: depois que o zoom para, a escala de cada quadro é medida contra um quadro de REFERÊNCIA fixo
+  // (0,3 s depois de parar) até 2,2 s — sem soma de ruído. Amplitude = quanto a escala ainda andou (ideal ≈ 0).
+  private var settleT0 = 0.0
+  private var settleActive = false
+  private var settleRef: [Float]?
+  private var settleVals: [(Double, Float)] = []
+  var onSettle: ((String, Float) -> Void)?
+  func startSettle(_ t: Double) { lock.lock(); settleT0 = t; settleActive = true; settleRef = nil; settleVals = []; lock.unlock() }
+  static func scaleVsRef(_ ref: [Float], _ img: [Float]) -> Float {
+    var best = (s: Float(1), dx: 0, dy: 0, e: Float.infinity)
+    for si in -10...10 { let s = 1 + Float(si) * 0.005
+      for dy in -4...4 { for dx in -4...4 { let e = cost(ref, img, s, Float(dx) / Float(w), Float(dy) / Float(h)); if e < best.e { best = (s, dx, dy, e) } } } }
+    let c = best
+    for si in -5...5 { let s = c.s + Float(si) * 0.001
+      for dy in (c.dy - 1)...(c.dy + 1) { for dx in (c.dx - 1)...(c.dx + 1) { let e = cost(ref, img, s, Float(dx) / Float(w), Float(dy) / Float(h)); if e < best.e { best = (s, dx, dy, e) } } } }
     return best.s
   }
-
-  func geometry(_ stream: String, at t: Double) -> SwitchGeometry {
-    lock.lock(); defer { lock.unlock() }
-    guard let tr = transitions[stream]?.last(where: { $0.t0 <= t }), t - tr.t0 < Self.glide, lensAt?(t) == tr.lens else { return .identity }
-    let k = Float(1 - (t - tr.t0) / Self.glide)
-    return tr.g.mix(k * k * (3 - 2 * k))
-  }
-  // imagem pequena (luma 96×54) de um quadro da saída `stream`
   func feed(_ stream: String, t: Double, luma: [Float]) {
     guard luma.count == Self.w * Self.h, let lens = lensAt?(t) else { return }
     let img = Self.normalize(luma)
-    lock.lock(); let prev = last[stream]; last[stream] = (lens, t, img); let measuring = stream == "fast" && t < settleUntil; let ended = stream == "fast" && settleUntil > 0 && t >= settleUntil && !settle.isEmpty; lock.unlock()
-    if measuring, let prev, prev.lens == lens {
-      let s = Self.scaleStep(prev.img, img)
-      lock.lock(); settle.append(String(format: "%.0f:%.3f", (t - (settleUntil - 1.2)) * 1000, s)); lock.unlock()
+    lock.lock(); let prev = last[stream]; last[stream] = (lens, t, img)
+    var job: (ref: [Float], dt: Double)?; var finished: (String, Float)?
+    if stream == "fast" && settleActive && t >= settleT0 {
+      let dt = t - settleT0
+      if dt >= 2.2 {
+        let v = settleVals.map { $0.1 }
+        let amp = (v.max() ?? 1) - (v.min() ?? 1)
+        finished = (settleVals.map { String(format: "%.0f:%.3f", $0.0 * 1000, $0.1) }.joined(separator: " "), amp)
+        settleActive = false; settleVals = []; settleRef = nil
+      } else if dt >= 0.3 {
+        if let r = settleRef { job = (r, dt) } else { settleRef = img }
+      }
     }
-    if ended { lock.lock(); let text = settle.joined(separator: " "); settle = []; settleUntil = 0; lock.unlock(); onSettle?(text) }
+    lock.unlock()
+    if let job { let sc = Self.scaleVsRef(job.ref, img); lock.lock(); settleVals.append((job.dt, sc)); lock.unlock() }
+    if let finished { onSettle?(finished.0, finished.1) }
     guard let prev, prev.lens != lens, t - prev.t < 0.2 else { return }
     guard (prev.lens == "ultra") != (lens == "ultra") else { return }   // só 0,5× <-> 1× (da 1× em diante não precisa)
     let r = Self.align(reference: prev.img, moving: img)

@@ -47,16 +47,17 @@ final class ZoomDriver: @unchecked Sendable {
   var onTrace: ((String) -> Void)?
   func endFollow() { lock.lock(); gestureDir = 0; gestureRef = 0; traceUntil = lastTick + 1.2; trace = []; lock.unlock() }   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: rampa nativa única
-  func glide(to factor: CGFloat, seconds: Double = 0.42) {
+  @discardableResult func glide(to factor: CGFloat, seconds: Double = 0.42) -> Double {
     lock.lock(); target = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
-    guard let d else { return }
+    guard let d else { return 0 }
     let to = clamp(d, factor), from = d.videoZoomFactor
     let stops = abs(log2(Double(to / from)))
-    guard stops > 0.003 else { return }
+    guard stops > 0.003 else { return 0 }
     let spread: Double = 0.6 + 0.4 * min(1.0, stops / 2.0)
     let duration: Double = max(0.2, seconds * spread)
     let rate = Float(max(0.8, stops / duration))
     configure(d) { d.ramp(toVideoZoomFactor: to, withRate: rate) }
+    return stops / Double(rate)
   }
   // um passo por quadro capturado (fila da saída de vídeo)
   func frameTick(_ t: Double) {

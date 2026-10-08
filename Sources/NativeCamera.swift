@@ -206,6 +206,16 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // ZOOM ESTILO BLACKMAGIC: em 0,5× a pinça dá zoom SÓ na ultra-angular (lente travada); tocando 1× ou mais, o zoom cruza as
   // lentes (ultra -> principal -> tele). Tocar 0,5 de novo volta a travar na ultra.
   @Published var ultraLock = UserDefaults.standard.object(forKey: "ultraLock") as? Bool ?? true
+  // FOCO SEGURADO NO ZOOM (medido 08/10): o vai-e-volta de escala ao estacionar era o FOCO AUTOMÁTICO procurando de novo
+  // (o zoom dentro de uma lente é recorte digital: muda a área que o AF analisa e ele caça; as lentes do iPhone mudam de
+  // tamanho de imagem quando o foco anda — "focus breathing", forte na tele). Durante o zoom e 1,2 s depois o foco fica
+  // TRAVADO onde está (a distância do assunto não mudou); na troca de lente física faz UM ajuste e trava de novo.
+  var focusHoldEnabled = true
+  private var focusHeld = false
+  private var focusGen = 0
+  @Published var selfTest = ""          // texto do teste automático em andamento ("" = parado)
+  private var selfTestResults: [String: [Float]] = [:]
+  private var selfTestMode = ""
   @Published var lensMatchOn = UserDefaults.standard.object(forKey: "lensMatch") as? Bool ?? true
   @Published var lensMatchStatus: [String: Int] = [:]
   // parar na hora: o toque derruba a gravação imediatamente (quadros que chegarem depois não entram)
@@ -461,7 +471,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       lensMatch = match; renderer.lensMatch = match
       let al = aligner ?? SwitchAligner()
       aligner = al; renderer.aligner = al
-      al.onSettle = { txt in Diag.step("zoom-settle-image", ["ms:escala": String(txt.prefix(3000))]) }
+      al.onSettle = { [weak self] txt, amp in
+        DispatchQueue.main.async {
+          guard let self else { return }
+          if !self.selfTestMode.isEmpty { self.selfTestResults[self.selfTestMode, default: []].append(amp) }
+          else { Diag.step("zoom-settle-image", ["amplitude": String(format: "%.4f", amp), "ms:escala": String(txt.prefix(2500))]) }
+        }
+      }
       zoomDriver.onStuck = { txt in Diag.step("zoom-stuck", ["info": txt]) }
       zoomDriver.onTrace = { txt in Diag.step("zoom-settle-cmd", ["zoom": String(txt.prefix(3000))]) }
       al.lensAt = { [weak match] t in match?.lens(at: t) ?? LensMatch.reference }
@@ -481,7 +497,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if cam.isVirtualDevice {
         constituentObservation = cam.observe(\.activePrimaryConstituent, options: [.initial, .new]) { [weak self] cam, _ in
           match.lensChanged(LensMatch.name(cam.activePrimaryConstituent?.deviceType))
-          self?.queue.async { self?.applyLensLock(cam) }
+          self?.queue.async {
+            self?.applyLensLock(cam)
+            // lente física nova com o foco segurado: um único ajuste de foco (sem caçar) e trava de novo
+            if self?.focusHeld == true, cam.isFocusModeSupported(.autoFocus) {
+              _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .autoFocus; cam.unlockForConfiguration() } }
+            }
+          }
         }
       } else { match.lensChanged(LensMatch.name(cam.deviceType)) }
       let st0 = match.status()
@@ -648,8 +670,24 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
     Diag.step("lens-lock", ["mode": lockUltra ? "ultra" : "cruzando"], send: false)
   }
-  func followZoom(_ display: Double) { zoomDriver.follow(CGFloat(display) * base) }
-  func endZoomGesture() { zoomDriver.endFollow(); aligner?.startSettle(CACurrentMediaTime()) }
+  private func holdFocus(_ seconds: Double) {
+    queue.async {
+      guard self.focusHoldEnabled, let cam = self.device, !self.manualFocus, cam.position == .back else { return }
+      self.focusGen += 1; let gen = self.focusGen
+      if !self.focusHeld && cam.isFocusModeSupported(.locked) {
+        _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .locked; cam.unlockForConfiguration() } }
+        self.focusHeld = true
+      }
+      self.queue.asyncAfter(deadline: .now() + seconds) {
+        guard gen == self.focusGen, self.focusHeld else { return }
+        self.focusHeld = false
+        guard !self.manualFocus, let cam = self.device, cam.isFocusModeSupported(.continuousAutoFocus) else { return }
+        _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .continuousAutoFocus; cam.unlockForConfiguration() } }
+      }
+    }
+  }
+  func followZoom(_ display: Double) { holdFocus(1.2); zoomDriver.follow(CGFloat(display) * base) }
+  func endZoomGesture() { holdFocus(1.2); zoomDriver.endFollow(); aligner?.startSettle(CACurrentMediaTime()) }
   func selectZoom(_ value: Double) {
     let toUltra = value <= 0.51
     ultraLock = toUltra; UserDefaults.standard.set(toUltra, forKey: "ultraLock")
@@ -658,8 +696,48 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         // destrava ANTES de subir (pra cruzar as lentes); voltando pra 0,5 trava quando a ultra assumir (observador acima)
         if !toUltra { self.applyLensLock(cam) }
       }
-      DispatchQueue.main.async { self.zoomDriver.glide(to: CGFloat(value) * self.base) }
+      DispatchQueue.main.async {
+        let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base)
+        self.holdFocus(dur + 1.2)
+        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { self.aligner?.startSettle(CACurrentMediaTime()) }
+      }
     }
+  }
+
+  // ---- TESTE AUTOMÁTICO DO ZOOM: os mesmos zooms com o foco do jeito antigo (caçando) e com o foco segurado; mede quanto
+  // a escala ainda anda depois de parar (contra quadro fixo) e manda "antes × depois" pro log. ~25 s, celular parado.
+  func runZoomSelfTest() {
+    guard selfTest.isEmpty, ready, !recording else { return }
+    let wasUltra = ultraLock, startZoom = zoom
+    selfTestResults = [:]
+    var steps: [(Double, () -> Void)] = []
+    func say(_ t: String) { steps.append((0, { self.selfTest = t })) }
+    func wait(_ s: Double) { steps.append((s, {})) }
+    func mode(_ m: String) { steps.append((0, { self.selfTestMode = m; self.focusHoldEnabled = m == "segurado"
+      if m == "antigo" { self.queue.async { if let c = self.device, c.isFocusModeSupported(.continuousAutoFocus) { _ = CowboyObjC.catching { if (try? c.lockForConfiguration()) != nil { c.focusMode = .continuousAutoFocus; c.unlockForConfiguration() } } } } } })) }
+    func tap(_ v: Double) { steps.append((0, { self.selectZoom(v) })); wait(3.0) }
+    func pinch(_ from: Double, _ to: Double) {
+      for i in 1...12 { let z = from * pow(to / from, Double(i) / 12); steps.append((0.04, { self.followZoom(z) })) }
+      steps.append((0, { self.endZoomGesture() })); wait(2.6)
+    }
+    say("Teste do zoom: mantenha o celular PARADO, apontado pra uma cena com detalhes…")
+    steps.append((0, { self.selectZoom(1) })); wait(2.5)
+    for m in ["antigo", "segurado"] {
+      mode(m); say(m == "antigo" ? "Teste 1/2 — foco como antes" : "Teste 2/2 — foco segurado no zoom")
+      tap(2.5); tap(1); pinch(1, 2); pinch(2, 1)
+    }
+    steps.append((0, {
+      self.focusHoldEnabled = true; self.selfTestMode = ""
+      let r = self.selfTestResults
+      func avg(_ a: [Float]?) -> String { guard let a, !a.isEmpty else { return "-" }; return String(format: "%.2f%%", a.reduce(0, +) / Float(a.count) * 100) }
+      let txt = "antigo \(avg(r["antigo"])) · segurado \(avg(r["segurado"]))"
+      Diag.step("zoom-selftest", ["resultado": txt, "antigo": (r["antigo"] ?? []).map { String(format: "%.4f", $0) }.joined(separator: " "), "segurado": (r["segurado"] ?? []).map { String(format: "%.4f", $0) }.joined(separator: " ")])
+      self.selfTest = "Pronto — escala ao parar: \(txt)"
+      self.selectZoom(wasUltra ? 0.5 : startZoom)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.selfTest = "" }
+    }))
+    var t = 0.0
+    for (delay, action) in steps { t += delay; DispatchQueue.main.asyncAfter(deadline: .now() + t, execute: action) }
   }
   func setLensMatch(_ on: Bool) { lensMatch?.setEnabled(on); lensMatchOn = on }
   func resetLensMatch() { lensMatch?.reset(); lensMatchStatus = [:] }
@@ -733,6 +811,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
     }
     control { cam in
+      self.focusGen += 1; self.focusHeld = false
       if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.autoFocus) {
         cam.focusPointOfInterest = point; cam.focusMode = .autoFocus
         self.publish { self.manualFocus = false }
