@@ -304,7 +304,8 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
           if let zf = ZoomLag.hist(hist, p + 0.025), zf > 0 { kOld = max(1, min(6, zNow / zf)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
           var k = kOld
           if let rr = track.ratio(newestOver: p) { k = max(1, min(6, rr)); if abs(k - 1) < 0.0005 { k = 1 } }
-          if t > tEnd + 0.02 { newN.append(content(p) * k); oldN.append(content(p) * kOld) }
+          // depois que o zoom REAL terminou de chegar na tela (último quadro rápido do zoom leva ~40 ms + 1 quadro)
+          if t > tEnd + 0.07 { newN.append(content(p) * k); oldN.append(content(p) * kOld) }
         }
         func spread(_ x: [Double]) -> Double { guard let mx = x.max(), let mn = x.min(), let l = x.last else { return 1 }; return (mx - mn) / l }
         let dn = spread(newN), dO = spread(oldN)
