@@ -146,7 +146,7 @@ enum ZoomImage {
     return n > 60 ? sum / n : .infinity
   }
   // zoom de img relativo a ref (>1 = img mais perto) entre lo e hi, + confiança (quanto o custo sobe errando 0,6%)
-  static func vsRef(_ ref: [Float], _ img: [Float], lo: Double = 0.72, hi: Double = 1.40) -> (z: Double, conf: Float) {
+  static func vsRef(_ ref: [Float], _ img: [Float], lo: Double = 0.72, hi: Double = 1.40, shift: Int = 2) -> (z: Double, conf: Float) {
     var best = (s: Float(1), dx: Float(0), dy: Float(0), e: Float.infinity)
     func t1(_ s: Float, _ dx: Float, _ dy: Float, _ step: Int) {
       let e = cost(ref, img, s, dx / Float(w), dy / Float(h), step: step); if e < best.e { best = (s, dx, dy, e) }
@@ -154,7 +154,7 @@ enum ZoomImage {
     let n = Int((log(hi / lo) / log(1.01)).rounded(.up))
     for i in 0...n { t1(Float(1 / (lo * pow(1.01, Double(i)))), 0, 0, 2) }
     var c = best
-    for dy in -2...2 { for dx in -2...2 { t1(c.s, Float(dx), Float(dy), 2) } }
+    for dy in -shift...shift { for dx in -shift...shift { t1(c.s, Float(dx), Float(dy), 2) } }
     c = best; best.e = cost(ref, img, c.s, c.dx / Float(w), c.dy / Float(h), step: 1)
     for si in -5...5 { for dy in -1...1 { for dx in -1...1 { t1(c.s * (1 + Float(si) * 0.002), c.dx + Float(dx) * 0.5, c.dy + Float(dy) * 0.5, 1) } } }
     c = best
@@ -371,32 +371,38 @@ struct GestureSample {
 final class FastZoomTracker: @unchecked Sendable {
   private let lock = NSLock()
   private let queue = DispatchQueue(label: "cowboy.zoomtrack", qos: .userInitiated)
-  private var prev: (pts: Double, z: Double, img: [Float]?)?
+  private var prev: (pts: Double, z: Double)?
+  // quadro de REFERÊNCIA: cada quadro novo é medido contra ele (não contra o vizinho) — o erro de medida (~0,2%) não se soma
+  // quadro a quadro (44 passos num clique davam 1,2%), só a cada troca de referência (~8% de zoom: 3–5 passos num zoom)
+  private var key: (pts: Double, img: [Float], acc: Double, predAcc: Double)?
   private var chain: [(Double, Double)] = []   // (pts, log do zoom real acumulado)
-  private var acc = 0.0
+  private var acc = 0.0, predAcc = 0.0
   private(set) var measured = 0, guessed = 0
-  func reset() { queue.async { self.prev = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.lock.unlock() } }
+  func reset() { queue.async { self.prev = nil; self.key = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.predAcc = 0; self.lock.unlock() } }
   // fila da saída rápida: só enfileira (a medida roda na fila própria, em ordem)
   func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving) } }
   // zHist = zoom registrado previsto pro instante do quadro (com o adiantamento médio); moving = o zoom pode estar mudando
   func step(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) {
-    let img = thumb.map { ZoomImage.prep($0) }
-    var r = 1.0
-    if let pv = prev, pts > pv.pts, zHist > 0, pv.z > 0 {
-      let pred = zHist / pv.z
-      r = pred
-      if moving, let a = pv.img, let b = img, pts - pv.pts < 0.05 {
-        let lo = min(1, pred) / 1.05, hi = max(1, pred) * 1.05
-        let m = ZoomImage.vsRef(a, b, lo: lo, hi: hi)
+    var pred = 1.0
+    if let pv = prev, pts > pv.pts, zHist > 0, pv.z > 0 { pred = zHist / pv.z }
+    prev = (pts, zHist)
+    predAcc += log(pred)
+    var next = acc + log(pred)   // sem medida: segue o registrado
+    if moving, let thumb {
+      let img = ZoomImage.prep(thumb)
+      if let k = key, pts - k.pts < 0.45 {
+        let expect = exp(predAcc - k.predAcc)                      // razão prevista contra a referência
+        let lo = min(1, expect, exp(acc - k.acc)) / 1.06, hi = max(1, expect, exp(acc - k.acc)) * 1.06
+        let m = ZoomImage.vsRef(k.img, img, lo: lo, hi: hi, shift: 4)
         if m.conf >= 0.04 && m.z > lo * 1.004 && m.z < hi / 1.004 {
-          r = m.z
-          if abs(pred - 1) < 1e-6 && abs(log(r)) < 0.002 { r = 1 }   // parado e dentro do ruído da medida: parado
-          measured += 1
+          next = k.acc + log(m.z); measured += 1
+          if abs(log(pred)) < 1e-6 && abs(next - acc) < 0.002 { next = acc }   // parado e dentro do ruído: parado
         } else { guessed += 1 }
-      }
-    }
-    prev = (pts, zHist, img)
-    lock.lock(); acc += log(r); chain.append((pts, acc)); if chain.count > 600 { chain.removeFirst(chain.count - 600) }; lock.unlock()
+        if abs(next - k.acc) > log(1.08) || pts - k.pts > 0.3 { key = (pts, img, next, predAcc) }
+      } else { key = (pts, img, next, predAcc) }
+    } else if !moving { key = nil }
+    acc = next
+    lock.lock(); chain.append((pts, acc)); if chain.count > 600 { chain.removeFirst(chain.count - 600) }; lock.unlock()
   }
   // zoom real do quadro rápido mais novo ÷ zoom real do quadro de horário t (nil = horário fora da curva)
   func ratio(newestOver t: Double) -> Double? {
