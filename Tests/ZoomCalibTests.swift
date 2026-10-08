@@ -280,6 +280,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         var hist: [(Double, Double)] = []
         var fi = 0, lastShown = -1.0
         var newN: [Double] = [], oldN: [Double] = []
+        var dbg: [String] = []
         var jx = 0.0, jy = 0.0
         for dIdx in 0..<240 {
           let t = Double(dIdx) / 60 + 0.005
@@ -305,7 +306,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
           var k = kOld
           if let rr = track.ratio(newestOver: p) { k = max(1, min(6, rr)); if abs(k - 1) < 0.0005 { k = 1 } }
           // depois que o zoom REAL terminou de chegar na tela (último quadro rápido do zoom leva ~40 ms + 1 quadro)
-          if t > tEnd + 0.07 { newN.append(content(p) * k); oldN.append(content(p) * kOld) }
+          if t > tEnd + 0.07 { newN.append(content(p) * k); oldN.append(content(p) * kOld); dbg.append(String(format: "%.0f:%.4f(k%.4f p%.0f)", (t - tEnd) * 1000, content(p) * k / z1, k, (p - T0) * 1000)) }
         }
         func spread(_ x: [Double]) -> Double { guard let mx = x.max(), let mn = x.min(), let l = x.last else { return 1 }; return (mx - mn) / l }
         let dn = spread(newN), dO = spread(oldN)
@@ -321,6 +322,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
             p += 1 / fps
           }
           print("     erro do medidor por quadro (ms desde o início: %): " + line.joined(separator: " "))
+          print("     tela depois de parar (ms: tamanho/final): " + dbg.prefix(45).joined(separator: " "))
         }
         if contrast >= 0.5 {
           check(dn <= 0.01, String(format: "zoom medido, adiantamento %.0f ms, %@: tela REAL depois de parar — medido %.2f%% × conta da 0.7.8 %.2f%% (medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
