@@ -64,7 +64,8 @@ enum ZoomImage {
     CVPixelBufferLockBaseAddress(buffer, .readOnly); defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return nil }
     let W = CVPixelBufferGetWidthOfPlane(buffer, 0), H = CVPixelBufferGetHeightOfPlane(buffer, 0), row = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
-    guard W >= w * sub, H >= h * sub else { return nil }
+    let sub = min(Self.sub, W / w, H / h)   // quadro pequeno (saída em tamanho de tela): menos amostras por ponto
+    guard sub >= 2 else { return nil }
     let sixteen = LutBaker.tenBit.contains(CVPixelBufferGetPixelFormatType(buffer))
     let bpp = sixteen ? 2 : 1
     var xs = [Int](repeating: 0, count: w * sub), ys = [Int](repeating: 0, count: h * sub)
@@ -356,4 +357,58 @@ struct GestureSample {
   let hist: [(Double, Double)]
   let tFirst: Double
   let tLast: Double
+}
+
+// ZOOM REAL DE CADA QUADRO MEDIDO NA SAÍDA RÁPIDA (0.7.9). Descoberta do filmmaker (08/10): com o estabilizador DESLIGADO o
+// zoom para perfeito — o quadro chega na hora e a tela não precisa adivinhar nada. Com a Extrema o quadro estabilizado chega
+// ~0,5 s depois e a tela amplia ele pro zoom de agora; a ampliação adivinhava o zoom de cada quadro pelo zoom REGISTRADO, que
+// anda 0–35 ms fora do aplicado (varia por gesto) -> passava do ponto 7–12% (medido na tela). Aqui não se adivinha: a saída
+// rápida (sem estabilização, mesmo instante de captura de cada quadro estabilizado, chega em ~40 ms) é medida NA IMAGEM
+// enquanto o zoom anda (quadro contra o anterior), e o zoom real de cada instante vira uma curva. Quando o quadro
+// estabilizado daquele instante chega na tela: ampliação = zoom real do quadro rápido mais novo ÷ zoom real do quadro
+// mostrado — a tela anda como a câmera sem estabilizador, com a imagem estabilizada. Fora do zoom não mede nada (calor).
+// Cena sem textura (noite): a medida não convence e entra o zoom registrado com o adiantamento médio (conta da 0.7.8).
+final class FastZoomTracker: @unchecked Sendable {
+  private let lock = NSLock()
+  private let queue = DispatchQueue(label: "cowboy.zoomtrack", qos: .userInitiated)
+  private var prev: (pts: Double, z: Double, img: [Float]?)?
+  private var chain: [(Double, Double)] = []   // (pts, log do zoom real acumulado)
+  private var acc = 0.0
+  private(set) var measured = 0, guessed = 0
+  func reset() { queue.async { self.prev = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.lock.unlock() } }
+  // fila da saída rápida: só enfileira (a medida roda na fila própria, em ordem)
+  func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving) } }
+  // zHist = zoom registrado previsto pro instante do quadro (com o adiantamento médio); moving = o zoom pode estar mudando
+  func step(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) {
+    let img = thumb.map { ZoomImage.prep($0) }
+    var r = 1.0
+    if let pv = prev, pts > pv.pts, zHist > 0, pv.z > 0 {
+      let pred = zHist / pv.z
+      r = pred
+      if moving, let a = pv.img, let b = img, pts - pv.pts < 0.05 {
+        let lo = min(1, pred) / 1.05, hi = max(1, pred) * 1.05
+        let m = ZoomImage.vsRef(a, b, lo: lo, hi: hi)
+        if m.conf >= 0.04 && m.z > lo * 1.004 && m.z < hi / 1.004 {
+          r = m.z
+          if abs(pred - 1) < 1e-6 && abs(log(r)) < 0.002 { r = 1 }   // parado e dentro do ruído da medida: parado
+          measured += 1
+        } else { guessed += 1 }
+      }
+    }
+    prev = (pts, zHist, img)
+    lock.lock(); acc += log(r); chain.append((pts, acc)); if chain.count > 600 { chain.removeFirst(chain.count - 600) }; lock.unlock()
+  }
+  // zoom real do quadro rápido mais novo ÷ zoom real do quadro de horário t (nil = horário fora da curva)
+  func ratio(newestOver t: Double) -> Double? {
+    lock.lock(); defer { lock.unlock() }
+    guard let first = chain.first, let last = chain.last, t >= first.0 - 0.02, t <= last.0 + 0.02 else { return nil }
+    if t <= first.0 { return exp(last.1 - first.1) }
+    if t >= last.0 { return 1 }
+    var lo = 0, hi = chain.count - 1
+    while hi - lo > 1 { let mid = (lo + hi) / 2; if chain[mid].0 <= t { lo = mid } else { hi = mid } }
+    let a = chain[lo], b = chain[hi]
+    let v = a.1 + (b.1 - a.1) * (t - a.0) / max(1e-4, b.0 - a.0)
+    return exp(last.1 - v)
+  }
+  var counts: (Int, Int) { (measured, guessed) }
 }

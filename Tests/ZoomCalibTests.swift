@@ -256,6 +256,66 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         } else { check(true, String(format: "aparelho FORA do modelo (alisa olhando à frente %.0f ms): não ligou (fica a conta antiga)", ahead * 1000)) }
       }
     }
+    // (5) ZOOM REAL MEDIDO NA SAÍDA RÁPIDA (0.7.9): o iPhone aplica o zoom ADIANTADO em relação ao registrado, e o
+    // adiantamento VARIA por gesto (0–35 ms, medido na tela do aparelho). A conta da 0.7.8 (registrado + 25 ms) erra nos
+    // extremos; o rastreador mede o zoom real nos quadros rápidos e a tela tem que parar quieta. No escuro: não pode piorar.
+    for (lead, contrast) in [(0.0, 1.0), (0.018, 1.0), (0.035, 1.0), (0.035, 0.25)] {
+      for kind in ["clique", "pinça"] {
+        let fps = 60.0, L = 0.55, z0 = 2.6, z1 = 3.4, T0 = 0.6
+        var cmd: [Double] = []; var zc = z0
+        for n in 0..<400 {
+          let t = Double(n) / fps
+          let tgt = t < T0 ? z0 : z0 * pow(z1 / z0, min(1, (t - T0) / 0.5))
+          if abs(log(tgt / zc)) > 0.0006 { zc = exp(log(zc) + log(tgt / zc) * (1 - exp(-(1 / fps) / 0.07))) }
+          cmd.append(zc)
+        }
+        func zProp(_ t: Double) -> Double {
+          if kind == "clique" { let dur = 0.35; return t <= T0 ? z0 : (t >= T0 + dur ? z1 : z0 * pow(z1 / z0, (t - T0) / dur)) }
+          return t <= 0 ? z0 : cmd[min(cmd.count - 1, Int(t * fps))]
+        }
+        var tEnd = T0 + 0.2
+        while tEnd < 6 && abs(zProp(tEnd + 0.05) / zProp(tEnd) - 1) > 1e-6 { tEnd += 1 / fps }
+        func content(_ p: Double) -> Double { zProp(p + lead) }
+        let track = FastZoomTracker()
+        var hist: [(Double, Double)] = []
+        var fi = 0, lastShown = -1.0
+        var newN: [Double] = [], oldN: [Double] = []
+        var jx = 0.0, jy = 0.0
+        for dIdx in 0..<240 {
+          let t = Double(dIdx) / 60 + 0.005
+          hist.append((t, zProp(t)))
+          // quadros rápidos que já chegaram (~38 ms depois da captura)
+          while Double(fi) / fps + 0.038 <= t {
+            let p = Double(fi) / fps
+            jx = jx * 0.95 + rng.normal() * 0.0006; jy = jy * 0.95 + rng.normal() * 0.0006
+            let arrive = p + 0.038
+            let moving = abs(log(zProp(arrive) / zProp(arrive - 0.4))) > 1e-6
+            var th: [Float]? = nil
+            if moving { th = scene.thumb(content(p), jx, jy, noise: 0.004, &rng).map { Float(0.5) + ($0 - Float(0.5)) * Float(contrast) } }
+            track.step(pts: p, zHist: ZoomLag.hist(hist, p + 0.025) ?? z0, thumb: th, moving: moving)
+            fi += 1
+          }
+          // quadro estabilizado mais novo (mesmo instante de captura), chega L depois
+          let p = floor((t - L) * fps) / fps
+          guard p > lastShown, p >= 0 else { continue }
+          lastShown = p
+          let zNow = zProp(t)
+          var kOld = 1.0
+          if let zf = ZoomLag.hist(hist, p + 0.025), zf > 0 { kOld = max(1, min(6, zNow / zf)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
+          var k = kOld
+          if let rr = track.ratio(newestOver: p) { k = max(1, min(6, rr)); if abs(k - 1) < 0.0005 { k = 1 } }
+          if t > tEnd + 0.02 { newN.append(content(p) * k); oldN.append(content(p) * kOld) }
+        }
+        func spread(_ x: [Double]) -> Double { guard let mx = x.max(), let mn = x.min(), let l = x.last else { return 1 }; return (mx - mn) / l }
+        let dn = spread(newN), dO = spread(oldN)
+        let c = track.counts
+        if contrast >= 0.5 {
+          check(dn <= 0.01, String(format: "zoom medido, adiantamento %.0f ms, %@: tela REAL depois de parar — medido %.2f%% × conta da 0.7.8 %.2f%% (medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
+        } else {
+          check(dn <= max(dO + 0.005, 0.01), String(format: "zoom medido NO ESCURO, adiantamento %.0f ms, %@: tela %.2f%% × conta da 0.7.8 %.2f%% (não pode piorar; medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
+        }
+      }
+    }
     print("TESTE DO ZOOM OK")
   }
 }

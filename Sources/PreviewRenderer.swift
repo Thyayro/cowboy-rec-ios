@@ -44,6 +44,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // zoomInstant = false: a tela mostra exatamente o arquivo (sem ampliação) — liso, mas o zoom aparece ~0,5 s depois.
   var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant") as? Bool ?? true
   static let contentLead = 0.025
+  let zoomTrack = FastZoomTracker()   // zoom real de cada instante, medido na saída rápida (0.7.9)
   var frameZoom: ((Double) -> Double?)?
   // por quadro estabilizado desenhado: ampliação usada, a que a conta antiga daria e a hora (medição do estacionar/calibração)
   private var shownK: [(pts: Double, k: Double, kOld: Double, at: Double)] = []
@@ -118,7 +119,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     lock.lock(); let fr = frozen; eis.margin = max(0.01, min(0.035, (crop - 1) / 2 - 0.006)); lock.unlock()
     if fr { return }
     // durante o zoom a imagem muda de tamanho: a medida de tremor erraria e depois "voltaria" — segura enquanto o zoom anda
-    lock.lock(); let zooming = CACurrentMediaTime() - lastZoomMove < 0.2; lock.unlock()
+    lock.lock(); let zooming = CACurrentMediaTime() - lastZoomMove < 0.2
+    let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.4, zHistFast = zoomAt(pts + Self.contentLead) ?? 0; lock.unlock()
+    if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving) }
     let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming) : (0, 0)
     lock.lock()
     if frozen { lock.unlock(); return }
@@ -205,7 +208,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -276,7 +279,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     var kOld = 1.0
     if zoomInstant, let zNow, let zFrame, zFrame > 0 { kOld = max(1, min(6, zNow / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
     var k = kOld
-    if zoomInstant, let zNow, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
+    if zoomInstant, let p = pts, let rr = zoomTrack.ratio(newestOver: p) { k = max(1, min(6, rr)); if abs(k - 1) < 0.0005 { k = 1 } }   // zoom REAL medido
+    else if zoomInstant, let zNow, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
     if let pts { lock.lock(); shownK.append((pts, k, kOld, now)); if shownK.count > 600 { shownK.removeFirst(shownK.count - 600) }; lock.unlock() }
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
