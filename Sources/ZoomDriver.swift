@@ -39,6 +39,9 @@ final class ZoomDriver: @unchecked Sendable {
     // sem quadro há mais de 120 ms (saída parada): o gesto não pode "travar" — aplica direto
     if CACurrentMediaTime() - lastTickWall > 0.25 { configure(d) { d.videoZoomFactor = z } }
   }
+  private var stuck = 0
+  private var stuckSent = false
+  var onStuck: ((String) -> Void)?
   private var trace: [String] = []
   private var traceUntil = 0.0
   var onTrace: ((String) -> Void)?
@@ -69,7 +72,12 @@ final class ZoomDriver: @unchecked Sendable {
     }
     lock.unlock()
     let diff = log(Double(tgt / cur))
-    guard abs(diff) > 0.0006 else { return }
+    guard abs(diff) > 0.0006 else { stuck = 0; return }
+    if abs(diff) > 0.05 { stuck += 1 } else { stuck = 0 }
+    if stuck == 30 && !stuckSent {
+      stuckSent = true
+      onStuck?("alvo \(tgt) atual \(cur) min \(d.minAvailableVideoZoomFactor) max \(d.maxAvailableVideoZoomFactor) rampa \(d.isRampingVideoZoom) lente \(d.activePrimaryConstituent?.deviceType.rawValue ?? "-") troca \(d.primaryConstituentDeviceSwitchingBehavior.rawValue)")
+    }
     let next = clamp(d, CGFloat(exp(log(Double(cur)) + diff * (1 - exp(-dt / 0.07)))))
     configure(d) { d.videoZoomFactor = next }
   }

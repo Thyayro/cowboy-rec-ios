@@ -31,6 +31,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // enquadramento do arquivo (corte medido); o arquivo continua com a estabilização Extrema. Zoom e troca de lente na hora.
   var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
   private var fastFresh = false
+  private let eis = PreviewEIS()
+  private var fastCorr = (0.0, 0.0)
   var lensMatch: LensMatch?
   var aligner: SwitchAligner?
   // NUNCA fila de medições: cada medição segura um quadro da câmera; acumuladas, os quadros acabam e a câmera para (0.6.1)
@@ -87,9 +89,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     }
   }
   func pushFast(_ buffer: CVPixelBuffer, pts: Double) {
+    // estabilização própria da tela (só deslocamento; cega ao zoom) — calculada aqui, antes de mostrar
+    lock.lock(); let fr = frozen; eis.margin = max(0.01, min(0.035, (crop - 1) / 2 - 0.006)); lock.unlock()
+    if fr { return }
+    let corr = lightPreview ? eis.process(buffer, t: pts) : (0, 0)
     lock.lock()
     if frozen { lock.unlock(); return }
-    fastBuffer = buffer; fastPTS = pts; fastFresh = true
+    fastBuffer = buffer; fastPTS = pts; fastFresh = true; fastCorr = corr
     let now = CACurrentMediaTime()
     fastAt = now
     let wantStats = now >= nextStats && !statsBusy
@@ -170,7 +176,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; lock.unlock() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); lock.unlock() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -220,6 +226,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
     if let a = zoomHistory.dropLast().last, let b = zoomHistory.last, abs(a.1 - b.1) > 0.0005 { lastZoomMove = now }
     let live = lightPreview && fast != nil
+    let corrNow = fastCorr
     let liveFrame: CVPixelBuffer? = live && fastFresh ? fast : nil
     let livePTS = fastPTS
     if live { fastFresh = false; pending = nil }
@@ -227,7 +234,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if live {
       guard let liveFrame else { return }
       drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now) ?? .identity,
-        geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity)
+        geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity, shake: corrNow)
       return
     }
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
@@ -257,12 +264,14 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     frames += 1
   }
 
-  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection, geo: SwitchGeometry) {
+  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection, geo: SwitchGeometry, shake: (Double, Double) = (0, 0)) {
     guard let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
     var raw = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
-    if !geo.isIdentity { raw = Self.aligned(raw, geo) }
+    // troca de lente (com zoom de cobertura) + tremor da mão (só desloca, dentro da margem do corte — sem zoom extra)
+    let g = SwitchGeometry(s: geo.s, tx: geo.tx + Float(shake.0), ty: geo.ty + Float(shake.1))
+    if !g.isIdentity { raw = Self.aligned(raw, g) }
     var image = Self.orient(raw, orient, mirrored: mirror)
     let fitScale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * fitScale) / 2, y: (target.height - image.extent.height * fitScale) / 2, width: image.extent.width * fitScale, height: image.extent.height * fitScale)

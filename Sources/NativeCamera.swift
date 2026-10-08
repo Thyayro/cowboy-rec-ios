@@ -440,8 +440,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if connection.isVideoMirroringSupported { connection.automaticallyAdjustsVideoMirroring = false; connection.isVideoMirrored = false }
       if fastOK, let fc = fastOut.connection(with: .video) {
         // prévia: estabilização de baixa latência (a da câmera do iPhone); a Extrema fica só no arquivo
-        var light: AVCaptureVideoStabilizationMode = .off
-        for m in [AVCaptureVideoStabilizationMode.previewOptimized, .standard] where cam.activeFormat.isVideoStabilizationModeSupported(m) { light = m; break }
+        // a estabilização de prévia da Apple fazia a ESCALA ir e voltar depois do zoom (medido 08/10): a tela recebe o quadro
+        // cru e estabiliza sozinha (PreviewEIS, só deslocamento)
+        let light: AVCaptureVideoStabilizationMode = .off
         if fc.isVideoStabilizationSupported {
           if CowboyObjC.catching({ fc.preferredVideoStabilizationMode = light }) != nil { _ = CowboyObjC.catching { fc.preferredVideoStabilizationMode = .standard } }
         }
@@ -461,6 +462,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let al = aligner ?? SwitchAligner()
       aligner = al; renderer.aligner = al
       al.onSettle = { txt in Diag.step("zoom-settle-image", ["ms:escala": String(txt.prefix(3000))]) }
+      zoomDriver.onStuck = { txt in Diag.step("zoom-stuck", ["info": txt]) }
       zoomDriver.onTrace = { txt in Diag.step("zoom-settle-cmd", ["zoom": String(txt.prefix(3000))]) }
       al.lensAt = { [weak match] t in match?.lens(at: t) ?? LensMatch.reference }
       al.onAlign = { stream, g, e, e0 in Diag.step("lens-align", ["stream": stream, "s": String(format: "%.4f", g.s), "tx": String(format: "%.4f", g.tx), "ty": String(format: "%.4f", g.ty), "gain": String(format: "%.2f", e0 > 0 ? 1 - e / e0 : 0)]) }
