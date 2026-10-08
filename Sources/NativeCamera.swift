@@ -471,10 +471,18 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       lensMatch = match; renderer.lensMatch = match
       let al = aligner ?? SwitchAligner()
       aligner = al; renderer.aligner = al
+      al.probe = { [weak cam] in
+        guard let c = cam else { return "" }
+        let lens = LensMatch.name(c.activePrimaryConstituent?.deviceType ?? c.deviceType)
+        return String(format: "L%.3f z%.3f %@ %@ e%.1f i%.0f", c.lensPosition, Double(c.videoZoomFactor), lens, c.isAdjustingFocus ? "AF" : "-", CMTimeGetSeconds(c.exposureDuration) * 1000, c.iso)
+      }
       al.onSettle = { [weak self] txt, amp in
         DispatchQueue.main.async {
           guard let self else { return }
-          if !self.selfTestMode.isEmpty { self.selfTestResults[self.selfTestMode, default: []].append(amp) }
+          if !self.selfTestMode.isEmpty {
+            self.selfTestResults[self.selfTestMode, default: []].append(amp)
+            Diag.step("zoom-selftest-trace", ["modo": self.selfTestMode, "amplitude": String(format: "%.4f", amp), "quadros": String(txt.prefix(5000))])
+          }
           else { Diag.step("zoom-settle-image", ["amplitude": String(format: "%.4f", amp), "ms:escala": String(txt.prefix(2500))]) }
         }
       }
@@ -704,8 +712,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
 
-  // ---- TESTE AUTOMÁTICO DO ZOOM: os mesmos zooms com o foco do jeito antigo (caçando) e com o foco segurado; mede quanto
-  // a escala ainda anda depois de parar (contra quadro fixo) e manda "antes × depois" pro log. ~25 s, celular parado.
+  // ---- TESTE AUTOMÁTICO DO ZOOM (v2): separa as causas. Zooms LONGE das fronteiras de lente/sensor (1,3× <-> 1,7×), em dois
+  // modos: foco AUTOMÁTICO e foco TRAVADO o tempo todo. A cada quadro depois de parar: escala real (contra quadro fixo) +
+  // posição da lente de foco, zoom real, lente ativa, exposição. Se travado = parado -> é o foco; senão o registro mostra quem.
   func runZoomSelfTest() {
     guard selfTest.isEmpty, ready, !recording else { return }
     let wasUltra = ultraLock, startZoom = zoom
@@ -713,25 +722,37 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     var steps: [(Double, () -> Void)] = []
     func say(_ t: String) { steps.append((0, { self.selfTest = t })) }
     func wait(_ s: Double) { steps.append((s, {})) }
-    func mode(_ m: String) { steps.append((0, { self.selfTestMode = m; self.focusHoldEnabled = m == "segurado"
-      if m == "antigo" { self.queue.async { if let c = self.device, c.isFocusModeSupported(.continuousAutoFocus) { _ = CowboyObjC.catching { if (try? c.lockForConfiguration()) != nil { c.focusMode = .continuousAutoFocus; c.unlockForConfiguration() } } } } } })) }
+    func focus(_ mode: AVCaptureDevice.FocusMode) {
+      steps.append((0, { self.queue.async { if let c = self.device, c.isFocusModeSupported(mode) { _ = CowboyObjC.catching { if (try? c.lockForConfiguration()) != nil { c.focusMode = mode; c.unlockForConfiguration() } } } } }))
+    }
+    func mode(_ m: String) { steps.append((0, { self.selfTestMode = m; self.focusHoldEnabled = false })) }
     func tap(_ v: Double) { steps.append((0, { self.selectZoom(v) })); wait(3.0) }
     func pinch(_ from: Double, _ to: Double) {
       for i in 1...12 { let z = from * pow(to / from, Double(i) / 12); steps.append((0.04, { self.followZoom(z) })) }
       steps.append((0, { self.endZoomGesture() })); wait(2.6)
     }
-    say("Teste do zoom: mantenha o celular PARADO, apontado pra uma cena com detalhes…")
-    steps.append((0, { self.selectZoom(1) })); wait(2.5)
-    for m in ["antigo", "segurado"] {
-      mode(m); say(m == "antigo" ? "Teste 1/2 — foco como antes" : "Teste 2/2 — foco segurado no zoom")
-      tap(2.5); tap(1); pinch(1, 2); pinch(2, 1)
-    }
+    say("Teste do zoom: celular PARADO e apoiado, apontado pra uma cena com detalhes…")
+    steps.append((0, {
+      self.focusHoldEnabled = false
+      self.queue.async {
+        guard let c = self.device else { return }
+        let f = c.activeFormat
+        Diag.step("zoom-selftest-info", ["camera": c.deviceType.rawValue, "trocas": c.virtualDeviceSwitchOverVideoZoomFactors.map { String(format: "%.2f", $0.doubleValue) }.joined(separator: ","),
+          "sensor2x": f.secondaryNativeResolutionZoomFactors.map { String(format: "%.2f", Double($0)) }.joined(separator: ","), "formato": "\(CMVideoFormatDescriptionGetDimensions(f.formatDescription).width)x\(CMVideoFormatDescriptionGetDimensions(f.formatDescription).height)"])
+      }
+    }))
+    steps.append((0, { self.selectZoom(1.3) })); focus(.continuousAutoFocus); wait(3.0)
+    mode("AF"); say("Teste 1/2 — foco automático")
+    tap(1.7); tap(1.3); pinch(1.35, 1.75); pinch(1.75, 1.35)
+    focus(.locked); mode("TRAVADO"); say("Teste 2/2 — foco travado")
+    tap(1.7); tap(1.3); pinch(1.35, 1.75); pinch(1.75, 1.35)
     steps.append((0, {
       self.focusHoldEnabled = true; self.selfTestMode = ""
+      self.queue.async { if let c = self.device, c.isFocusModeSupported(.continuousAutoFocus) { _ = CowboyObjC.catching { if (try? c.lockForConfiguration()) != nil { c.focusMode = .continuousAutoFocus; c.unlockForConfiguration() } } } }
       let r = self.selfTestResults
       func avg(_ a: [Float]?) -> String { guard let a, !a.isEmpty else { return "-" }; return String(format: "%.2f%%", a.reduce(0, +) / Float(a.count) * 100) }
-      let txt = "antigo \(avg(r["antigo"])) · segurado \(avg(r["segurado"]))"
-      Diag.step("zoom-selftest", ["resultado": txt, "antigo": (r["antigo"] ?? []).map { String(format: "%.4f", $0) }.joined(separator: " "), "segurado": (r["segurado"] ?? []).map { String(format: "%.4f", $0) }.joined(separator: " ")])
+      let txt = "foco automático \(avg(r["AF"])) · foco travado \(avg(r["TRAVADO"]))"
+      Diag.step("zoom-selftest", ["resultado": txt, "AF": (r["AF"] ?? []).map { String(format: "%.4f", $0) }.joined(separator: " "), "TRAVADO": (r["TRAVADO"] ?? []).map { String(format: "%.4f", $0) }.joined(separator: " ")])
       self.selfTest = "Pronto — escala ao parar: \(txt)"
       self.selectZoom(wasUltra ? 0.5 : startZoom)
       DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.selfTest = "" }

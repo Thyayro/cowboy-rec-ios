@@ -18,8 +18,8 @@ settings:
     INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
     DEVELOPMENT_LANGUAGE: pt-BR
     INFOPLIST_KEY_CFBundleDevelopmentRegion: pt-BR
-    MARKETING_VERSION: "0.6.8"
-    CURRENT_PROJECT_VERSION: "25"
+    MARKETING_VERSION: "0.6.9"
+    CURRENT_PROJECT_VERSION: "26"
 targets:
   CowboyRec:
     type: application

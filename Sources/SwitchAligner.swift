@@ -30,8 +30,9 @@ final class SwitchAligner: @unchecked Sendable {
   private var settleT0 = 0.0
   private var settleActive = false
   private var settleRef: [Float]?
-  private var settleVals: [(Double, Float)] = []
+  private var settleVals: [(Double, Float, String)] = []
   var onSettle: ((String, Float) -> Void)?
+  var probe: (() -> String)?   // estado real da câmera no quadro (posição da lente de foco, zoom, lente, exposição)
   func startSettle(_ t: Double) { lock.lock(); settleT0 = t; settleActive = true; settleRef = nil; settleVals = []; lock.unlock() }
   static func scaleVsRef(_ ref: [Float], _ img: [Float]) -> Float {
     var best = (s: Float(1), dx: 0, dy: 0, e: Float.infinity)
@@ -58,14 +59,14 @@ final class SwitchAligner: @unchecked Sendable {
       if dt >= 2.2 {
         let v = settleVals.map { $0.1 }
         let amp = (v.max() ?? 1) - (v.min() ?? 1)
-        finished = (settleVals.map { String(format: "%.0f:%.3f", $0.0 * 1000, $0.1) }.joined(separator: " "), amp)
+        finished = (settleVals.map { String(format: "%.0f:%.3f", $0.0 * 1000, $0.1) + "[" + $0.2 + "]" }.joined(separator: " "), amp)
         settleActive = false; settleVals = []; settleRef = nil
       } else if dt >= 0.3 {
         if let r = settleRef { job = (r, dt) } else { settleRef = img }
       }
     }
     lock.unlock()
-    if let job { let sc = Self.scaleVsRef(job.ref, img); lock.lock(); settleVals.append((job.dt, sc)); lock.unlock() }
+    if let job { let st = probe?() ?? ""; let sc = Self.scaleVsRef(job.ref, img); lock.lock(); settleVals.append((job.dt, sc, st)); lock.unlock() }
     if let finished { onSettle?(finished.0, finished.1) }
     guard let prev, prev.lens != lens, t - prev.t < 0.2 else { return }
     guard (prev.lens == "ultra") != (lens == "ultra") else { return }   // só 0,5× <-> 1× (da 1× em diante não precisa)
