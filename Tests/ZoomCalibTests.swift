@@ -57,14 +57,18 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     let scene = Scene(seed: 7)
     var rng = RNG(s: 99)
     // (1) medida de escala
-    var worst = 0.0
-    for z in [2.6, 3.0] { for r in [1.0, 1.012, 1.04, 1.1, 1.25] {
+    // entre quadros vizinhos (zoom normal, até 10%) o erro tem que ser mínimo; no degrau de 25% (só na calibração, onde
+    // importa QUANDO e não o tamanho exato) a diferença de nitidez entre as miniaturas pesa um pouco mais
+    var worstSmall = 0.0, worstBig = 0.0
+    for z in [2.6, 3.0] { for r in [1.0, 1.012, 1.04, 1.1, 1.25] { for _ in 0..<2 {
       let a = ZoomImage.prep(scene.thumb(z, 0, 0, noise: 0.004, &rng))
       let b = ZoomImage.prep(scene.thumb(z * r, 0.002, -0.001, noise: 0.004, &rng))
       let m = ZoomImage.vsRef(a, b, lo: 0.75, hi: 1.35)
-      worst = max(worst, abs(m.z / r - 1))
-    } }
-    check(worst < 0.004, String(format: "medida de escala entre miniaturas: pior erro %.3f%%", worst * 100))
+      let e = abs(m.z / r - 1)
+      if r < 1.2 { worstSmall = max(worstSmall, e) } else { worstBig = max(worstBig, e) }
+    } } }
+    check(worstSmall < 0.002, String(format: "medida de escala entre quadros vizinhos (até 10%%): pior erro %.3f%%", worstSmall * 100))
+    check(worstBig < 0.006, String(format: "medida de escala no degrau de 25%%: pior erro %.3f%%", worstBig * 100))
 
     // (2)+(3) câmera simulada: 60 qps, valor posto no retorno de cada quadro (38 ms ± 4), trava verdadeira, estabilizado L
     for trueLag in [-0.012, 0.018, 0.045] {
