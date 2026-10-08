@@ -10,14 +10,29 @@ import Foundation
 // CALIBRAÇÃO no aparelho (ZoomCalibration): degraus + cliques + pinça com o celular parado, razão de escala entre quadros
 // estabilizados VIZINHOS medida na imagem, melhor trava por mínimos quadrados; depois a calibração VERIFICA (clique e pinça
 // com a trava ligada, tela nova × antiga nos MESMOS quadros) e só liga se a nova provar. Senão fica a conta antiga.
+// trava (quanto antes do quadro o valor precisa ter sido posto) + suavização (o estabilizador pode alisar o zoom: média
+// exponencial dos valores postos pra trás, constante τ). τ = 0: o quadro carrega exatamente o último valor.
+struct ZoomFit: Equatable { var lag: Double; var tau: Double
+  var text: String { String(format: "trava %+.0fms%@", lag * 1000, tau > 0.001 ? String(format: " suaviza %.0fms", tau * 1000) : "") } }
 enum ZoomLag {
-  static func load() -> Double? {
+  static func load() -> ZoomFit? {
     let u = UserDefaults.standard
-    return u.bool(forKey: "zoomLagOn") ? u.double(forKey: "zoomLag") : nil
+    return u.bool(forKey: "zoomLagOn") ? ZoomFit(lag: u.double(forKey: "zoomLag"), tau: u.double(forKey: "zoomTau")) : nil
   }
-  static func save(_ v: Double?) {
+  static func save(_ v: ZoomFit?) {
     let u = UserDefaults.standard
-    if let v { u.set(v, forKey: "zoomLag"); u.set(true, forKey: "zoomLagOn") } else { u.set(false, forKey: "zoomLagOn") }
+    if let v { u.set(v.lag, forKey: "zoomLag"); u.set(v.tau, forKey: "zoomTau"); u.set(true, forKey: "zoomLagOn") } else { u.set(false, forKey: "zoomLagOn") }
+  }
+  // zoom que o quadro captado em p carrega, pelo registro de valores postos
+  static func model(_ sets: [(Double, Double)], _ p: Double, _ f: ZoomFit) -> Double? {
+    if f.tau < 0.001 { return at(sets, p - f.lag) }
+    let step = max(0.004, f.tau / 8)
+    var acc = 0.0, ws = 0.0, u = 0.0
+    while u < 5 * f.tau {
+      guard let z = at(sets, p - f.lag - u), z > 0 else { break }
+      let w = exp(-u / f.tau); acc += w * Foundation.log(z); ws += w; u += step
+    }
+    return ws > 0 ? exp(acc / ws) : at(sets, p - f.lag)
   }
   // valor do registro (hora, zoom) vigente em t
   static func at(_ log: [(Double, Double)], _ t: Double) -> Double? {
@@ -196,22 +211,39 @@ enum ZoomCalibMath {
     return p99 <= max(3 * floor, 0.004) && a.last! <= max(6 * floor, 0.008)
   }
   static func huber(_ x: Double) -> Double { let a = abs(x); return a < 0.01 ? a * a : 0.01 * (2 * a - 0.01) }
-  // erro médio das razões medidas × previstas (trava = registro exato; nil = conta antiga pelo histórico da tela)
-  static func lagError(_ pairs: [(PairMeas, CalibWindow)], _ lag: Double?) -> (Double, Int) {
+  // erro médio das razões medidas × previstas (modelo = registro exato; nil = conta antiga pelo histórico da tela)
+  static func lagError(_ pairs: [(PairMeas, CalibWindow)], _ fit: ZoomFit?) -> (Double, Int) {
     var e = 0.0, n = 0
     for (m, w) in pairs {
       let za: Double?, zb: Double?
-      if let lag { za = ZoomLag.at(w.setLog, m.a - lag); zb = ZoomLag.at(w.setLog, m.b - lag) } else { za = ZoomLag.hist(w.hist, m.a); zb = ZoomLag.hist(w.hist, m.b) }
+      if let fit { za = ZoomLag.model(w.setLog, m.a, fit); zb = ZoomLag.model(w.setLog, m.b, fit) } else { za = ZoomLag.hist(w.hist, m.a); zb = ZoomLag.hist(w.hist, m.b) }
       guard let za, let zb, za > 0, zb > 0 else { continue }
       e += huber(log(m.r) - log(zb / za)); n += 1
     }
     return (n > 0 ? e / Double(n) : .infinity, n)
   }
-  static func bestLag(_ pairs: [(PairMeas, CalibWindow)]) -> (Double, Double, Int)? {
-    var curve: [(Double, Double, Int)] = []
+  static func bestFit(_ pairs: [(PairMeas, CalibWindow)]) -> (ZoomFit, Double, Int)? { search { lagError(pairs, $0) } }
+  // busca: 1) só trava (τ = 0), meio da faixa equivalente; 2) com suavização perto dela — só fica com suavização se ela
+  // explica as medidas CLARAMENTE melhor (≥10%), pra não inventar suavização com ruído; 3) refino
+  static func search(_ errAt: (ZoomFit) -> (Double, Int)) -> (ZoomFit, Double, Int)? {
+    var c0: [(Double, Double, Int)] = []
     var lag = -0.10
-    while lag <= 0.1201 { let r = lagError(pairs, lag); if r.1 > 0 { curve.append((lag, r.0, r.1)) }; lag += 0.002 }
-    return plateauCenter(curve)
+    while lag <= 0.1201 { let r = errAt(ZoomFit(lag: lag, tau: 0)); if r.1 > 0 { c0.append((lag, r.0, r.1)) }; lag += 0.002 }
+    guard let b0 = plateauCenter(c0) else { return nil }
+    var best = (ZoomFit(lag: b0.0, tau: 0), b0.1, b0.2)
+    for tau in [0.015, 0.03, 0.045, 0.06, 0.09] {
+      var c: [(Double, Double, Int)] = []
+      var l = b0.0 - 0.07
+      while l <= b0.0 + 0.0201 { let r = errAt(ZoomFit(lag: l, tau: tau)); if r.1 > 0 { c.append((l, r.0, r.1)) }; l += 0.004 }
+      if let m = plateauCenter(c), m.1 < best.1 * (best.0.tau > 0 ? 1 : 0.9) { best = (ZoomFit(lag: m.0, tau: tau), m.1, m.2) }
+    }
+    if best.0.tau > 0 {
+      for dl in stride(from: -0.004, through: 0.0041, by: 0.001) { for dt in [-0.007, 0, 0.007] {
+        let f = ZoomFit(lag: best.0.lag + dl, tau: max(0.005, best.0.tau + dt)); let r = errAt(f)
+        if r.1 > 0 && r.0 < best.1 { best = (f, r.0, r.1) }
+      } }
+    }
+    return best
   }
   // várias travas dão EXATAMENTE os mesmos quadros (o valor posto só entra no próximo quadro que a trava alcança): erro
   // igual numa faixa. Escolhe o MEIO da faixa do mínimo — o mais longe das bordas, onde o jitter de entrega troca o quadro.
@@ -227,11 +259,11 @@ enum ZoomCalibMath {
   // VERIFICAÇÃO em janelas que NÃO entraram no ajuste: nos pares de quadros estabilizados vizinhos, quanto a razão medida
   // na imagem foge da prevista pela trava (nova) e pela conta antiga. Parados (nenhuma prevê mudança) = ruído da medida.
   // Liga só se a nova erra bem menos que a antiga e o maior erro dela fica no nível do ruído (sem salto na tela).
-  static func verify(_ ws: [CalibWindow], lag: Double) -> (ok: Bool, eNew: Double, eOld: Double, maxNew: Double, maxOld: Double, floor: Double, n: Int) {
+  static func verify(_ ws: [CalibWindow], fit: ZoomFit) -> (ok: Bool, eNew: Double, eOld: Double, maxNew: Double, maxOld: Double, floor: Double, n: Int) {
     var rn: [Double] = [], ro: [Double] = [], still: [Double] = []
     for w in ws {
       for m in neighborRatios(w.stab, from: w.tFirst - 0.3, to: w.tLast + 0.9) where m.conf >= 0.04 {
-        guard let na = ZoomLag.at(w.setLog, m.a - lag), let nb = ZoomLag.at(w.setLog, m.b - lag), let oa = ZoomLag.hist(w.hist, m.a), let ob = ZoomLag.hist(w.hist, m.b),
+        guard let na = ZoomLag.model(w.setLog, m.a, fit), let nb = ZoomLag.model(w.setLog, m.b, fit), let oa = ZoomLag.hist(w.hist, m.a), let ob = ZoomLag.hist(w.hist, m.b),
           na > 0, nb > 0, oa > 0, ob > 0 else { continue }
         let pn = log(nb / na), po = log(ob / oa), mr = log(m.r)
         if abs(pn) < 1e-6 && abs(po) < 1e-6 { still.append(mr) } else { rn.append(mr - pn); ro.append(mr - po) }
@@ -265,57 +297,53 @@ enum ZoomCalibMath {
     return GestureSample(pairs: pairs, setLog: sl, hist: hist.filter { $0.0 >= a && $0.0 <= b }, tFirst: tFirst, tLast: tLast)
   }
   // resíduos (medido − previsto) com a trava e com a conta antiga; parados = nenhum dos dois prevê mudança
-  static func residuals(_ g: GestureSample, lag: Double) -> (new: [Double], old: [Double], still: [Double]) {
+  static func residuals(_ g: GestureSample, fit: ZoomFit) -> (new: [Double], old: [Double], still: [Double]) {
     var rn: [Double] = [], ro: [Double] = [], st: [Double] = []
     for m in g.pairs {
-      guard let na = ZoomLag.at(g.setLog, m.a - lag), let nb = ZoomLag.at(g.setLog, m.b - lag), let oa = ZoomLag.hist(g.hist, m.a), let ob = ZoomLag.hist(g.hist, m.b),
+      guard let na = ZoomLag.model(g.setLog, m.a, fit), let nb = ZoomLag.model(g.setLog, m.b, fit), let oa = ZoomLag.hist(g.hist, m.a), let ob = ZoomLag.hist(g.hist, m.b),
         na > 0, nb > 0, oa > 0, ob > 0 else { continue }
       let pn = log(nb / na), po = log(ob / oa), mr = log(m.r)
       if abs(pn) < 1e-6 && abs(po) < 1e-6 { st.append(mr) } else { rn.append(mr - pn); ro.append(mr - po) }
     }
     return (rn, ro, st)
   }
-  static func bestLag(_ gs: [GestureSample]) -> (Double, Double, Int)? {
-    var curve: [(Double, Double, Int)] = []
-    var lag = -0.10
-    while lag <= 0.1201 {
+  static func bestFit(_ gs: [GestureSample]) -> (ZoomFit, Double, Int)? {
+    search { f in
       var e = 0.0, n = 0
       for g in gs { for m in g.pairs {
-        guard let za = ZoomLag.at(g.setLog, m.a - lag), let zb = ZoomLag.at(g.setLog, m.b - lag), za > 0, zb > 0 else { continue }
+        guard let za = ZoomLag.model(g.setLog, m.a, f), let zb = ZoomLag.model(g.setLog, m.b, f), za > 0, zb > 0 else { continue }
         e += huber(log(m.r) - log(zb / za)); n += 1
       } }
-      if n > 0 { curve.append((lag, e / Double(n), n)) }
-      lag += 0.002
+      return (n > 0 ? e / Double(n) : .infinity, n)
     }
-    return plateauCenter(curve)
   }
-  static func moving(_ g: GestureSample) -> Int { residuals(g, lag: 0.02).new.count }
+  static func moving(_ g: GestureSample) -> Int { residuals(g, fit: ZoomFit(lag: 0.02, tau: 0)).new.count }
   // decisão: validação cruzada (deixa um gesto de fora, ajusta nos outros, mede no de fora); liga só se a nova erra bem
   // menos que a antiga nos gestos de fora, o maior erro dela fica no nível do ruído e a trava é a mesma em todos
-  static func decide(_ gs0: [GestureSample]) -> (lag: Double?, txt: String) {
-    let gs = gs0.filter { moving($0) >= 6 }
+  static func decide(_ gs0: [GestureSample]) -> (fit: ZoomFit?, txt: String) {
+    let gs = Array(gs0.filter { moving($0) >= 6 }.suffix(6))
     guard gs.count >= 3 else { return (nil, "gestos úteis \(gs.count)/3") }
     var rn: [Double] = [], ro: [Double] = [], st: [Double] = [], lags: [Double] = []
     for i in 0..<gs.count {
       var rest = gs; rest.remove(at: i)
-      guard let f = bestLag(rest) else { continue }
-      lags.append(f.0)
-      let r = residuals(gs[i], lag: f.0); rn += r.new; ro += r.old; st += r.still
+      guard let f = bestFit(rest) else { continue }
+      lags.append(f.0.lag + f.0.tau)   // atraso efetivo (trava + suavização) tem que bater entre as dobras
+      let r = residuals(gs[i], fit: f.0); rn += r.new; ro += r.old; st += r.still
     }
     func ms(_ v: [Double]) -> Double { v.isEmpty ? .infinity : v.reduce(0) { $0 + $1 * $1 } / Double(v.count) }
     let floor = st.count >= 5 ? ms(st).squareRoot() : 0.002
     let eN = ms(rn), eO = ms(ro), mN = rn.map { abs($0) }.max() ?? .infinity, mO = ro.map { abs($0) }.max() ?? .infinity
     let spread = (lags.max() ?? 0) - (lags.min() ?? 0)
-    guard let g = bestLag(gs) else { return (nil, "sem ajuste") }
+    guard let g = bestFit(gs) else { return (nil, "sem ajuste") }
     let ok = rn.count >= 30 && eN <= 0.7 * eO && quiet(rn, floor) && spread <= 0.012
-    let txt = String(format: "gestos %d pares %d | trava %+.0fms (dobras %+.0f…%+.0f) | erro nova %.2e antiga %.2e | maior nova %.2f%% antiga %.2f%% | ruído %.2f%%",
-                     gs.count, rn.count, g.0 * 1000, (lags.min() ?? 0) * 1000, (lags.max() ?? 0) * 1000, eN, eO, mN * 100, mO * 100, floor * 100)
+    let txt = String(format: "gestos %d pares %d | %@ (dobras %+.0f…%+.0f) | erro nova %.2e antiga %.2e | maior nova %.2f%% antiga %.2f%% | ruído %.2f%%",
+                     gs.count, rn.count, g.0.text, (lags.min() ?? 0) * 1000, (lags.max() ?? 0) * 1000, eN, eO, mN * 100, mO * 100, floor * 100)
     return (ok ? g.0 : nil, (ok ? "LIGA " : "ainda não ") + txt)
   }
   // vigia depois de ligada: nos gestos recentes, a trava ainda erra menos que a conta antiga?
-  static func stillGood(_ gs: [GestureSample], lag: Double) -> (ok: Bool, n: Int, eNew: Double, eOld: Double) {
+  static func stillGood(_ gs: [GestureSample], fit: ZoomFit) -> (ok: Bool, n: Int, eNew: Double, eOld: Double) {
     var rn: [Double] = [], ro: [Double] = []
-    for g in gs { let r = residuals(g, lag: lag); rn += r.new; ro += r.old }
+    for g in gs { let r = residuals(g, fit: fit); rn += r.new; ro += r.old }
     func ms(_ v: [Double]) -> Double { v.isEmpty ? 0 : v.reduce(0) { $0 + $1 * $1 } / Double(v.count) }
     let eN = ms(rn), eO = ms(ro)
     return (rn.count < 30 || eN <= eO, rn.count, eN, eO)

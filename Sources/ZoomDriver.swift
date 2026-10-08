@@ -38,15 +38,10 @@ final class ZoomDriver: @unchecked Sendable {
     if setLog.last?.1 != Double(z) { setLog.append((now, Double(z))); if setLog.count > 1200 { setLog.removeFirst(setLog.count - 1200) } }
     lock.unlock()
   }
-  // zoom que o quadro captado em p carrega: último valor posto até p − lag (nil = sem registro cobrindo esse quadro)
-  func zoom(forFrame p: Double, lag: Double) -> Double? {
+  // zoom que o quadro captado em p carrega pelo registro (trava + suavização calibradas; nil = sem registro cobrindo)
+  func zoom(forFrame p: Double, fit: ZoomFit) -> Double? {
     lock.lock(); defer { lock.unlock() }
-    let t = p - lag
-    guard let first = setLog.first, t >= first.0 else { return nil }
-    var lo = 0, hi = setLog.count - 1
-    if setLog[hi].0 <= t { return setLog[hi].1 }
-    while hi - lo > 1 { let mid = (lo + hi) / 2; if setLog[mid].0 <= t { lo = mid } else { hi = mid } }
-    return setLog[lo].1
+    return ZoomLag.model(setLog, p, fit)
   }
   var lastSet: (Double, Double)? { lock.lock(); defer { lock.unlock() }; return setLog.last }
   func setLogSnapshot() -> [(Double, Double)] { lock.lock(); defer { lock.unlock() }; return setLog }

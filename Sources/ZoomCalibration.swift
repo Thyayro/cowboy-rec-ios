@@ -58,7 +58,7 @@ extension NativeCamera {
     if let w = await window("clique-", { self.selectZoom(1.3) }) { fitW.append(w) }
     if let w = await window("pinça+", { await pinch() }) { fitW.append(w) }
     selfTest = "Calibrando o zoom… medindo (não mexa)"
-    let fit: (lag: Double, e: Double, eOld: Double, n: Int, lagFast: Double?, txt: [String]) = await withCheckedContinuation { cont in
+    let fit: (model: ZoomFit, e: Double, eOld: Double, n: Int, fast: ZoomFit?, txt: [String]) = await withCheckedContinuation { cont in
       DispatchQueue.global(qos: .userInitiated).async {
         var all: [(PairMeas, CalibWindow)] = [], allFast: [(PairMeas, CalibWindow)] = []
         var txt: [String] = []
@@ -71,13 +71,13 @@ extension NativeCamera {
             + st.map { String(format: "%.0f:%.4f%@", ($0.b - w.tFirst) * 1000, $0.r, $0.conf >= 0.04 ? "" : "?") }.joined(separator: " ")
             + " | rápida: " + fa.map { String(format: "%.0f:%.4f%@", ($0.b - w.tFirst) * 1000, $0.r, $0.conf >= 0.04 ? "" : "?") }.joined(separator: " "))
         }
-        let bs = ZoomCalibMath.bestLag(all), bf = ZoomCalibMath.bestLag(allFast), old = ZoomCalibMath.lagError(all, nil)
-        cont.resume(returning: (bs?.0 ?? 0, bs?.1 ?? .infinity, old.0, bs?.2 ?? 0, bf?.0, txt))
+        let bs = ZoomCalibMath.bestFit(all), bf = ZoomCalibMath.bestFit(allFast), old = ZoomCalibMath.lagError(all, nil)
+        cont.resume(returning: (bs?.0 ?? ZoomFit(lag: 0, tau: 0), bs?.1 ?? .infinity, old.0, bs?.2 ?? 0, bf?.0, txt))
       }
     }
     for t in fit.txt { Diag.step("zoom-calib-janela", ["dados": String(t.prefix(7000))]) }
-    Diag.step("zoom-calib-ajuste", ["trava_ms": String(format: "%.0f", fit.lag * 1000), "erro": String(format: "%.2e", fit.e), "erro_antiga": String(format: "%.2e", fit.eOld),
-      "pares": fit.n, "trava_rapida_ms": fit.lagFast.map { String(format: "%.0f", $0 * 1000) } ?? "-"])
+    Diag.step("zoom-calib-ajuste", ["modelo": fit.model.text, "erro": String(format: "%.2e", fit.e), "erro_antiga": String(format: "%.2e", fit.eOld),
+      "pares": fit.n, "rapida": fit.fast?.text ?? "-"])
     guard fit.n >= 30, fit.e.isFinite else {
       setFrameLag(previousLag)
       Diag.step("zoom-calib", ["resultado": "SEM PROVA: pouca textura/luz", "pares": fit.n])
@@ -85,7 +85,7 @@ extension NativeCamera {
       return
     }
     // ---- 2) verificação com a trava ligada
-    setFrameLag(fit.lag)
+    setFrameLag(fit.model)
     var verW: [CalibWindow] = []
     selfTest = "Calibrando o zoom… conferindo"
     selectZoom(1.3); await sleep(2.8)
@@ -93,13 +93,13 @@ extension NativeCamera {
     selectZoom(1.3); await sleep(2.8)
     if let w = await window("pinça", { await pinch() }) { verW.append(w) }
     let v = await withCheckedContinuation { cont in
-      DispatchQueue.global(qos: .userInitiated).async { cont.resume(returning: ZoomCalibMath.verify(verW, lag: fit.lag)) }
+      DispatchQueue.global(qos: .userInitiated).async { cont.resume(returning: ZoomCalibMath.verify(verW, fit: fit.model)) }
     }
     let ok = v.ok && verW.count == 2
-    Diag.step("zoom-calib", ["resultado": ok ? "LIGADO" : "NÃO PROVOU — mantém", "trava_ms": String(format: "%.0f", fit.lag * 1000),
+    Diag.step("zoom-calib", ["resultado": ok ? "LIGADO" : "NÃO PROVOU — mantém", "modelo": fit.model.text,
       "verificacao": String(format: "pares %d | erro nova %.2e antiga %.2e | maior nova %.2f%% antiga %.2f%% | ruído %.2f%%", v.n, v.eNew, v.eOld, v.maxNew * 100, v.maxOld * 100, v.floor * 100)])
     if ok {
-      ZoomLag.save(fit.lag); setFrameLag(fit.lag)
+      ZoomLag.save(fit.model); setFrameLag(fit.model)
       await finish(String(format: "Zoom calibrado ✓ — maior erro de escala entre quadros: antes %.1f%%, agora %.1f%%", v.maxOld * 100, v.maxNew * 100))
     } else {
       setFrameLag(previousLag)
@@ -145,17 +145,17 @@ extension NativeCamera {
     autoSamples.append(g); if autoSamples.count > 12 { autoSamples.removeFirst() }
     let samples = autoSamples, current = ZoomLag.load()
     DispatchQueue.global(qos: .utility).async {
-      if let lag = current {
-        let v = ZoomCalibMath.stillGood(Array(samples.suffix(4)), lag: lag)
+      if let cur = current {
+        let v = ZoomCalibMath.stillGood(Array(samples.suffix(4)), fit: cur)
         DispatchQueue.main.async {
           if !v.ok { ZoomLag.save(nil); self.setFrameLag(nil); self.autoSamples = [] }
-          Diag.step("zoom-auto", ["resultado": v.ok ? "ligada e conferida" : "DESLIGOU (errando mais que a antiga)", "trava_ms": String(format: "%.0f", lag * 1000),
+          Diag.step("zoom-auto", ["resultado": v.ok ? "ligada e conferida" : "DESLIGOU (errando mais que a antiga)", "modelo": cur.text,
             "conferencia": String(format: "pares %d erro nova %.2e antiga %.2e", v.n, v.eNew, v.eOld)])
         }
       } else {
         let d = ZoomCalibMath.decide(samples)
         DispatchQueue.main.async {
-          if let lag = d.lag, ZoomLag.load() == nil { ZoomLag.save(lag); self.setFrameLag(lag) }
+          if let f = d.fit, ZoomLag.load() == nil { ZoomLag.save(f); self.setFrameLag(f) }
           Diag.step("zoom-auto", ["resultado": d.txt])
         }
       }

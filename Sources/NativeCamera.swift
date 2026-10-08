@@ -224,8 +224,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   var autoTimer: Timer?
   var zoomBoundaries: [Double] = []
   // prévia estabilizada: zoom de cada quadro = registro exato do ZoomDriver + trava calibrada (nil = conta antiga). Só main.
-  func setFrameLag(_ lag: Double?) {
-    if let lag { let drv = zoomDriver; renderer.frameZoom = { [weak drv] p in drv?.zoom(forFrame: p, lag: lag) } } else { renderer.frameZoom = nil }
+  func setFrameLag(_ fit: ZoomFit?) {
+    if let fit { let drv = zoomDriver; renderer.frameZoom = { [weak drv] p in drv?.zoom(forFrame: p, fit: fit) } } else { renderer.frameZoom = nil }
   }
   @Published var lensMatchOn = UserDefaults.standard.object(forKey: "lensMatch") as? Bool ?? true
   @Published var lensMatchStatus: [String: Int] = [:]
@@ -480,7 +480,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let bounds = (cam.isVirtualDevice ? cam.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue } : []) + cam.activeFormat.secondaryNativeResolutionZoomFactors.map { Double($0) }
       DispatchQueue.main.async { self.setFrameLag(ZoomLag.load()); self.zoomBoundaries = bounds; self.startZoomAutoLearn() }
       DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-        Diag.step("zoom-lag-state", ["trava_ms": ZoomLag.load().map { String(format: "%.0f", $0 * 1000) } ?? "nenhuma (conta antiga)", "previa": self.renderer.lightPreview ? "sem atraso" : "estabilizada"])
+        Diag.step("zoom-lag-state", ["trava_ms": ZoomLag.load()?.text ?? "nenhuma (conta antiga)", "previa": self.renderer.lightPreview ? "sem atraso" : "estabilizada"])
       }
       // igualar câmeras: lente ativa a cada instante (o quadro atrasado do arquivo procura a lente pelo próprio horário)
       let match = lensMatch ?? LensMatch(deviceKey: cam.deviceType.rawValue)
