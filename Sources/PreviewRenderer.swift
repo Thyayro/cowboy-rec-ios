@@ -37,6 +37,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // (ZoomLag/ZoomCalibration); nil = sem calibração aprovada: conta antiga. Só a thread da tela lê e escreve.
   let calibRec = ZoomCalibRecorder()
   let tap = PreviewTap()   // trechos do que a tela mostrou em volta de cada zoom (diagnóstico)
+  // ZOOM NA PRÉVIA ESTABILIZADA (0.7.8, medido na tela do aparelho em 5 trechos): o quadro estabilizado (o do arquivo)
+  // para LISO sozinho — sobe sem recuar, ultrapassagem ≤0,6%. Todo o vai-e-volta vinha da ampliação que mostra o zoom
+  // "na hora" sobre o quadro atrasado: o conteúdo chega ~25 ms ADIANTADO em relação ao zoom lido na tela (variando 0–35 ms
+  // de gesto pra gesto com a Extrema), e a ampliação passava do ponto 7–12%. Com o adiantamento medido: ~3,5% em média.
+  // zoomInstant = false: a tela mostra exatamente o arquivo (sem ampliação) — liso, mas o zoom aparece ~0,5 s depois.
+  var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant") as? Bool ?? true
+  static let contentLead = 0.025
   var frameZoom: ((Double) -> Double?)?
   // por quadro estabilizado desenhado: ampliação usada, a que a conta antiga daria e a hora (medição do estacionar/calibração)
   private var shownK: [(pts: Double, k: Double, kOld: Double, at: Double)] = []
@@ -90,7 +97,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     pending = buffer; pendingPTS = pts
     let nowS = CACurrentMediaTime()
     let wantStab = aligner != nil && !stabBusy && nowS >= nextStab && pts != nil
-    if wantStab { stabBusy = true; nextStab = nowS + 0.03 }
+    if wantStab { stabBusy = true; nextStab = nowS + 0.1 }   // 10/s (era 33/s: aquecia)
     var match: (pts: Double, image: CGImage)?
     if let cf = calibFast, let pts {
       if abs(cf.pts - pts) < 0.004 { match = cf; calibFast = nil } else if pts > cf.pts + 0.1 { calibFast = nil; calibBusy = false }
@@ -119,7 +126,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let now = CACurrentMediaTime()
     fastAt = now
     let wantStats = now >= nextStats && !statsBusy
-    if wantStats { nextStats = now + 0.03; statsBusy = true }
+    if wantStats { nextStats = now + 0.1; statsBusy = true }   // 10/s (era 33/s: aquecia)
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib && !cropFrozen
     if go { calibBusy = true; nextCalib = now + 0.5 }
@@ -242,7 +249,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     lock.lock()
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
     let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
-    let zFrame = pts.flatMap { zoomAt($0) }
+    let zFrame = pts.flatMap { zoomAt($0 + Self.contentLead) }   // conteúdo adiantado ~25 ms em relação ao zoom lido
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
@@ -267,9 +274,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     var image = Self.oriented(buffer, orient, mirrored: mirror)
     // ampliação = zoom pedido agora ÷ zoom do conteúdo do quadro; nunca < 1 (zoom out: o quadro como está, sem borda inventada)
     var kOld = 1.0
-    if let zNow, let zFrame, zFrame > 0 { kOld = max(1, min(6, zNow / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
+    if zoomInstant, let zNow, let zFrame, zFrame > 0 { kOld = max(1, min(6, zNow / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
     var k = kOld
-    if let zNow, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
+    if zoomInstant, let zNow, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
     if let pts { lock.lock(); shownK.append((pts, k, kOld, now)); if shownK.count > 600 { shownK.removeFirst(shownK.count - 600) }; lock.unlock() }
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)

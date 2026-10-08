@@ -189,6 +189,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var rawLog = false
   @Published var droppedFrames = 0
   @Published var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
+  @Published var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant") as? Bool ?? true
   // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
   @Published var bake709 = UserDefaults.standard.object(forKey: "bake709") as? Bool ?? true { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
   @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
@@ -439,6 +440,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let sub = CMFormatDescriptionGetMediaSubType(cam.activeFormat.formatDescription)
       if videoOut.availableVideoPixelFormatTypes.contains(sub) { videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: sub] }
       if fastOK, fastOut.availableVideoPixelFormatTypes.contains(sub) { fastOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: sub] }
+      // LEVEZA (0.7.8): a saída rápida só serve à tela e às medidas — quadro do tamanho da tela em vez do 4K inteiro
+      // (o celular esquentava e travava os outros apps)
+      if fastOK { _ = CowboyObjC.catching { self.fastOut.automaticallyConfiguresOutputBufferDimensions = false; self.fastOut.deliversPreviewSizedOutputBuffers = true } }
       // troca de lente SÓ pelo zoom (no automático o iPhone também troca sozinho por foco perto/macro e pouca luz — salto no
       // meio da tomada, com cor e luz diferentes)
       if cam.isVirtualDevice {
@@ -646,6 +650,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       } else { self.configureStabilization() }
     }
   }
+  func setZoomInstant(_ value: Bool) { UserDefaults.standard.set(value, forKey: "zoomInstant"); renderer.zoomInstant = value; publish { self.zoomInstant = value } }
   func setLightPreview(_ value: Bool) { UserDefaults.standard.set(value, forKey: "lightPreview"); renderer.lightPreview = value; publish { self.lightPreview = value } }
   func setBitrate(_ value: Int) { UserDefaults.standard.set(value, forKey: "bitrate"); publish { self.bitrateChoice = value } }
   // interface girou (retrato/deitado): a prévia acompanha; o arquivo usa o ângulo do horizonte travado ao começar
@@ -1091,7 +1096,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
   // ---- garimpo dos dados por quadro (só diagnóstico, 1× por abertura): procura um valor de zoom/recorte que o iPhone
   // anexe a cada quadro — se existir, a prévia estabilizada passa a saber o zoom EXATO de cada quadro até no escuro
-  private var metaScout = 1, metaScoutStab = 1, metaZoomLogs = 0, metaLastZoom = 0.0
+  private var metaScout = 0, metaScoutStab = 0, metaZoomLogs = 8, metaLastZoom = 0.0   // garimpo encerrado (0.7.8)
   static func flatMeta(_ sample: CMSampleBuffer, numbersOnly: Bool) -> String {
     var out: [String] = []
     func walk(_ prefix: String, _ v: Any) {

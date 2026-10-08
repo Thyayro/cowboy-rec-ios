@@ -13,6 +13,10 @@ struct NativeCameraSettings: View {
         Text("Ativa agora (arquivo): \(NativeCamera.label(camera.activeMode))").font(.caption)
         Toggle("Prévia sem atraso", isOn: Binding(get: { camera.lightPreview }, set: { camera.setLightPreview($0) }))
         Text(camera.lightPreview ? "A tela mostra a câmera em tempo real com estabilização leve (como a câmera do iPhone): zoom e troca de lente na hora. O ARQUIVO sai com a estabilização escolhida acima, no mesmo enquadramento." : "A tela mostra exatamente o quadro do arquivo (estabilização forte), com o atraso dela — inclusive no zoom.").font(.caption2)
+        if !camera.lightPreview {
+          Toggle("Zoom na hora", isOn: Binding(get: { camera.zoomInstant }, set: { camera.setZoomInstant($0) }))
+          Text(camera.zoomInstant ? "O zoom acompanha o dedo na hora. Ao parar, a escala ainda pode ajustar um pouco (a Extrema aplica o zoom com tempo variável). O arquivo não muda." : "A tela mostra exatamente o arquivo: zoom liso, sem ajuste nenhum ao parar — mas aparece ~0,5 s depois do dedo (o tempo da estabilização).").font(.caption2)
+        }
         Text("Extrema = Cinematic Extended Enhanced do iOS 18 (o modo mais forte da Apple: segura caminhada e corrida, recorta mais as bordas e atrasa um pouco a prévia). A prévia mostra o quadro já estabilizado — o mesmo que vai pro arquivo. Se o formato não tiver o modo pedido, cai pro mais forte que ele aceita, sem baixar resolução nem fps.").font(.caption2)
       }
       Section("Lente e formato reais") {

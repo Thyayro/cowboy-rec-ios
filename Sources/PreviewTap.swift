@@ -14,7 +14,7 @@ final class PreviewTap: @unchecked Sendable {
   private(set) var active = false
   private var start = 0.0, lastMove = 0.0, skip = false
   private var frames: [Frame] = []
-  private var clipsLeft = 8
+  private var clipsLeft = 3
   var allowed: () -> Bool = { false }
   var onClip: ((Data) -> Void)?
 
