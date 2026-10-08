@@ -58,10 +58,10 @@ final class PreviewEIS: @unchecked Sendable {
   }
   func reset() { prev = nil; pathX = 0; pathY = 0; smX = 0; smY = 0; lastT = 0 }
   // correção do quadro (coordenadas do sensor, fração): aplicar como deslocamento da imagem
-  func process(_ buffer: CVPixelBuffer, t: Double) -> (Double, Double) {
+  func process(_ buffer: CVPixelBuffer, t: Double, hold: Bool = false) -> (Double, Double) {
     guard let cur = Self.luma(buffer) else { return (0, 0) }
     let dt = lastT == 0 ? 1.0 / 60 : min(0.1, max(0.004, t - lastT)); lastT = t
-    if let p = prev, let s = Self.shift(cur, p) { pathX += s.0; pathY += s.1 }   // a cena andou s -> a câmera andou −s
+    if !hold, let p = prev, let s = Self.shift(cur, p) { pathX += s.0; pathY += s.1 }   // a cena andou s -> a câmera andou −s
     prev = cur
     let k = 1 - exp(-dt / 0.33)
     smX += (pathX - smX) * k; smY += (pathY - smY) * k

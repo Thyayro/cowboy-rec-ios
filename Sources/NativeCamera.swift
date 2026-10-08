@@ -471,10 +471,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       lensMatch = match; renderer.lensMatch = match
       let al = aligner ?? SwitchAligner()
       aligner = al; renderer.aligner = al
+      let rnd = renderer
       al.probe = { [weak cam] in
         guard let c = cam else { return "" }
+        let crop = rnd.displayCrop
         let lens = LensMatch.name(c.activePrimaryConstituent?.deviceType ?? c.deviceType)
-        return String(format: "L%.3f z%.3f %@ %@ e%.1f i%.0f", c.lensPosition, Double(c.videoZoomFactor), lens, c.isAdjustingFocus ? "AF" : "-", CMTimeGetSeconds(c.exposureDuration) * 1000, c.iso)
+        return String(format: "L%.3f z%.3f %@ %@ e%.1f i%.0f c%.4f", c.lensPosition, Double(c.videoZoomFactor), lens, c.isAdjustingFocus ? "AF" : "-", CMTimeGetSeconds(c.exposureDuration) * 1000, c.iso, crop)
       }
       al.onSettle = { [weak self] txt, amp in
         DispatchQueue.main.async {

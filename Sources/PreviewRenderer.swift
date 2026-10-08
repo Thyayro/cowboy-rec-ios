@@ -48,6 +48,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var shownCrop = 0.0          // corte usado na tela: segue a medida devagar (sem "ajuste" depois do zoom)
   private var shownCropAt = 0.0
   private var cropSamples: [Double] = []
+  // CORTE DA TELA FIXO (medido 08/10): recalcular o corte a cada parada do zoom fazia a imagem da tela crescer/encolher
+  // sozinha por 1–2 s ("estacionar"). Agora: 5 medidas ao abrir a câmera -> mediana -> fixo até trocar câmera/formato.
+  private var cropFrozen = false
+  var displayCrop: Double { lock.lock(); defer { lock.unlock() }; return shownCrop }
   private var calibFast: (pts: Double, image: CGImage)?
   private var calibBusy = false
   private var nextCalib = 0.0
@@ -92,7 +96,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     // estabilização própria da tela (só deslocamento; cega ao zoom) — calculada aqui, antes de mostrar
     lock.lock(); let fr = frozen; eis.margin = max(0.01, min(0.035, (crop - 1) / 2 - 0.006)); lock.unlock()
     if fr { return }
-    let corr = lightPreview ? eis.process(buffer, t: pts) : (0, 0)
+    // durante o zoom a imagem muda de tamanho: a medida de tremor erraria e depois "voltaria" — segura enquanto o zoom anda
+    lock.lock(); let zooming = CACurrentMediaTime() - lastZoomMove < 0.2; lock.unlock()
+    let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming) : (0, 0)
     lock.lock()
     if frozen { lock.unlock(); return }
     fastBuffer = buffer; fastPTS = pts; fastFresh = true; fastCorr = corr
@@ -101,8 +107,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let wantStats = now >= nextStats && !statsBusy
     if wantStats { nextStats = now + 0.03; statsBusy = true }
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
-    let go = calm && !calibBusy && now >= nextCalib
-    if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
+    let go = calm && !calibBusy && now >= nextCalib && !cropFrozen
+    if go { calibBusy = true; nextCalib = now + 0.5 }
     lock.unlock()
     if wantStats {
       let lm = lensMatch, al = aligner
@@ -169,15 +175,17 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     var c = det.squareRoot(); if c < 1 { c = 1 / c }
     guard c >= 1, c <= 1.8 else { return }
     lock.lock()
-    cropSamples.append(c); if cropSamples.count > 7 { cropSamples.removeFirst() }
+    guard !cropFrozen else { lock.unlock(); return }
+    cropSamples.append(c)
     let sorted = cropSamples.sorted(); crop = sorted[sorted.count / 2]
-    let value = crop, first = cropSamples.count == 3
+    if cropSamples.count >= 5 { cropFrozen = true }
+    let value = crop, first = cropSamples.count == 5
     lock.unlock()
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
   func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); lock.unlock() }
-  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
+  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
     if t <= first.0 { return first.1 }

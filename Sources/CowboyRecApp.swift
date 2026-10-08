@@ -116,7 +116,7 @@ struct RecorderView: View {
       Button("Agora não", role: .cancel) {}
     } message: { Text("Apoie o celular parado, apontado pra uma cena com detalhes. O app faz os zooms sozinho e mede se a imagem para quieta.") }
     .onChange(of: camera.ready) { _, ok in
-      if ok && !UserDefaults.standard.bool(forKey: "selftest_069") { UserDefaults.standard.set(true, forKey: "selftest_069"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
+      if ok && !UserDefaults.standard.bool(forKey: "selftest_070") { UserDefaults.standard.set(true, forKey: "selftest_069"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
     }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
     .task {
