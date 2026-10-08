@@ -40,7 +40,7 @@ final class ZoomDriver: @unchecked Sendable {
     if CACurrentMediaTime() - lastTickWall > 0.25 { configure(d) { d.videoZoomFactor = z } }
   }
   private var stuck = 0
-  private var stuckSent = false
+  private var lastCur: CGFloat = 0
   var onStuck: ((String) -> Void)?
   private var trace: [String] = []
   private var traceUntil = 0.0
@@ -73,10 +73,12 @@ final class ZoomDriver: @unchecked Sendable {
     }
     lock.unlock()
     let diff = log(Double(tgt / cur))
-    guard abs(diff) > 0.0006 else { stuck = 0; return }
-    if abs(diff) > 0.05 { stuck += 1 } else { stuck = 0 }
-    if stuck == 30 && !stuckSent {
-      stuckSent = true
+    guard abs(diff) > 0.0006 else { stuck = 0; lastCur = cur; return }
+    // zoom que NÃO anda: alvo longe e o zoom real parado quadro após quadro (ex.: limite digital da ultra travada)
+    if abs(diff) > 0.03 && abs(cur - lastCur) < cur * 0.0004 { stuck += 1 } else { stuck = 0 }
+    lastCur = cur
+    if stuck == 8 {
+      stuck = -60   // espera ~1 s antes de avisar de novo
       onStuck?("alvo \(tgt) atual \(cur) min \(d.minAvailableVideoZoomFactor) max \(d.maxAvailableVideoZoomFactor) rampa \(d.isRampingVideoZoom) lente \(d.activePrimaryConstituent?.deviceType.rawValue ?? "-") troca \(d.primaryConstituentDeviceSwitchingBehavior.rawValue)")
     }
     let next = clamp(d, CGFloat(exp(log(Double(cur)) + diff * (1 - exp(-dt / 0.07)))))

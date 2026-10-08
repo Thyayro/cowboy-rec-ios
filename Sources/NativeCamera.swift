@@ -488,7 +488,16 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           else { Diag.step("zoom-settle-image", ["amplitude": String(format: "%.4f", amp), "ms:escala": String(txt.prefix(2500))]) }
         }
       }
-      zoomDriver.onStuck = { txt in Diag.step("zoom-stuck", ["info": txt]) }
+      // pinça na ultra travada bateu no limite digital dela (medido 08/10: parou em ~1,4×): libera o cruzamento de lentes e o
+      // zoom continua subindo pela principal, sem "travar" o gesto
+      zoomDriver.onStuck = { [weak self] txt in
+        Diag.step("zoom-stuck", ["info": txt])
+        DispatchQueue.main.async {
+          guard let self, self.ultraLock else { return }
+          self.ultraLock = false; UserDefaults.standard.set(false, forKey: "ultraLock")
+          self.queue.async { if let c = self.device { self.applyLensLock(c) } }
+        }
+      }
       zoomDriver.onTrace = { txt in Diag.step("zoom-settle-cmd", ["zoom": String(txt.prefix(3000))]) }
       al.lensAt = { [weak match] t in match?.lens(at: t) ?? LensMatch.reference }
       al.onAlign = { stream, g, e, e0 in Diag.step("lens-align", ["stream": stream, "s": String(format: "%.4f", g.s), "tx": String(format: "%.4f", g.tx), "ty": String(format: "%.4f", g.ty), "gain": String(format: "%.2f", e0 > 0 ? 1 - e / e0 : 0)]) }
