@@ -1075,11 +1075,44 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
 
+  // ---- garimpo dos dados por quadro (só diagnóstico, 1× por abertura): procura um valor de zoom/recorte que o iPhone
+  // anexe a cada quadro — se existir, a prévia estabilizada passa a saber o zoom EXATO de cada quadro até no escuro
+  private var metaScout = 1, metaScoutStab = 1, metaZoomLogs = 0, metaLastZoom = 0.0
+  static func flatMeta(_ sample: CMSampleBuffer, numbersOnly: Bool) -> String {
+    var out: [String] = []
+    func walk(_ prefix: String, _ v: Any) {
+      if let d = v as? [String: Any] { for (k, x) in d.sorted(by: { $0.key < $1.key }) { walk(prefix.isEmpty ? k : prefix + "." + k, x) } }
+      else if let n = v as? NSNumber { out.append(prefix + "=" + n.stringValue) }
+      else if !numbersOnly {
+        if let t = v as? String { out.append(prefix + "=" + String(t.prefix(40))) }
+        else if let d = v as? Data { out.append(prefix + "=<\(d.count)B>") }
+        else if let a = v as? [Any] { out.append(prefix + "=[\(a.count)]") }
+        else { out.append(prefix + "=?") }
+      }
+    }
+    if let a = CMCopyDictionaryOfAttachments(allocator: nil, target: sample, attachmentMode: kCMAttachmentMode_ShouldPropagate) as? [String: Any] { walk("sb", a) }
+    if let a = CMCopyDictionaryOfAttachments(allocator: nil, target: sample, attachmentMode: kCMAttachmentMode_ShouldNotPropagate) as? [String: Any] { walk("sbn", a) }
+    if let pb = CMSampleBufferGetImageBuffer(sample), let a = CVBufferCopyAttachments(pb, .shouldPropagate) as? [String: Any] { walk("pb", a) }
+    return String(out.joined(separator: " ").prefix(3800))
+  }
+  private func scoutMeta(_ sample: CMSampleBuffer, fast: Bool) {
+    if !fast { if metaScoutStab > 0 { metaScoutStab -= 1; Diag.step("frame-meta", ["saida": "estabilizada", "meta": Self.flatMeta(sample, numbersOnly: false)]) }; return }
+    let z = Double(device?.videoZoomFactor ?? 0)
+    let moving = abs(z - metaLastZoom) > 1e-4; metaLastZoom = z
+    if metaScout > 0 { metaScout -= 1; Diag.step("frame-meta", ["saida": "rapida", "z": String(format: "%.4f", z), "meta": Self.flatMeta(sample, numbersOnly: false)]) }
+    else if moving && metaZoomLogs < 8 {
+      metaZoomLogs += 1
+      Diag.step("frame-meta-zoom", ["z": String(format: "%.4f", z), "pts": String(format: "%.4f", CMSampleBufferGetPresentationTimeStamp(sample).seconds),
+        "agora": String(format: "%.4f", CACurrentMediaTime()), "meta": Self.flatMeta(sample, numbersOnly: true)])
+    }
+  }
+
   // ---- quadros
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     if output === fastOut {
       let t = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
       zoomDriver.frameTick(t)   // pinça: um passo de zoom por quadro capturado
+      if metaScout > 0 || metaZoomLogs < 8 { scoutMeta(sampleBuffer, fast: true) }
       if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) { renderer.pushFast(pb, pts: t) }
       return
     }
@@ -1091,6 +1124,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    if metaScoutStab > 0 { scoutMeta(sampleBuffer, fast: false) }
     if let pixel { renderer.push(pixel, pts: pts.seconds) }
     guard let writer, !stopping else { return }
     var baked: CMSampleBuffer?

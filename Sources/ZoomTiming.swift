@@ -136,28 +136,34 @@ final class ZoomTiming: @unchecked Sendable {
   }
 
   // ---- imagem
-  // miniatura 96×54 direto do plano de luz (Y), média de 4×4 amostras por ponto (sem serrilhado), 8 ou 10 bits
+  // miniatura 96×54 direto do plano de luz (Y), média de 8×8 amostras por ponto (sem serrilhado e com pouco ruído mesmo
+  // com pouca luz), 8 ou 10 bits. Posições calculadas uma vez; a leitura em si é só carregar e somar (≈0,5 ms em 4K).
+  static let sub = 8
   static func thumb(_ buffer: CVPixelBuffer) -> [Float]? {
     guard CVPixelBufferGetPlaneCount(buffer) >= 1 else { return nil }
     CVPixelBufferLockBaseAddress(buffer, .readOnly); defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return nil }
     let W = CVPixelBufferGetWidthOfPlane(buffer, 0), H = CVPixelBufferGetHeightOfPlane(buffer, 0), row = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
-    guard W >= w * 4, H >= h * 4 else { return nil }
+    guard W >= w * sub, H >= h * sub else { return nil }
     let sixteen = LutBaker.tenBit.contains(CVPixelBufferGetPixelFormatType(buffer))
-    // posições das 4×4 amostras de cada ponto, calculadas uma vez (a leitura em si fica só carregar e somar)
     let bpp = sixteen ? 2 : 1
-    let xs = (0..<(w * 4)).map { min(W - 1, Int((Double($0) + 0.5) / 4 * Double(W) / Double(w))) * bpp }
-    let ys = (0..<(h * 4)).map { min(H - 1, Int((Double($0) + 0.5) / 4 * Double(H) / Double(h))) * row }
+    var xs = [Int](repeating: 0, count: w * sub), ys = [Int](repeating: 0, count: h * sub)
+    let fw = Double(W) / Double(w * sub), fh = Double(H) / Double(h * sub)
+    for i in 0..<(w * sub) { let px: Int = Int((Double(i) + 0.5) * fw); xs[i] = min(W - 1, px) * bpp }
+    for i in 0..<(h * sub) { let py: Int = Int((Double(i) + 0.5) * fh); ys[i] = min(H - 1, py) * row }
+    let scale: Float = (sixteen ? 1 / 65535 : 1 / 255) / Float(sub * sub)
     var out = [Float](repeating: 0, count: w * h)
     for y in 0..<h {
       for x in 0..<w {
-        var acc: Float = 0
-        for sy in 0..<4 { let ro = ys[y * 4 + sy]
-          for sx in 0..<4 {
-            let o = ro + xs[x * 4 + sx]
-            acc += sixteen ? Float(base.load(fromByteOffset: o, as: UInt16.self)) / 65535 : Float(base.load(fromByteOffset: o, as: UInt8.self)) / 255
-          } }
-        out[y * w + x] = acc / 16
+        var acc: UInt32 = 0
+        for sy in 0..<sub {
+          let ro = ys[y * sub + sy]
+          for sx in 0..<sub {
+            let o = ro + xs[x * sub + sx]
+            if sixteen { acc &+= UInt32(base.load(fromByteOffset: o, as: UInt16.self)) } else { acc &+= UInt32(base.load(fromByteOffset: o, as: UInt8.self)) }
+          }
+        }
+        out[y * w + x] = Float(acc) * scale
       }
     }
     return out
