@@ -13,6 +13,11 @@ final class ZoomDriver: @unchecked Sendable {
   private var target: CGFloat?
   private var lastTick = 0.0
   private var lastTickWall = 0.0   // quando o último quadro CHEGOU (relógio de agora)
+  // FREIO SEM TREMOR: ao soltar os dedos eles não saem juntos e a distância entre eles muda nos últimos milissegundos — o
+  // iOS entrega isso como um vai-e-volta da pinça (pior no zoom IN, dedos afastados). Inversão de direção pequena (< 4%)
+  // é ignorada; inversão de verdade (o filmmaker decidiu voltar) passa.
+  private var gestureDir: Double = 0
+  private var gestureRef: CGFloat = 0
 
   func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; lock.unlock() }
   private func clamp(_ d: AVCaptureDevice, _ z: CGFloat) -> CGFloat { max(d.minAvailableVideoZoomFactor, min(d.maxAvailableVideoZoomFactor, z)) }
@@ -24,15 +29,20 @@ final class ZoomDriver: @unchecked Sendable {
     lock.lock(); defer { lock.unlock() }
     guard let d = device else { return }
     if target == nil { configure(d) { if d.isRampingVideoZoom { d.cancelVideoZoomRamp() } } }
-    let z = clamp(d, factor)
+    var z = clamp(d, factor)
+    if let cur = target, gestureRef > 0 {
+      let step = log(Double(z / gestureRef))
+      if gestureDir != 0 && step * gestureDir < 0 && abs(step) < 0.04 { z = cur }      // tremor de soltar: segura
+      else if abs(step) > 0.004 { gestureDir = step > 0 ? 1 : -1; gestureRef = z }
+    } else { gestureRef = z; gestureDir = 0 }
     target = z
     // sem quadro há mais de 120 ms (saída parada): o gesto não pode "travar" — aplica direto
     if CACurrentMediaTime() - lastTickWall > 0.25 { configure(d) { d.videoZoomFactor = z } }
   }
-  func endFollow() {}   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
+  func endFollow() { lock.lock(); gestureDir = 0; gestureRef = 0; lock.unlock() }   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: rampa nativa única
   func glide(to factor: CGFloat, seconds: Double = 0.42) {
-    lock.lock(); target = nil; let d = device; lock.unlock()
+    lock.lock(); target = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
     guard let d else { return }
     let to = clamp(d, factor), from = d.videoZoomFactor
     let stops = abs(log2(Double(to / from)))
