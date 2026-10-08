@@ -1,5 +1,6 @@
 import AVFoundation
 import Combine
+import simd
 import CoreImage
 import QuartzCore
 import SwiftUI
@@ -460,12 +461,17 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Diag.step("preview-stab", ["asked": lightName, "active": Self.label(fc.activeVideoStabilizationMode)]) }
         if isFront, fc.isVideoRotationAngleSupported(previewAngle) { fc.videoRotationAngle = previewAngle } else if fc.isVideoRotationAngleSupported(0) { fc.videoRotationAngle = 0 }
         if fc.isVideoMirroringSupported { fc.automaticallyAdjustsVideoMirroring = false; fc.isVideoMirrored = false }
+        // zoom da tela pelo quadro: distância focal real de cada quadro (ver PreviewRenderer, 0.7.3)
+        if fc.isCameraIntrinsicMatrixDeliverySupported { _ = CowboyObjC.catching { fc.isCameraIntrinsicMatrixDeliveryEnabled = true } }
+        let intrOK = fc.isCameraIntrinsicMatrixDeliverySupported, intrOn = fc.isCameraIntrinsicMatrixDeliveryEnabled
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { Diag.step("intrinsics", ["supported": intrOK, "enabled": intrOn]) }
       }
       zoomObservation?.invalidate(); rotationObservation?.invalidate()
       device = cam; base = nativeBase; selectedProfile = chosen; requestedHDR = wantsHDR; requestedLog = wantsLog; requestedCodec = encoding; configured = true
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
+      renderer.onFxCheck = { txt in Diag.step("intrinsics-check", ["resultado": txt]) }
       // igualar câmeras: lente ativa a cada instante (o quadro atrasado do arquivo procura a lente pelo próprio horário)
       let match = lensMatch ?? LensMatch(deviceKey: cam.deviceType.rawValue)
       lensMatch = match; renderer.lensMatch = match
@@ -476,8 +482,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         guard let c = cam else { return "" }
         let crop = rnd.displayCrop, sh = rnd.displayShake
         let lens = LensMatch.name(c.activePrimaryConstituent?.deviceType ?? c.deviceType)
-        return String(format: "z%.3f %@%@ L%.3f c%.4f E%+.4f,%+.4f", Double(c.videoZoomFactor), lens, c.isRampingVideoZoom ? " R" : "", c.lensPosition, crop, sh.0, sh.1)
+        return String(format: "z%.3f %@%@ L%.3f c%.4f E%+.4f,%+.4f ", Double(c.videoZoomFactor), lens, c.isRampingVideoZoom ? " R" : "", c.lensPosition, crop, sh.0, sh.1) + rnd.fxInfo
       }
+      al.settleStream = { [weak rnd] in (rnd?.lightPreview ?? true) ? "fast" : "stab" }
+      al.displayScale = { [weak rnd] t in rnd?.displayK(at: t) }
       al.onSettle = { [weak self] txt, amp, tag in
         DispatchQueue.main.async {
           guard let self else { return }
@@ -711,7 +719,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     holdFocus(1.2); zoomDriver.endFollow()
     let user = selfTestMode.hasPrefix("VOCÊ")
     if user { userPinches += 1 }
-    aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode)
+    if !recording { aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode) }
   }
   func selectZoom(_ value: Double) {
     let toUltra = value <= 0.51
@@ -725,7 +733,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base)
         self.holdFocus(dur + 1.2)
         let tag = self.selfTestMode
-        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { self.aligner?.startSettle(CACurrentMediaTime(), tag: tag) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { if !self.recording { self.aligner?.startSettle(CACurrentMediaTime(), tag: tag) } }
       }
     }
   }
@@ -1065,12 +1073,21 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
 
+  // distância focal (px) do quadro, já com o zoom aplicado — matriz intrínseca que o iPhone anexa ao quadro
+  static func focalPixels(_ sample: CMSampleBuffer) -> Double? {
+    guard let d = CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix, attachmentModeOut: nil) as? Data,
+      d.count >= MemoryLayout<matrix_float3x3>.size else { return nil }
+    let m = d.withUnsafeBytes { $0.loadUnaligned(as: matrix_float3x3.self) }
+    let fx = Double(m.columns.0.x)
+    return fx.isFinite && fx > 1 ? fx : nil
+  }
+
   // ---- quadros
   func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     if output === fastOut {
       let t = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
       zoomDriver.frameTick(t)   // pinça: um passo de zoom por quadro capturado
-      if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) { renderer.pushFast(pb, pts: t) }
+      if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) { renderer.pushFast(pb, pts: t, fx: Self.focalPixels(sampleBuffer)) }
       return
     }
     if output === audioOut {

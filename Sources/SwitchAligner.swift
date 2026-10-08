@@ -30,7 +30,10 @@ final class SwitchAligner: @unchecked Sendable {
   // perto que o final), deslizamento em px (de 96×54) + estado da câmera. "volta" = quanto andou CONTRA o sentido de chegada.
   private var settleT0 = 0.0
   private var settleActive = false
-  private var settleFrames: [(Double, [Float], String)] = []
+  private var settleFrames: [(Double, [Float], String, Double)] = []
+  // o que a tela mostra: prévia sem atraso = quadro rápido; prévia estabilizada = quadro estabilizado × ampliação da tela
+  var settleStream: () -> String = { "fast" }
+  var displayScale: ((Double) -> Double?)?
   private var settleTag = ""
   private let settleQueue = DispatchQueue(label: "cowboy.settle", qos: .utility)
   var onSettle: ((String, Float, String) -> Void)?   // quadros, volta, etiqueta do passo
@@ -57,20 +60,28 @@ final class SwitchAligner: @unchecked Sendable {
     guard luma.count == Self.w * Self.h, let lens = lensAt?(t) else { return }
     let img = Self.normalize(luma)
     lock.lock(); let prev = last[stream]; last[stream] = (lens, t, img)
-    var done: [(Double, [Float], String)]?; let tag = settleTag
-    if stream == "fast" && settleActive && t >= settleT0 - 0.3 {
+    var done: [(Double, [Float], String, Double)]?; let tag = settleTag
+    if settleActive && stream == settleStream() && t >= settleT0 - 0.3 {
       let dt = t - settleT0
-      if dt >= 2.0 { done = settleFrames + [(dt, img, "")]; settleActive = false; settleFrames = [] }
-      else { lock.unlock(); let st = probe?() ?? ""; lock.lock(); settleFrames.append((dt, img, st)) }
+      if dt >= 2.0 { done = settleFrames + [(dt, img, "", t)]; settleActive = false; settleFrames = [] }
+      else { lock.unlock(); let st = probe?() ?? ""; lock.lock(); settleFrames.append((dt, img, st, t)) }
     }
     lock.unlock()
-    if let done, let ref = done.last?.1 {
+    if let done {
       // conta pesada fora da fila dos quadros (nunca segura quadro da câmera — 0.6.1)
+      let measured = stream, disp = displayScale
       settleQueue.async { [weak self] in
+        // tamanho na tela = tamanho no quadro × ampliação da tela (só na prévia estabilizada; quadro não desenhado fica fora)
+        let shown: [((Double, [Float], String, Double), Double)] = done.compactMap { f in
+          if measured != "stab" { return (f, 1) }
+          return disp?(f.3).map { (f, $0) }
+        }
+        guard let last = shown.last else { return }
         var parts: [String] = []; var zs: [Float] = []
-        for (i, f) in done.dropLast().enumerated() where f.0 < 1.0 || i % 3 == 0 {
-          let r = Self.scaleShiftVsRef(ref, f.1); let z = 1 / r.s; zs.append(z)
-          parts.append(String(format: "%.0f:%.4f,%.1f,%.1f", f.0 * 1000, z, r.dx, r.dy) + "[" + f.2 + "]")
+        for (i, e) in shown.dropLast().enumerated() where e.0.0 < 1.0 || i % 3 == 0 {
+          let f = e.0
+          let r = Self.scaleShiftVsRef(last.0.1, f.1); let z = 1 / r.s * Float(e.1 / last.1); zs.append(z)
+          parts.append(String(format: "%.0f:%.4f,%.1f,%.1f", f.0 * 1000, z, r.dx, r.dy) + (measured == "stab" ? String(format: ",k%.4f", e.1) : "") + "[" + f.2 + "]")
         }
         var back: Float = 0
         if let first = zs.first {
@@ -79,7 +90,7 @@ final class SwitchAligner: @unchecked Sendable {
           for z in zs { if (z - peak) * dir >= 0 { peak = z } else { back = max(back, abs(z - peak)) } }
           back = max(back, zs.map { ($0 - 1) * dir }.max() ?? 0)   // passou do final e voltou (ultrapassagem)
         }
-        self?.onSettle?(parts.joined(separator: " "), back, tag)
+        self?.onSettle?(measured + " " + parts.joined(separator: " "), back, tag)
       }
     }
     guard let prev, prev.lens != lens, t - prev.t < 0.2 else { return }

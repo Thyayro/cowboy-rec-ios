@@ -33,6 +33,23 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var fastFresh = false
   private let eis = PreviewEIS()
   private var fastCorr = (0.0, 0.0)
+  // ZOOM DA TELA PELO QUADRO (0.7.3) — prévia ESTABILIZADA ("Prévia sem atraso" desligada): o quadro estabilizado chega
+  // atrasado e a tela o amplia pro zoom de agora. Antes a ampliação era zoom PEDIDO agora ÷ zoom pedido no instante do quadro,
+  // mas o sensor aplica o zoom alguns quadros depois do pedido: no zoom in a tela ficava vários % fora do certo e, quando o
+  // quadro estabilizado alcançava, "voltava" (o vai-e-volta no freio; o zoom out não amplia, por isso ficava certo — 08/10,
+  // teste v3: o iPhone do operador estava com a prévia estabilizada). Agora: distância focal REAL de cada quadro (matriz
+  // intrínseca que o iPhone anexa a cada quadro da saída rápida, já com o zoom aplicado) -> ampliação = fx do quadro mais novo
+  // ÷ fx do quadro estabilizado (mesmo horário de captura). Parou o zoom: o fx do mais novo não muda mais, então o tamanho na
+  // tela não muda mais — o quadro estabilizado que alcança só troca ampliação por imagem real, no mesmo tamanho.
+  // Sem intrínseca, ou se ela não acompanhar o zoom (conferido sozinho em repouso), volta pra conta antiga.
+  private var fxHist: [(Double, Double)] = []
+  private var fxLatest: Double?
+  private var fxValid = true
+  private var fxChecked = false
+  private var fxRest: (z: Double, fx: Double, since: Double, done: Bool)?
+  private var fxSamples: [(Double, Double)] = []
+  var onFxCheck: ((String) -> Void)?
+  private var shownK: [(Double, Double)] = []   // ampliação usada na tela por quadro estabilizado (medição do estacionar)
   var lensMatch: LensMatch?
   var aligner: SwitchAligner?
   // NUNCA fila de medições: cada medição segura um quadro da câmera; acumuladas, os quadros acabam e a câmera para (0.6.1)
@@ -53,6 +70,49 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var cropFrozen = false
   var displayCrop: Double { lock.lock(); defer { lock.unlock() }; return shownCrop }
   var displayShake: (Double, Double) { lock.lock(); defer { lock.unlock() }; return fastCorr }
+  var fxInfo: String { lock.lock(); defer { lock.unlock() }; return fxLatest.map { String(format: "fx%.1f%@", $0, fxValid ? "" : "!") } ?? "fx-" }
+  func displayK(at t: Double) -> Double? {
+    lock.lock(); defer { lock.unlock() }
+    return shownK.last(where: { abs($0.0 - t) < 0.004 })?.1
+  }
+  private func noteFx(_ fx: Double, pts: Double) {
+    let z = zoomNow?() ?? 0
+    var report: String?
+    lock.lock()
+    if let last = fxHist.last, pts <= last.0 { fxHist.removeAll() }   // relógio voltou (câmera reconfigurada)
+    fxHist.append((pts, fx)); if fxHist.count > 900 { fxHist.removeFirst(fxHist.count - 900) }
+    fxLatest = fx
+    // conferência: em repouso (zoom e fx parados 0,5 s) guarda (zoom, fx); dois repousos com zoom ≥30% diferente têm que ter fx
+    // na mesma proporção (±12% = diferença de campo entre lentes); senão a intrínseca não acompanha o zoom e sai do jogo
+    if z > 0 {
+      if let r = fxRest, abs(r.z - z) < 1e-4, abs(r.fx - fx) < 1e-3 * fx {
+        if !r.done && pts - r.since > 0.5 {
+          fxRest = (r.z, r.fx, r.since, true)
+          for q in fxSamples where abs(log(z / q.0)) > log(1.3) {
+            let err = abs(log(fx / q.1) - log(z / q.0))
+            if err > log(1.12) {
+              if fxValid { fxValid = false; report = String(format: "FALHOU z%.3f fx%.1f × z%.3f fx%.1f — conta antiga", q.0, q.1, z, fx) }
+              break
+            } else if !fxChecked { fxChecked = true; report = String(format: "ok z%.3f fx%.1f × z%.3f fx%.1f (erro %.1f%%)", q.0, q.1, z, fx, (exp(err) - 1) * 100) }
+          }
+          fxSamples.append((z, fx)); if fxSamples.count > 8 { fxSamples.removeFirst() }
+        }
+      } else { fxRest = (z, fx, pts, false) }
+    }
+    lock.unlock()
+    if let report { onFxCheck?(report) }
+  }
+  // fx no instante de captura t (lock segurado): busca binária + interpolação (quadro descartado da saída rápida)
+  private func fxAt(_ t: Double) -> Double? {
+    guard fxValid, let first = fxHist.first, let last = fxHist.last, t >= first.0 - 0.02, t <= last.0 + 0.02 else { return nil }
+    var lo = 0, hi = fxHist.count - 1
+    while hi - lo > 1 { let mid = (lo + hi) / 2; if fxHist[mid].0 <= t { lo = mid } else { hi = mid } }
+    let a = fxHist[lo], b = fxHist[hi]
+    if t <= a.0 { return a.1 }
+    if t >= b.0 { return b.1 }
+    guard b.0 - a.0 < 0.15 else { return nil }
+    return a.1 * pow(b.1 / a.1, (t - a.0) / (b.0 - a.0))
+  }
   private var calibFast: (pts: Double, image: CGImage)?
   private var calibBusy = false
   private var nextCalib = 0.0
@@ -93,7 +153,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       }
     }
   }
-  func pushFast(_ buffer: CVPixelBuffer, pts: Double) {
+  func pushFast(_ buffer: CVPixelBuffer, pts: Double, fx: Double? = nil) {
+    if let fx { noteFx(fx, pts: pts) }
     // estabilização própria da tela (só deslocamento; cega ao zoom) — calculada aqui, antes de mostrar
     lock.lock(); let fr = frozen; eis.margin = max(0.01, min(0.035, (crop - 1) / 2 - 0.006)); lock.unlock()
     if fr { return }
@@ -185,8 +246,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); lock.unlock() }
-  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); fxHist.removeAll(); fxLatest = nil; shownK.removeAll(); lock.unlock() }
+  func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; fxRest = nil; fxSamples.removeAll(); fxValid = true; fxChecked = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
     if t <= first.0 { return first.1 }
@@ -230,6 +291,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
     let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0) }
+    let fxFrame = pts.flatMap { fxAt($0) }, fxNow = fxLatest
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
@@ -249,9 +311,17 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
-    var image = Self.oriented(buffer, orient, mirrored: mirror)
+    // troca de lente: o mesmo alinhamento deslizante que vai pro ARQUIVO (a tela mostra o quadro do arquivo)
+    var raw = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+    let geo = aligner?.geometry("stab", at: pts ?? now) ?? .identity
+    if !geo.isIdentity { raw = Self.aligned(raw, geo) }
+    var image = Self.orient(raw, orient, mirrored: mirror)
     var k = 1.0
-    if let zNow, let zFrame, zFrame > 0 { k = max(1, min(6, zNow / zFrame)); if abs(k - 1) < 0.004 { k = 1 } }   // nunca < 1
+    if let fxFrame, let fxNow, fxFrame > 0 { k = fxNow / fxFrame }          // zoom REAL do quadro (intrínseca)
+    else if let zNow, let zFrame, zFrame > 0 { k = zNow / zFrame }          // sem intrínseca: zoom pedido (conta antiga)
+    k = max(1, min(6, k)); if abs(k - 1) < 0.0005 { k = 1 }   // nunca < 1 (zoom out: o quadro como está, sem borda inventada)
+    if let pts { lock.lock(); shownK.append((pts, k)); if shownK.count > 400 { shownK.removeFirst(shownK.count - 400) }; lock.unlock() }
+    k *= Double(geo.cover)
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * scale) / 2, y: (target.height - image.extent.height * scale) / 2, width: image.extent.width * scale, height: image.extent.height * scale)
