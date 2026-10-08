@@ -200,14 +200,21 @@ enum ZoomCalibMath {
     return (n > 0 ? e / Double(n) : .infinity, n)
   }
   static func bestLag(_ pairs: [(PairMeas, CalibWindow)]) -> (Double, Double, Int)? {
-    var b: (Double, Double, Int)?
+    var curve: [(Double, Double, Int)] = []
     var lag = -0.10
-    while lag <= 0.1201 {
-      let r = lagError(pairs, lag)
-      if r.1 > 0 { if let cur = b { if r.0 < cur.1 { b = (lag, r.0, r.1) } } else { b = (lag, r.0, r.1) } }
-      lag += 0.002
-    }
-    return b
+    while lag <= 0.1201 { let r = lagError(pairs, lag); if r.1 > 0 { curve.append((lag, r.0, r.1)) }; lag += 0.002 }
+    return plateauCenter(curve)
+  }
+  // várias travas dão EXATAMENTE os mesmos quadros (o valor posto só entra no próximo quadro que a trava alcança): erro
+  // igual numa faixa. Escolhe o MEIO da faixa do mínimo — o mais longe das bordas, onde o jitter de entrega troca o quadro.
+  static func plateauCenter(_ curve: [(Double, Double, Int)]) -> (Double, Double, Int)? {
+    guard let best = curve.min(by: { $0.1 < $1.1 }), let i = curve.firstIndex(where: { $0.0 == best.0 }) else { return nil }
+    let tol = best.1 * 1.02 + 1e-9
+    var lo = i, hi = i
+    while lo > 0 && curve[lo - 1].1 <= tol { lo -= 1 }
+    while hi < curve.count - 1 && curve[hi + 1].1 <= tol { hi += 1 }
+    let mid = curve[(lo + hi) / 2]
+    return (mid.0, mid.1, mid.2)
   }
   // VERIFICAÇÃO em janelas que NÃO entraram no ajuste: nos pares de quadros estabilizados vizinhos, quanto a razão medida
   // na imagem foge da prevista pela trava (nova) e pela conta antiga. Parados (nenhuma prevê mudança) = ruído da medida.
@@ -261,7 +268,7 @@ enum ZoomCalibMath {
     return (rn, ro, st)
   }
   static func bestLag(_ gs: [GestureSample]) -> (Double, Double, Int)? {
-    var b: (Double, Double, Int)?
+    var curve: [(Double, Double, Int)] = []
     var lag = -0.10
     while lag <= 0.1201 {
       var e = 0.0, n = 0
@@ -269,10 +276,10 @@ enum ZoomCalibMath {
         guard let za = ZoomLag.at(g.setLog, m.a - lag), let zb = ZoomLag.at(g.setLog, m.b - lag), za > 0, zb > 0 else { continue }
         e += huber(log(m.r) - log(zb / za)); n += 1
       } }
-      if n > 0 { let v = e / Double(n); if let cur = b { if v < cur.1 { b = (lag, v, n) } } else { b = (lag, v, n) } }
+      if n > 0 { curve.append((lag, e / Double(n), n)) }
       lag += 0.002
     }
-    return b
+    return plateauCenter(curve)
   }
   static func moving(_ g: GestureSample) -> Int { residuals(g, lag: 0.02).new.count }
   // decisão: validação cruzada (deixa um gesto de fora, ajusta nos outros, mede no de fora); liga só se a nova erra bem
