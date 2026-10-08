@@ -147,6 +147,9 @@ enum ZoomImage {
   }
   // zoom de img relativo a ref (>1 = img mais perto) entre lo e hi, + confiança (quanto o custo sobe errando 0,6%)
   static func vsRef(_ ref: [Float], _ img: [Float], lo: Double = 0.72, hi: Double = 1.40, shift: Int = 2) -> (z: Double, conf: Float) {
+    let r = vsRefFull(ref, img, lo: lo, hi: hi, shift: shift); return (r.z, r.conf)
+  }
+  static func vsRefFull(_ ref: [Float], _ img: [Float], lo: Double = 0.72, hi: Double = 1.40, shift: Int = 2) -> (z: Double, conf: Float, resid: Float) {
     var best = (s: Float(1), dx: Float(0), dy: Float(0), e: Float.infinity)
     func t1(_ s: Float, _ dx: Float, _ dy: Float, _ step: Int) {
       let e = cost(ref, img, s, dx / Float(w), dy / Float(h), step: step); if e < best.e { best = (s, dx, dy, e) }
@@ -163,7 +166,7 @@ enum ZoomImage {
     let ep = cost(ref, img, best.s * 1.006, best.dx / Float(w), best.dy / Float(h), step: 1)
     let em = cost(ref, img, best.s / 1.006, best.dx / Float(w), best.dy / Float(h), step: 1)
     let conf = e.isFinite && e > 0 ? ((ep + em) / 2 - e) / e : 0
-    return (1 / Double(best.s), conf.isFinite ? conf : 0)
+    return (1 / Double(best.s), conf.isFinite ? conf : 0, e)
   }
 }
 
@@ -379,6 +382,7 @@ final class FastZoomTracker: @unchecked Sendable {
   private var acc = 0.0, predAcc = 0.0
   private(set) var measured = 0, guessed = 0
   private(set) var confs: [Float] = []
+  private(set) var resids: [Float] = []
   func reset() { queue.async { self.prev = nil; self.key = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.predAcc = 0; self.lock.unlock() } }
   // fila da saída rápida: só enfileira (a medida roda na fila própria, em ordem)
   func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving) } }
@@ -394,8 +398,8 @@ final class FastZoomTracker: @unchecked Sendable {
       if let k = key, pts - k.pts < 0.45 {
         let expect = exp(predAcc - k.predAcc)                      // razão prevista contra a referência
         let lo = min(1, expect, exp(acc - k.acc)) / 1.06, hi = max(1, expect, exp(acc - k.acc)) * 1.06
-        let m = ZoomImage.vsRef(k.img, img, lo: lo, hi: hi, shift: 4)
-        confs.append(m.conf); if confs.count > 400 { confs.removeFirst() }
+        let m = ZoomImage.vsRefFull(k.img, img, lo: lo, hi: hi, shift: 4)
+        confs.append(m.conf); resids.append(m.resid); if confs.count > 400 { confs.removeFirst(); resids.removeFirst() }
         if m.conf >= 0.04 && m.z > lo * 1.004 && m.z < hi / 1.004 {
           next = k.acc + log(m.z); measured += 1
           if abs(log(pred)) < 1e-6 && abs(next - acc) < 0.002 { next = acc }   // parado e dentro do ruído: parado
