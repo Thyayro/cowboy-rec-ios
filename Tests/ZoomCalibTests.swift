@@ -50,6 +50,8 @@ final class Scene {
   }
 }
 
+var softFail = false
+func soft(_ ok: Bool, _ msg: String) { print((ok ? "OK   " : "RUIM ") + msg); if !ok { softFail = true } }
 func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { print("FALHA " + msg); exit(1) } }
 
 @main struct ZoomCalibTests {
@@ -259,6 +261,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     // (5) ZOOM REAL MEDIDO NA SAÍDA RÁPIDA (0.7.9): o iPhone aplica o zoom ADIANTADO em relação ao registrado, e o
     // adiantamento VARIA por gesto (0–35 ms, medido na tela do aparelho). A conta da 0.7.8 (registrado + 25 ms) erra nos
     // extremos; o rastreador mede o zoom real nos quadros rápidos e a tela tem que parar quieta. No escuro: não pode piorar.
+    for useKey in [false, true] { print(useKey ? "   --- medindo contra REFERÊNCIA" : "   --- medindo contra o VIZINHO")
     for (lead, contrast) in [(0.0, 1.0), (0.018, 1.0), (0.035, 1.0), (0.035, 0.25)] {
       for kind in ["clique", "pinça"] {
         let fps = 60.0, L = 0.55, z0 = 2.6, z1 = 3.4, T0 = 0.6
@@ -276,7 +279,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         var tEnd = T0 + 0.2
         while tEnd < 6 && abs(zProp(tEnd + 0.05) / zProp(tEnd) - 1) > 1e-6 { tEnd += 1 / fps }
         func content(_ p: Double) -> Double { zProp(p + lead) }
-        let track = FastZoomTracker()
+        let track = FastZoomTracker(); track.useKey = useKey
         var hist: [(Double, Double)] = []
         var fi = 0, lastShown = -1.0
         var newN: [Double] = [], oldN: [Double] = []
@@ -314,7 +317,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         let cs = track.confs.sorted()
         let rs = track.resids.sorted()
         if !cs.isEmpty { print(String(format: "     medida (contraste %.2f, %@): confiança mediana %.3f | resíduo mín %.3f mediana %.3f máx %.3f", contrast, kind, cs[cs.count / 2], rs.first!, rs[rs.count / 2], rs.last!)) }
-        if dn > 0.009 || dn > dO + 0.004 {   // diagnóstico: erro do medidor contra o zoom verdadeiro, por quadro rápido
+        if false {   // diagnóstico: erro do medidor contra o zoom verdadeiro, por quadro rápido
           var line: [String] = []
           var p = T0 - 0.1
           while p < tEnd + 0.2 {
@@ -325,12 +328,14 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
           print("     tela depois de parar (ms: tamanho/final): " + dbg.prefix(45).joined(separator: " "))
         }
         if contrast >= 0.5 {
-          check(dn <= 0.01, String(format: "zoom medido, adiantamento %.0f ms, %@: tela REAL depois de parar — medido %.2f%% × conta da 0.7.8 %.2f%% (medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
+          soft(dn <= 0.01, String(format: "zoom medido, adiantamento %.0f ms, %@: tela REAL depois de parar — medido %.2f%% × conta da 0.7.8 %.2f%% (medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
         } else {
-          check(dn <= max(dO + 0.005, 0.01), String(format: "zoom medido NO ESCURO, adiantamento %.0f ms, %@: tela %.2f%% × conta da 0.7.8 %.2f%% (não pode piorar; medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
+          soft(dn <= max(dO + 0.005, 0.01), String(format: "zoom medido NO ESCURO, adiantamento %.0f ms, %@: tela %.2f%% × conta da 0.7.8 %.2f%% (não pode piorar; medidos %d, estimados %d)", lead * 1000, kind, dn * 100, dO * 100, c.0, c.1))
         }
       }
     }
+    }
+    if softFail { print("FALHA (comparação dos medidores)"); exit(1) }
     print("TESTE DO ZOOM OK")
   }
 }

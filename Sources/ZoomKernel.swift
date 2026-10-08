@@ -380,6 +380,7 @@ final class FastZoomTracker: @unchecked Sendable {
   private var key: (pts: Double, img: [Float], acc: Double, predAcc: Double)?
   private var chain: [(Double, Double)] = []   // (pts, log do zoom real acumulado)
   private var acc = 0.0, predAcc = 0.0
+  var useKey = true   // medir contra quadro de referência (true) ou contra o vizinho (false)
   private(set) var measured = 0, guessed = 0
   private(set) var confs: [Float] = []
   private(set) var resids: [Float] = []
@@ -404,7 +405,7 @@ final class FastZoomTracker: @unchecked Sendable {
           next = k.acc + log(m.z); measured += 1
           if abs(log(pred)) < 1e-6 && abs(next - acc) < 0.002 { next = acc }   // parado e dentro do ruído: parado
         } else { guessed += 1 }
-        if abs(next - k.acc) > log(1.08) || pts - k.pts > 0.3 { key = (pts, img, next, predAcc) }
+        if !useKey || abs(next - k.acc) > log(1.08) || pts - k.pts > 0.3 { key = (pts, img, next, predAcc) }
       } else { key = (pts, img, next, predAcc) }
     } else if !moving { key = nil }
     acc = next
