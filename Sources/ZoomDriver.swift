@@ -23,7 +23,10 @@ final class ZoomDriver: @unchecked Sendable {
     lock.lock(); defer { lock.unlock() }
     guard let d = device else { return }
     if target == nil { configure(d) { if d.isRampingVideoZoom { d.cancelVideoZoomRamp() } } }
-    target = clamp(d, factor)
+    let z = clamp(d, factor)
+    target = z
+    // sem quadro há mais de 120 ms (saída parada): o gesto não pode "travar" — aplica direto
+    if CACurrentMediaTime() - lastTick > 0.12 { configure(d) { d.videoZoomFactor = z } }
   }
   func endFollow() {}   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: rampa nativa única

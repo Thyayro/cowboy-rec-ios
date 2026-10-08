@@ -32,6 +32,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
   private var fastFresh = false
   var lensMatch: LensMatch?
+  var aligner: SwitchAligner?
+  // NUNCA fila de medições: cada medição segura um quadro da câmera; acumuladas, os quadros acabam e a câmera para (0.6.1)
+  private var statsBusy = false
+  private var stabBusy = false
+  private var nextStab = 0.0
+  private let statsQueue = DispatchQueue(label: "cowboy.preview.stats", qos: .utility)
+  private let stabQueue = DispatchQueue(label: "cowboy.preview.stab", qos: .utility)
   var blackBorder: (() -> Void)?
   private var nextStats = 0.0
   private var fastAt = 0.0
@@ -61,12 +68,21 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if frozen { lock.unlock(); return }
     if dropFrames > 0 { dropFrames -= 1; lock.unlock(); return }
     pending = buffer; pendingPTS = pts
+    let nowS = CACurrentMediaTime()
+    let wantStab = aligner != nil && !stabBusy && nowS >= nextStab && pts != nil
+    if wantStab { stabBusy = true; nextStab = nowS + 0.03 }
     var match: (pts: Double, image: CGImage)?
     if let cf = calibFast, let pts {
       if abs(cf.pts - pts) < 0.004 { match = cf; calibFast = nil } else if pts > cf.pts + 0.1 { calibFast = nil; calibBusy = false }
     }
     lock.unlock()
     if let match { calibQueue.async { self.register(stabilized: buffer, fast: match.image) } }
+    if wantStab, let pts, let al = aligner {
+      stabQueue.async {
+        if let r = self.sample(buffer, cube: false) { al.feed("stab", t: pts, luma: r.luma) }
+        self.lock.lock(); self.stabBusy = false; self.lock.unlock()
+      }
+    }
   }
   func pushFast(_ buffer: CVPixelBuffer, pts: Double) {
     lock.lock()
@@ -74,24 +90,32 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     fastBuffer = buffer; fastPTS = pts; fastFresh = true
     let now = CACurrentMediaTime()
     fastAt = now
-    let wantStats = now >= nextStats
-    if wantStats { nextStats = now + 0.03 }
+    let wantStats = now >= nextStats && !statsBusy
+    if wantStats { nextStats = now + 0.03; statsBusy = true }
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib
     if go { calibBusy = true; nextCalib = now + (cropSamples.count < 3 ? 0.6 : 3) }
     lock.unlock()
-    if wantStats { let lm = lensMatch; calibQueue.async { if let st = self.stats(buffer), let lm, lm.enabled { lm.observe(st, at: pts) } } }
+    if wantStats {
+      let lm = lensMatch, al = aligner
+      statsQueue.async {
+        if let r = self.sample(buffer, cube: true) {
+          if let lm, lm.enabled { lm.observe(r.stats, at: pts) }
+          al?.feed("fast", t: pts, luma: r.luma)
+        }
+        self.lock.lock(); self.statsBusy = false; self.lock.unlock()
+      }
+    }
     if go { calibQueue.async { if let img = self.small(buffer) { self.lock.lock(); self.calibFast = (pts, img); self.lock.unlock() } else { self.lock.lock(); self.calibBusy = false; self.lock.unlock() } } }
   }
-  // cor/luz do quadro como sai na tela (depois do LUT, antes da correção): média RGB e luz em p20/p80
-  private func stats(_ buffer: CVPixelBuffer) -> FrameStats? {
+  // quadro pequeno 96×54 (orientação do sensor): cor/luz (depois do LUT, antes da correção) + luma pro alinhamento
+  private func sample(_ buffer: CVPixelBuffer, cube useCube: Bool) -> (stats: FrameStats, luma: [Float])? {
     var img = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
-    let w = 64.0, sc = w / max(1, img.extent.width)
-    img = img.transformed(by: CGAffineTransform(scaleX: sc, y: sc))
+    let W = SwitchAligner.w, H = Int((Double(W) * img.extent.height / max(1, img.extent.width)).rounded())
+    guard H > 4 else { return nil }
+    img = img.transformed(by: CGAffineTransform(scaleX: CGFloat(W) / img.extent.width, y: CGFloat(H) / img.extent.height))
     img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
-    let (cube, size) = currentCube(); img = Self.filtered(img, cube: cube, size: size)
-    let W = Int(img.extent.width), H = Int(img.extent.height)
-    guard W > 4, H > 4 else { return nil }
+    if useCube { let (cube, size) = currentCube(); img = Self.filtered(img, cube: cube, size: size) }
     var bytes = [UInt8](repeating: 0, count: W * H * 4)
     context.render(img, toBitmap: &bytes, rowBytes: W * 4, bounds: CGRect(x: 0, y: 0, width: W, height: H), format: .RGBA8, colorSpace: nil)
     var sum = SIMD3<Float>(0, 0, 0); var lum = [Float](); lum.reserveCapacity(W * H)
@@ -99,13 +123,14 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       let c = SIMD3<Float>(Float(bytes[i]), Float(bytes[i + 1]), Float(bytes[i + 2])) / 255
       sum += c; lum.append(c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722)
     }
+    let luma = lum
     // detector de BORDA PRETA no quadro em tempo real (estabilizador entortando a imagem durante o zoom?)
     var ring: Float = 0, rn: Float = 0
     for y in 0..<H { for x in 0..<W where x < 2 || y < 2 || x >= W - 2 || y >= H - 2 { let i = (y * W + x) * 4; ring += (Float(bytes[i]) + Float(bytes[i + 1]) + Float(bytes[i + 2])) / 765; rn += 1 } }
     let inner = (sum * SIMD3<Float>(0.2126, 0.7152, 0.0722)).sum() / Float(W * H)
     if rn > 0, ring / rn < 0.015, inner > 0.08 { blackBorder?() }
     lum.sort()
-    return FrameStats(mean: sum / Float(W * H), p25: lum[lum.count / 4], p75: lum[lum.count * 3 / 4])
+    return (FrameStats(mean: sum / Float(W * H), p25: lum[lum.count / 4], p75: lum[lum.count * 3 / 4]), luma)
   }
   static func matched(_ image: CIImage, _ m: LensCorrection) -> CIImage {
     if m.isIdentity { return image }
@@ -161,7 +186,18 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     return filter.outputImage ?? image
   }
   static func oriented(_ buffer: CVPixelBuffer, _ orientation: CGImagePropertyOrientation, mirrored: Bool) -> CIImage {
-    var image = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()]).oriented(orientation)
+    orient(CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()]), orientation, mirrored: mirrored)
+  }
+  // alinhamento da troca de lente no quadro do sensor: escala s no centro + deslocamento t (y do sensor pra baixo = −y no CI)
+  static func aligned(_ image: CIImage, _ g: SwitchGeometry) -> CIImage {
+    let e = image.extent, cx = e.midX, cy = e.midY
+    var t = CGAffineTransform(translationX: -cx, y: -cy)
+    t = t.concatenating(CGAffineTransform(scaleX: CGFloat(g.s), y: CGFloat(g.s)))
+    t = t.concatenating(CGAffineTransform(translationX: cx + CGFloat(g.tx) * e.width, y: cy - CGFloat(g.ty) * e.height))
+    return image.clampedToExtent().transformed(by: t).cropped(to: e)
+  }
+  static func orient(_ source: CIImage, _ orientation: CGImagePropertyOrientation, mirrored: Bool) -> CIImage {
+    var image = source.oriented(orientation)
     if mirrored { image = image.transformed(by: CGAffineTransform(scaleX: -1, y: 1)) }
     return image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
   }
@@ -176,14 +212,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let zFrame = pts.flatMap { zoomAt($0) }
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = crop
     if let a = zoomHistory.dropLast().last, let b = zoomHistory.last, abs(a.1 - b.1) > 0.0005 { lastZoomMove = now }
-    let live = lightPreview && fast != nil && now - fastAt < 0.5
+    let live = lightPreview && fast != nil
     let liveFrame: CVPixelBuffer? = live && fastFresh ? fast : nil
     let livePTS = fastPTS
     if live { fastFresh = false; pending = nil }
     lock.unlock()
     if live {
       guard let liveFrame else { return }
-      drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now) ?? .identity)
+      drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now) ?? .identity,
+        geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity)
       return
     }
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
@@ -191,7 +228,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     guard target.width > 0, target.height > 0 else { return }
     var image = Self.oriented(buffer, orient, mirrored: mirror)
     var k = 1.0
-    if let zNow, let zFrame, zFrame > 0 { k = max(0.3, min(6, zNow / zFrame)); if abs(k - 1) < 0.004 { k = 1 } }
+    if let zNow, let zFrame, zFrame > 0 { k = max(1, min(6, zNow / zFrame)); if abs(k - 1) < 0.004 { k = 1 } }   // nunca < 1
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * scale) / 2, y: (target.height - image.extent.height * scale) / 2, width: image.extent.width * scale, height: image.extent.height * scale)
@@ -201,23 +238,6 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     // Sem troca de fonte (não pula) e sem pixel inventado (não repete nem borra).
     image = image.transformed(by: CGAffineTransform(scaleX: scale * k, y: scale * k))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
-    if k < 1 {
-      if let fast {
-        var f = Self.oriented(fast, orient, mirrored: mirror)
-        let kf = (zNow != nil && zFast != nil && zFast! > 0) ? max(0.5, min(2, zNow! / zFast!)) : 1
-        let sF = min(target.width / f.extent.width, target.height / f.extent.height) * cropNow * kf
-        f = f.transformed(by: CGAffineTransform(scaleX: sF, y: sF))
-        f = f.transformed(by: CGAffineTransform(translationX: fit.midX - f.extent.midX, y: fit.midY - f.extent.midY)).cropped(to: fit)
-        let feather = max(2, min(10, image.extent.width * 0.012))
-        let mask = CIImage(color: CIColor(red: 1, green: 1, blue: 1)).cropped(to: image.extent.insetBy(dx: feather, dy: feather))
-          .applyingGaussianBlur(sigma: Double(feather) / 2).cropped(to: fit)
-        image = image.applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: f, kCIInputMaskImageKey: mask])
-      } else {
-        // sem a saída em tempo real: não inventa borda — mostra o quadro no zoom em que ele foi captado (espera o real)
-        image = Self.oriented(buffer, orient, mirrored: mirror).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
-      }
-    }
     image = image.cropped(to: fit)
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
@@ -230,14 +250,16 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     frames += 1
   }
 
-  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection) {
+  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection, geo: SwitchGeometry) {
     guard let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
-    var image = Self.oriented(buffer, orient, mirrored: mirror)
+    var raw = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+    if !geo.isIdentity { raw = Self.aligned(raw, geo) }
+    var image = Self.orient(raw, orient, mirrored: mirror)
     let fitScale = min(target.width / image.extent.width, target.height / image.extent.height)
     let fit = CGRect(x: (target.width - image.extent.width * fitScale) / 2, y: (target.height - image.extent.height * fitScale) / 2, width: image.extent.width * fitScale, height: image.extent.height * fitScale)
-    let sc = fitScale * max(1, crop)
+    let sc = fitScale * max(1, crop) * Double(geo.cover)
     image = image.transformed(by: CGAffineTransform(scaleX: sc, y: sc))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY)).cropped(to: fit)
     image = Self.matched(Self.filtered(image, cube: cube, size: size), match).cropped(to: fit)

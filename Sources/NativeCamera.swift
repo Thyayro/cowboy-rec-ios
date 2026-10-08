@@ -201,6 +201,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   func setNoise(_ l: NoiseReducer.Level) { noise.setLevel(l); noiseLevel = l; UserDefaults.standard.set(l.rawValue, forKey: "noise"); Diag.step("noise", ["level": l.label], send: false) }
   private var constituentObservation: NSKeyValueObservation?
   private(set) var lensMatch: LensMatch?
+  private var aligner: SwitchAligner?
   @Published var lensMatchOn = UserDefaults.standard.object(forKey: "lensMatch") as? Bool ?? true
   @Published var lensMatchStatus: [String: Int] = [:]
   // parar na hora: o toque derruba a gravação imediatamente (quadros que chegarem depois não entram)
@@ -424,6 +425,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // igualar câmeras: lente ativa a cada instante (o quadro atrasado do arquivo procura a lente pelo próprio horário)
       let match = lensMatch ?? LensMatch(deviceKey: cam.deviceType.rawValue)
       lensMatch = match; renderer.lensMatch = match
+      let al = aligner ?? SwitchAligner()
+      aligner = al; renderer.aligner = al
+      al.lensAt = { [weak match] t in match?.lens(at: t) ?? LensMatch.reference }
+      al.onAlign = { stream, g, e, e0 in Diag.step("lens-align", ["stream": stream, "s": String(format: "%.4f", g.s), "tx": String(format: "%.4f", g.tx), "ty": String(format: "%.4f", g.ty), "gain": String(format: "%.2f", e0 > 0 ? 1 - e / e0 : 0)]) }
       match.motion = { MotionHub.shared.rotationSpeed() }
       var lastBorderDiag = 0.0
       renderer.blackBorder = { [weak cam] in
@@ -900,7 +905,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     guard let writer, !stopping else { return }
     var baked: CMSampleBuffer?
     if let recBaker {
-      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds) ?? .identity)
+      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds) ?? .identity, geo: aligner?.geometry("stab", at: pts.seconds) ?? .identity)
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)
