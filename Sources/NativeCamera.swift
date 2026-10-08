@@ -217,6 +217,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private var selfTestResults: [String: [Float]] = [:]
   private var selfTestMode = ""
   var calibrating = false   // calibração do zoom rodando: sem medição do estacionar em paralelo (CPU)
+  // aprendizado da trava nos zooms do uso normal (ZoomCalibration.swift) — só na thread principal
+  var autoSamples: [GestureSample] = []
+  var autoWindow: Double?
+  var autoHandled = 0.0
+  var autoTimer: Timer?
+  var zoomBoundaries: [Double] = []
   // prévia estabilizada: zoom de cada quadro = registro exato do ZoomDriver + trava calibrada (nil = conta antiga). Só main.
   func setFrameLag(_ lag: Double?) {
     if let lag { let drv = zoomDriver; renderer.frameZoom = { [weak drv] p in drv?.zoom(forFrame: p, lag: lag) } } else { renderer.frameZoom = nil }
@@ -471,7 +477,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
-      DispatchQueue.main.async { self.setFrameLag(ZoomLag.load()) }
+      let bounds = (cam.isVirtualDevice ? cam.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue } : []) + cam.activeFormat.secondaryNativeResolutionZoomFactors.map { Double($0) }
+      DispatchQueue.main.async { self.setFrameLag(ZoomLag.load()); self.zoomBoundaries = bounds; self.startZoomAutoLearn() }
       DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
         Diag.step("zoom-lag-state", ["trava_ms": ZoomLag.load().map { String(format: "%.0f", $0 * 1000) } ?? "nenhuma (conta antiga)", "previa": self.renderer.lightPreview ? "sem atraso" : "estabilizada"])
       }
@@ -722,7 +729,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     holdFocus(1.2); zoomDriver.endFollow()
     let user = selfTestMode.hasPrefix("VOCÊ")
     if user { userPinches += 1 }
-    if !recording && !calibrating { aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode) }
+    if !recording && !calibrating && !selfTestMode.isEmpty { aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode) }
   }
   func selectZoom(_ value: Double) {
     let toUltra = value <= 0.51
@@ -736,7 +743,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base)
         self.holdFocus(dur + 1.2)
         let tag = self.selfTestMode
-        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { if !self.recording && !self.calibrating { self.aligner?.startSettle(CACurrentMediaTime(), tag: tag) } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + dur) { if !self.recording && !self.calibrating && !tag.isEmpty { self.aligner?.startSettle(CACurrentMediaTime(), tag: tag) } }
       }
     }
   }

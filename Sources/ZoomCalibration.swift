@@ -106,4 +106,59 @@ extension NativeCamera {
       await finish("Calibração não provou melhora — ficou como estava (resultado enviado pra análise).")
     }
   }
+
+  // ---- APRENDIZADO NO USO NORMAL (0.7.6): cada zoom do filmmaker (prévia estabilizada, sem gravar) grava as miniaturas
+  // dos quadros estabilizados daquele trecho, mede os vizinhos e guarda só as medidas. Com 3+ zooms úteis: validação
+  // cruzada (ZoomCalibMath.decide) — liga a trava sozinho quando prova. Ligada, vigia: errando mais que a antiga, desliga.
+  func startZoomAutoLearn() {
+    guard autoTimer == nil else { return }
+    autoTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.zoomAutoTick() }
+  }
+  func zoomAutoTick() {
+    let rec = renderer.calibRec
+    let busy = calibrating || recording || renderer.lightPreview || device?.position != .back
+    if busy { if autoWindow != nil { _ = rec.end(); autoWindow = nil }; return }
+    guard let last = zoomDriver.lastSet else { return }
+    let now = CACurrentMediaTime()
+    guard let start = autoWindow else {
+      if last.0 > autoHandled + 1e-6 {
+        if now - last.0 < 0.6 { rec.begin(fast: false); autoWindow = now - 0.25 } else { autoHandled = last.0 }
+      }
+      return
+    }
+    guard now - last.0 > 2.0 || now - start > 8 else { return }
+    let data = rec.end(); autoWindow = nil
+    let log = zoomDriver.setLogSnapshot(), hist = renderer.zoomHistorySnapshot()
+    let sets = log.filter { $0.0 >= start - 0.35 && $0.0 > autoHandled }
+    autoHandled = last.0
+    guard let tFirst = sets.first?.0, let tLast = sets.last?.0, data.stab.count > 20 else { return }
+    let lensAt = renderer.aligner?.lensAt ?? { _ in "" }
+    let bounds = zoomBoundaries
+    DispatchQueue.global(qos: .utility).async {
+      let g = ZoomCalibMath.sample(stab: data.stab, setLog: log, hist: hist, tFirst: tFirst, tLast: tLast, lensAt: lensAt, boundaries: bounds)
+      DispatchQueue.main.async { self.zoomAutoAdd(g) }
+    }
+  }
+  func zoomAutoAdd(_ g: GestureSample) {
+    let mv = ZoomCalibMath.moving(g)
+    guard mv >= 6 else { Diag.step("zoom-auto", ["gesto": "pouca medida (\(g.pairs.count) pares, \(mv) com zoom andando) — escuro/liso ou troca de lente"]); return }
+    autoSamples.append(g); if autoSamples.count > 12 { autoSamples.removeFirst() }
+    let samples = autoSamples, current = ZoomLag.load()
+    DispatchQueue.global(qos: .utility).async {
+      if let lag = current {
+        let v = ZoomCalibMath.stillGood(Array(samples.suffix(4)), lag: lag)
+        DispatchQueue.main.async {
+          if !v.ok { ZoomLag.save(nil); self.setFrameLag(nil); self.autoSamples = [] }
+          Diag.step("zoom-auto", ["resultado": v.ok ? "ligada e conferida" : "DESLIGOU (errando mais que a antiga)", "trava_ms": String(format: "%.0f", lag * 1000),
+            "conferencia": String(format: "pares %d erro nova %.2e antiga %.2e", v.n, v.eNew, v.eOld)])
+        }
+      } else {
+        let d = ZoomCalibMath.decide(samples)
+        DispatchQueue.main.async {
+          if let lag = d.lag, ZoomLag.load() == nil { ZoomLag.save(lag); self.setFrameLag(lag) }
+          Diag.step("zoom-auto", ["resultado": d.txt])
+        }
+      }
+    }
+  }
 }

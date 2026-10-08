@@ -155,13 +155,15 @@ enum ZoomImage {
 final class ZoomCalibRecorder: @unchecked Sendable {
   private let lock = NSLock()
   private var on = false
+  private var withFast = true
   private var fast: [(Double, [Float])] = []
   private var stab: [(Double, [Float])] = []
   var active: Bool { lock.lock(); defer { lock.unlock() }; return on }
-  func begin() { lock.lock(); on = true; fast = []; stab = []; lock.unlock() }
+  func begin(fast f: Bool = true) { lock.lock(); on = true; withFast = f; fast = []; stab = []; lock.unlock() }
   func end() -> (fast: [(Double, [Float])], stab: [(Double, [Float])]) { lock.lock(); defer { lock.unlock() }; on = false; let r = (fast, stab); fast = []; stab = []; return r }
   func feed(_ buffer: CVPixelBuffer, pts: Double, stabilized: Bool) {
-    guard active, let t = ZoomImage.thumb(buffer) else { return }
+    lock.lock(); let want = on && (stabilized || withFast); lock.unlock()
+    guard want, let t = ZoomImage.thumb(buffer) else { return }
     lock.lock(); if on { if stabilized { stab.append((pts, t)) } else { fast.append((pts, t)) } }; lock.unlock()
   }
 }
@@ -227,4 +229,87 @@ enum ZoomCalibMath {
     let ok = rn.count >= 20 && eN <= 0.7 * eO && mN <= max(3 * floor, 0.004)
     return (ok, eN, eO, mN, mO, floor, rn.count)
   }
+
+  // ---- APRENDIZADO NO USO NORMAL (0.7.6): cada zoom do filmmaker vira uma amostra só com as medidas (sem imagens)
+  static func sample(stab: [(Double, [Float])], setLog: [(Double, Double)], hist: [(Double, Double)], tFirst: Double, tLast: Double,
+                     lensAt: (Double) -> String, boundaries: [Double]) -> GestureSample {
+    // fora: perto de troca de lente (o iPhone troca ~0,6 s depois e alisa a troca por ~0,8 s) e de fronteira de modo do sensor
+    var changes: [Double] = []
+    var prevLens: String?
+    for f in stab { let l = lensAt(f.0); if let p = prevLens, p != l { changes.append(f.0) }; prevLens = l }
+    func near(_ t: Double) -> Bool {
+      if changes.contains(where: { t >= $0 - 0.05 && t <= $0 + 0.8 }) { return true }
+      let vals = setLog.filter { $0.0 >= t - 0.7 && $0.0 <= t + 0.1 }.map { $0.1 } + [ZoomLag.at(setLog, t - 0.7) ?? 0].filter { $0 > 0 }
+      guard let lo = vals.min(), let hi = vals.max() else { return false }
+      return boundaries.contains { $0 > lo * 0.999 && $0 < hi * 1.001 }
+    }
+    let pairs = neighborRatios(stab, from: tFirst - 0.3, to: tLast + 0.9).filter { $0.conf >= 0.04 && !near($0.a) && !near($0.b) }
+    let a = tFirst - 1.0, b = tLast + 1.5
+    var sl = setLog.filter { $0.0 >= a - 2 && $0.0 <= b }
+    if let before = setLog.last(where: { $0.0 < a - 2 }) { sl.insert(before, at: 0) }   // valor vigente antes do recorte
+    return GestureSample(pairs: pairs, setLog: sl, hist: hist.filter { $0.0 >= a && $0.0 <= b }, tFirst: tFirst, tLast: tLast)
+  }
+  // resíduos (medido − previsto) com a trava e com a conta antiga; parados = nenhum dos dois prevê mudança
+  static func residuals(_ g: GestureSample, lag: Double) -> (new: [Double], old: [Double], still: [Double]) {
+    var rn: [Double] = [], ro: [Double] = [], st: [Double] = []
+    for m in g.pairs {
+      guard let na = ZoomLag.at(g.setLog, m.a - lag), let nb = ZoomLag.at(g.setLog, m.b - lag), let oa = ZoomLag.hist(g.hist, m.a), let ob = ZoomLag.hist(g.hist, m.b),
+        na > 0, nb > 0, oa > 0, ob > 0 else { continue }
+      let pn = log(nb / na), po = log(ob / oa), mr = log(m.r)
+      if abs(pn) < 1e-6 && abs(po) < 1e-6 { st.append(mr) } else { rn.append(mr - pn); ro.append(mr - po) }
+    }
+    return (rn, ro, st)
+  }
+  static func bestLag(_ gs: [GestureSample]) -> (Double, Double, Int)? {
+    var b: (Double, Double, Int)?
+    var lag = -0.10
+    while lag <= 0.1201 {
+      var e = 0.0, n = 0
+      for g in gs { for m in g.pairs {
+        guard let za = ZoomLag.at(g.setLog, m.a - lag), let zb = ZoomLag.at(g.setLog, m.b - lag), za > 0, zb > 0 else { continue }
+        e += huber(log(m.r) - log(zb / za)); n += 1
+      } }
+      if n > 0 { let v = e / Double(n); if let cur = b { if v < cur.1 { b = (lag, v, n) } } else { b = (lag, v, n) } }
+      lag += 0.002
+    }
+    return b
+  }
+  static func moving(_ g: GestureSample) -> Int { residuals(g, lag: 0.02).new.count }
+  // decisão: validação cruzada (deixa um gesto de fora, ajusta nos outros, mede no de fora); liga só se a nova erra bem
+  // menos que a antiga nos gestos de fora, o maior erro dela fica no nível do ruído e a trava é a mesma em todos
+  static func decide(_ gs0: [GestureSample]) -> (lag: Double?, txt: String) {
+    let gs = gs0.filter { moving($0) >= 6 }
+    guard gs.count >= 3 else { return (nil, "gestos úteis \(gs.count)/3") }
+    var rn: [Double] = [], ro: [Double] = [], st: [Double] = [], lags: [Double] = []
+    for i in 0..<gs.count {
+      var rest = gs; rest.remove(at: i)
+      guard let f = bestLag(rest) else { continue }
+      lags.append(f.0)
+      let r = residuals(gs[i], lag: f.0); rn += r.new; ro += r.old; st += r.still
+    }
+    func ms(_ v: [Double]) -> Double { v.isEmpty ? .infinity : v.reduce(0) { $0 + $1 * $1 } / Double(v.count) }
+    let floor = st.count >= 5 ? ms(st).squareRoot() : 0.002
+    let eN = ms(rn), eO = ms(ro), mN = rn.map { abs($0) }.max() ?? .infinity, mO = ro.map { abs($0) }.max() ?? .infinity
+    let spread = (lags.max() ?? 0) - (lags.min() ?? 0)
+    guard let g = bestLag(gs) else { return (nil, "sem ajuste") }
+    let ok = rn.count >= 30 && eN <= 0.7 * eO && mN <= max(3 * floor, 0.004) && spread <= 0.012
+    let txt = String(format: "gestos %d pares %d | trava %+.0fms (dobras %+.0f…%+.0f) | erro nova %.2e antiga %.2e | maior nova %.2f%% antiga %.2f%% | ruído %.2f%%",
+                     gs.count, rn.count, g.0 * 1000, (lags.min() ?? 0) * 1000, (lags.max() ?? 0) * 1000, eN, eO, mN * 100, mO * 100, floor * 100)
+    return (ok ? g.0 : nil, (ok ? "LIGA " : "ainda não ") + txt)
+  }
+  // vigia depois de ligada: nos gestos recentes, a trava ainda erra menos que a conta antiga?
+  static func stillGood(_ gs: [GestureSample], lag: Double) -> (ok: Bool, n: Int, eNew: Double, eOld: Double) {
+    var rn: [Double] = [], ro: [Double] = []
+    for g in gs { let r = residuals(g, lag: lag); rn += r.new; ro += r.old }
+    func ms(_ v: [Double]) -> Double { v.isEmpty ? 0 : v.reduce(0) { $0 + $1 * $1 } / Double(v.count) }
+    let eN = ms(rn), eO = ms(ro)
+    return (rn.count < 30 || eN <= eO, rn.count, eN, eO)
+  }
+}
+struct GestureSample {
+  let pairs: [PairMeas]
+  let setLog: [(Double, Double)]
+  let hist: [(Double, Double)]
+  let tFirst: Double
+  let tLast: Double
 }
