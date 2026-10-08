@@ -25,23 +25,27 @@ final class SwitchAligner: @unchecked Sendable {
   private var transitions: [String: [(t0: Double, lens: String, g: SwitchGeometry)]] = [:]
   var lensAt: ((Double) -> String)?
   var onAlign: ((String, SwitchGeometry, Float, Float) -> Void)?
-  // MEDIÇÃO DO ESTACIONAR: depois que o zoom para, a escala de cada quadro é medida contra um quadro de REFERÊNCIA fixo
-  // (0,3 s depois de parar) até 2,2 s — sem soma de ruído. Amplitude = quanto a escala ainda andou (ideal ≈ 0).
+  // MEDIÇÃO DO ESTACIONAR (v3): guarda os quadros crus da tela de 0,3 s ANTES do zoom parar até 2 s depois e compara cada um
+  // com o quadro FINAL (v2 começava 0,3 s depois de parar e não via a volta). Por quadro: zoom relativo ao final (>1 = mais
+  // perto que o final), deslizamento em px (de 96×54) + estado da câmera. "volta" = quanto andou CONTRA o sentido de chegada.
   private var settleT0 = 0.0
   private var settleActive = false
-  private var settleRef: [Float]?
-  private var settleVals: [(Double, Float, String)] = []
-  var onSettle: ((String, Float) -> Void)?
-  var probe: (() -> String)?   // estado real da câmera no quadro (posição da lente de foco, zoom, lente, exposição)
-  func startSettle(_ t: Double) { lock.lock(); settleT0 = t; settleActive = true; settleRef = nil; settleVals = []; lock.unlock() }
-  static func scaleVsRef(_ ref: [Float], _ img: [Float]) -> Float {
-    var best = (s: Float(1), dx: 0, dy: 0, e: Float.infinity)
-    for si in -10...10 { let s = 1 + Float(si) * 0.005
-      for dy in -4...4 { for dx in -4...4 { let e = cost(ref, img, s, Float(dx) / Float(w), Float(dy) / Float(h)); if e < best.e { best = (s, dx, dy, e) } } } }
-    let c = best
-    for si in -5...5 { let s = c.s + Float(si) * 0.001
-      for dy in (c.dy - 1)...(c.dy + 1) { for dx in (c.dx - 1)...(c.dx + 1) { let e = cost(ref, img, s, Float(dx) / Float(w), Float(dy) / Float(h)); if e < best.e { best = (s, dx, dy, e) } } } }
-    return best.s
+  private var settleFrames: [(Double, [Float], String)] = []
+  private var settleTag = ""
+  private let settleQueue = DispatchQueue(label: "cowboy.settle", qos: .utility)
+  var onSettle: ((String, Float, String) -> Void)?   // quadros, volta, etiqueta do passo
+  var probe: (() -> String)?   // estado real no quadro (zoom, lente, rampa, lente de foco, corte e correção da estabilização da tela)
+  func startSettle(_ t: Double, tag: String = "") { lock.lock(); settleT0 = t; settleActive = true; settleFrames = []; settleTag = tag; lock.unlock() }
+  // escala (como cost: <1 = imagem mais perto que a referência) + deslocamento em px
+  static func scaleShiftVsRef(_ ref: [Float], _ img: [Float]) -> (s: Float, dx: Float, dy: Float) {
+    var b = (s: Float(1), dx: Float(0), dy: Float(0), e: Float.infinity)
+    func try1(_ s: Float, _ dx: Float, _ dy: Float) { let e = cost(ref, img, s, dx / Float(w), dy / Float(h)); if e < b.e { b = (s, dx, dy, e) } }
+    for si in -10...10 { for dy in -5...5 { for dx in -5...5 { try1(1 + Float(si) * 0.01, Float(dx), Float(dy)) } } }
+    var c = b
+    for si in -4...4 { for dy in -1...1 { for dx in -1...1 { try1(c.s + Float(si) * 0.0025, c.dx + Float(dx), c.dy + Float(dy)) } } }
+    c = b
+    for si in -5...5 { for dy in -2...2 { for dx in -2...2 { try1(c.s + Float(si) * 0.0005, c.dx + Float(dx) * 0.25, c.dy + Float(dy) * 0.25) } } }
+    return (b.s, b.dx, b.dy)
   }
   func geometry(_ stream: String, at t: Double) -> SwitchGeometry {
     lock.lock(); defer { lock.unlock() }
@@ -53,21 +57,31 @@ final class SwitchAligner: @unchecked Sendable {
     guard luma.count == Self.w * Self.h, let lens = lensAt?(t) else { return }
     let img = Self.normalize(luma)
     lock.lock(); let prev = last[stream]; last[stream] = (lens, t, img)
-    var job: (ref: [Float], dt: Double)?; var finished: (String, Float)?
-    if stream == "fast" && settleActive && t >= settleT0 {
+    var done: [(Double, [Float], String)]?; let tag = settleTag
+    if stream == "fast" && settleActive && t >= settleT0 - 0.3 {
       let dt = t - settleT0
-      if dt >= 2.2 {
-        let v = settleVals.map { $0.1 }
-        let amp = (v.max() ?? 1) - (v.min() ?? 1)
-        finished = (settleVals.map { String(format: "%.0f:%.3f", $0.0 * 1000, $0.1) + "[" + $0.2 + "]" }.joined(separator: " "), amp)
-        settleActive = false; settleVals = []; settleRef = nil
-      } else if dt >= 0.3 {
-        if let r = settleRef { job = (r, dt) } else { settleRef = img }
-      }
+      if dt >= 2.0 { done = settleFrames + [(dt, img, "")]; settleActive = false; settleFrames = [] }
+      else { lock.unlock(); let st = probe?() ?? ""; lock.lock(); settleFrames.append((dt, img, st)) }
     }
     lock.unlock()
-    if let job { let st = probe?() ?? ""; let sc = Self.scaleVsRef(job.ref, img); lock.lock(); settleVals.append((job.dt, sc, st)); lock.unlock() }
-    if let finished { onSettle?(finished.0, finished.1) }
+    if let done, let ref = done.last?.1 {
+      // conta pesada fora da fila dos quadros (nunca segura quadro da câmera — 0.6.1)
+      settleQueue.async { [weak self] in
+        var parts: [String] = []; var zs: [Float] = []
+        for (i, f) in done.dropLast().enumerated() where f.0 < 1.0 || i % 3 == 0 {
+          let r = Self.scaleShiftVsRef(ref, f.1); let z = 1 / r.s; zs.append(z)
+          parts.append(String(format: "%.0f:%.4f,%.1f,%.1f", f.0 * 1000, z, r.dx, r.dy) + "[" + f.2 + "]")
+        }
+        var back: Float = 0
+        if let first = zs.first {
+          let dir: Float = 1 - first >= 0 ? 1 : -1   // chegando de mais longe (zoom in) ou de mais perto (zoom out)
+          var peak = first
+          for z in zs { if (z - peak) * dir >= 0 { peak = z } else { back = max(back, abs(z - peak)) } }
+          back = max(back, zs.map { ($0 - 1) * dir }.max() ?? 0)   // passou do final e voltou (ultrapassagem)
+        }
+        self?.onSettle?(parts.joined(separator: " "), back, tag)
+      }
+    }
     guard let prev, prev.lens != lens, t - prev.t < 0.2 else { return }
     guard (prev.lens == "ultra") != (lens == "ultra") else { return }   // só 0,5× <-> 1× (da 1× em diante não precisa)
     let r = Self.align(reference: prev.img, moving: img)

@@ -52,6 +52,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // sozinha por 1–2 s ("estacionar"). Agora: 5 medidas ao abrir a câmera -> mediana -> fixo até trocar câmera/formato.
   private var cropFrozen = false
   var displayCrop: Double { lock.lock(); defer { lock.unlock() }; return shownCrop }
+  var displayShake: (Double, Double) { lock.lock(); defer { lock.unlock() }; return fastCorr }
   private var calibFast: (pts: Double, image: CGImage)?
   private var calibBusy = false
   private var nextCalib = 0.0
