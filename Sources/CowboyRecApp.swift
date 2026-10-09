@@ -50,6 +50,7 @@ struct RecorderView: View {
   @State private var iconAngle: Double = 0
   @State private var noisePanel = false
   @State private var askSelfTest = false
+  @State private var fxOpen = false
   @Environment(\.scenePhase) private var phase
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 1, green: 0.8, blue: 0)
@@ -171,12 +172,15 @@ struct RecorderView: View {
       }.padding(.leading, 10).padding(.top, 10)
       Spacer()
       if let panel, !camera.recording { panelView(panel).padding(.bottom, 10) }
+      if fxOpen { fxPanel.padding(.bottom, 8).transition(.opacity) }
+      fxPill.padding(.bottom, 8)   // efeitos e zoom em destaque na prévia (0.8.9)
       lensBar.padding(.bottom, 12)   // também gravando: tocar = zoom até a lente (0.8.1)
       if (!camera.recording && stream.pendingMB > 1) || (camera.recording && (stream.health == .offline || stream.health == .slow || stream.health == .error)) { uploadLine.padding(.bottom, 8) }
       bottomRow.padding(.bottom, 6)
     }
     .animation(.easeOut(duration: 0.18), value: camera.recording)
     .animation(.easeOut(duration: 0.18), value: panel)
+    .animation(.easeOut(duration: 0.18), value: fxOpen)
   }
   private var topBar: some View {
     VStack(spacing: 4) {
@@ -318,6 +322,38 @@ struct RecorderView: View {
         case .aspect:
           ForEach(Framing.options, id: \.id) { o in pill(o.label, tools.aspect == o.id) { tools.aspect = o.id; if o.id != "livre" { UserDefaults.standard.set(o.id, forKey: "lastAspect") } } }
         }
+      }.padding(.horizontal, 14)
+    }
+    .frame(height: 40)
+  }
+  // ---------------------------------------------------------------- efeitos: LIVE/RENDER · desfoque · velocidade do zoom
+  private var fxPill: some View {
+    Button { fxOpen.toggle() } label: {
+      HStack(spacing: 6) {
+        Image(systemName: "sparkles").font(.system(size: 12, weight: .bold))
+        Text(camera.fxRender ? "RENDER" : "LIVE").font(.system(size: 12, weight: .heavy))
+        Text("·").opacity(0.6)
+        Text(camera.motionBlur ? (camera.blurStrong ? "Desfoque forte" : "Desfoque") : "Sem desfoque").font(.system(size: 12, weight: .semibold))
+        Text("·").opacity(0.6)
+        Text("Zoom " + NativeCamera.zoomSpeeds[max(0, min(2, camera.zoomSpeed))].label.lowercased()).font(.system(size: 12, weight: .semibold))
+      }
+      .padding(.horizontal, 12).padding(.vertical, 7)
+      .background(camera.motionBlur ? gold : Color.black.opacity(0.55), in: Capsule())
+      .foregroundStyle(camera.motionBlur ? .black : .white)
+      .overlay(Capsule().stroke(.white.opacity(fxOpen ? 0.9 : 0), lineWidth: 1.5))
+    }.buttonStyle(.plain)
+  }
+  private var fxPanel: some View {
+    ScrollView(.horizontal, showsIndicators: false) {
+      HStack(spacing: 8) {
+        pill("Live", !camera.fxRender) { camera.setFXRender(false); flash("Live: o desfoque entra na hora, na tela e no arquivo") }.disabled(camera.recording)
+        pill("Render", camera.fxRender) { camera.setFXRender(true); flash("Render: grava limpo e a nuvem aplica o desfoque depois") }.disabled(camera.recording)
+        if camera.fxRender { pill("Ver como render", camera.previewAsRender) { camera.setPreviewAsRender(!camera.previewAsRender) } }
+        Divider().frame(height: 20)
+        pill(camera.motionBlur ? "Desfoque ON" : "Desfoque OFF", camera.motionBlur) { camera.setMotionBlur(!camera.motionBlur) }
+        if camera.motionBlur { pill("Forte 360°", camera.blurStrong) { camera.setBlurStrong(!camera.blurStrong) } }
+        Divider().frame(height: 20)
+        ForEach(NativeCamera.zoomSpeeds.indices, id: \.self) { i in pill(NativeCamera.zoomSpeeds[i].label, camera.zoomSpeed == i) { camera.setZoomSpeed(i) } }
       }.padding(.horizontal, 14)
     }
     .frame(height: 40)

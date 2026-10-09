@@ -37,16 +37,36 @@ final class LutBaker: @unchecked Sendable {
     float4 m = prm[1];   // matriz da fonte: Cr->R, Cb->G, Cr->G, Cb->B
     float n = prm[2].x;  // lado do cubo
     float4 g = prm[5];   // troca de lente: escala, deslocamento x, y (coordenadas do quadro) e zoom de cobertura
+    float4 b = prm[6];   // desfoque de movimento (0.8.9): ln(escala) do rastro radial, deslocamento x/y, amostras (1 = sem)
+    int nb = int(b.w + 0.5);
     float2 size = float2(yOut.get_width(), yOut.get_height());
     float sumCb = 0.0, sumCr = 0.0;
     for (uint dy = 0; dy < 2; dy++) {
       for (uint dx = 0; dx < 2; dx++) {
         uint2 p = gid * 2 + uint2(dx, dy);
         float2 uv = (float2(p) + 0.5) / size;
-        float2 src = (uv - 0.5 - g.yz) / (g.x * g.w) + 0.5;   // 4:2:0 e 4:2:2 caem certo: coordenada normalizada
-        float2 cc = cIn.sample(s, src).rg;
+        float yv = 0.0;
+        float2 cc = float2(0.0);
+        if (nb > 1) {
+          // rastro: nb leituras ao longo do caminho (radial do zoom + giro), deslocadas por pixel (ruído intercalado) =
+          // liso, sem cópias em degrau; média nos valores da fonte e a cor UMA vez depois (mesma conta da tela e da VPS)
+          float f = 0.06711056 * float(p.x) + 0.00583715 * float(p.y);
+          float j = fract(52.9829189 * fract(f)) - 0.5;
+          for (int i = 0; i < nb; i++) {
+            float u = (float(i) + 0.5 + j) / float(nb) - 0.5;
+            float2 q = 0.5 + (uv - 0.5) * exp(b.x * u) + b.yz * u;
+            float2 src = (q - 0.5 - g.yz) / (g.x * g.w) + 0.5;
+            yv += yIn.sample(s, src).r;
+            cc += cIn.sample(s, src).rg;
+          }
+          yv /= float(nb); cc /= float(nb);
+        } else {
+          float2 src = (uv - 0.5 - g.yz) / (g.x * g.w) + 0.5;   // 4:2:0 e 4:2:2 caem certo: coordenada normalizada
+          yv = yIn.sample(s, src).r;
+          cc = cIn.sample(s, src).rg;
+        }
         float cb = (cc.r - a.w) * a.z, cr = (cc.g - a.w) * a.z;
-        float y = (yIn.sample(s, src).r - a.y) * a.x;
+        float y = (yv - a.y) * a.x;
         float3 rgb = clamp(float3(y + m.x * cr, y - m.y * cb - m.z * cr, y + m.w * cb), 0.0, 1.0);
         float3 o = lut.sample(s, (rgb * (n - 1.0) + 0.5) / n).rgb;
         o = clamp(prm[4].x * pow(max(o, 0.0), float3(prm[3].w)) * prm[3].rgb, 0.0, 1.0);   // igualar câmeras (lente do quadro)
@@ -100,7 +120,7 @@ final class LutBaker: @unchecked Sendable {
   static func supports(_ f: OSType) -> Bool { tenBit.contains(f) || eightBit.contains(f) }
 
   // quadro convertido com o mesmo tempo do original; nil = não deu (quem chama grava o original e conta a falha)
-  func convert(_ sample: CMSampleBuffer, match: LensCorrection = .identity, geo: SwitchGeometry = .identity) -> CMSampleBuffer? {
+  func convert(_ sample: CMSampleBuffer, match: LensCorrection = .identity, geo: SwitchGeometry = .identity, blur: BlurParams = .none, samples: Int = 1) -> CMSampleBuffer? {
     guard let src = CMSampleBufferGetImageBuffer(sample) else { return fail("sem imagem") }
     let fmt = CVPixelBufferGetPixelFormatType(src)
     let ten = Self.tenBit.contains(fmt), eight = Self.eightBit.contains(fmt)
@@ -127,7 +147,8 @@ final class LutBaker: @unchecked Sendable {
     if !full && !ten { range = SIMD4<Float>(255.0 / 219.0, 16.0 / 255.0, 255.0 / 224.0, 128.0 / 255.0) }
     let rec2020 = SIMD4<Float>(1.4746, 0.16455, 0.57135, 1.8814), rec709 = SIMD4<Float>(1.5748, 0.1873, 0.4681, 1.8556)
     let matrix = ten ? rec2020 : rec709
-    var prm: [SIMD4<Float>] = [range, matrix, SIMD4(Float(lutN), four22 ? 1 : 2, 0, 0), SIMD4(match.gain.x, match.gain.y, match.gain.z, match.gamma), SIMD4(match.scale, 0, 0, 0), SIMD4(geo.s, geo.tx, geo.ty, geo.cover)]
+    var prm: [SIMD4<Float>] = [range, matrix, SIMD4(Float(lutN), four22 ? 1 : 2, 0, 0), SIMD4(match.gain.x, match.gain.y, match.gain.z, match.gamma), SIMD4(match.scale, 0, 0, 0), SIMD4(geo.s, geo.tx, geo.ty, geo.cover),
+      SIMD4(Float(blur.zoom), Float(blur.mx), Float(blur.my), Float(blur.active ? max(1, samples) : 1))]
     guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return fail("comando") }
     enc.setComputePipelineState(pipeline)
     enc.setTexture(yIn, index: 0); enc.setTexture(cIn, index: 1); enc.setTexture(lut, index: 2); enc.setTexture(yOut, index: 3); enc.setTexture(cOut, index: 4)

@@ -101,14 +101,14 @@ final class ZoomDriver: @unchecked Sendable {
   var onTrace: ((String) -> Void)?
   func endFollow() { lock.lock(); gestureDir = 0; gestureRef = 0; traceUntil = lastTick + 1.2; trace = []; lock.unlock() }   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: deslizamento com velocidade constante (em potências de 2), um valor por quadro
-  @discardableResult func glide(to factor: CGFloat, seconds: Double = 0.42) -> Double {
+  @discardableResult func glide(to factor: CGFloat, seconds: Double = 0.42, floor minDur: Double = 0.2) -> Double {
     lock.lock(); target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
     guard let d else { return 0 }
     let to = clamp(d, factor), from = d.videoZoomFactor
     let stops = abs(log2(Double(to / from)))
     guard stops > 0.003 else { return 0 }
     let spread: Double = 0.6 + 0.4 * min(1.0, stops / 2.0)
-    let duration: Double = max(0.2, seconds * spread)
+    let duration: Double = max(minDur, seconds * spread)   // 0.8.9: rápido/médio/lento (lento = o de até a 0.8.8)
     let rate = max(0.8, stops / duration)
     let dur = stops / rate
     // rampa nativa (0.7.7): o deslizamento por quadro (0.7.5–0.7.6) deixou o foco estranho na troca de lente — a rampa do

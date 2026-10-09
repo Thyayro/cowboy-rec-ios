@@ -239,7 +239,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
   }
   private func pendingCount(_ t: Take) -> Int { lock.lock(); defer { lock.unlock() }; return t.mem.count + t.disk.count }
   private func finish(_ t: Take, chunks: Int, cookie: String) async throws {
-    for kind in ["thumb", "gcsv", "space", "cube"] {
+    for kind in ["thumb", "gcsv", "space", "cube", "fx"] {
       let url = sideFile(t.m.cid, kind: kind)
       guard let data = try? Data(contentsOf: url) else { continue }
       let (code, _) = try await call("/api/rec/side?take=\(t.m.take!)&kind=\(kind)", method: "PUT", data: data, cookie: cookie, type: kind == "thumb" ? "image/jpeg" : "text/plain; charset=utf-8")

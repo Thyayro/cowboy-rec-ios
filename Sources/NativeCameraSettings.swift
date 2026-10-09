@@ -19,6 +19,25 @@ struct NativeCameraSettings: View {
         }
         Text("Extrema = Cinematic Extended Enhanced do iOS 18 (o modo mais forte da Apple: segura caminhada e corrida, recorta mais as bordas e atrasa um pouco a prévia). A prévia mostra o quadro já estabilizado — o mesmo que vai pro arquivo. Se o formato não tiver o modo pedido, cai pro mais forte que ele aceita, sem baixar resolução nem fps.").font(.caption2)
       }
+      Section("Efeitos e zoom") {
+        Picker("Velocidade do zoom", selection: Binding(get: { camera.zoomSpeed }, set: { camera.setZoomSpeed($0) })) {
+          ForEach(NativeCamera.zoomSpeeds.indices, id: \.self) { i in Text(NativeCamera.zoomSpeeds[i].label).tag(i) }
+        }.pickerStyle(.segmented)
+        Text("Velocidade do zoom ao tocar nas lentes (0,5 · 1 · 2 · 5). Lento é o das versões anteriores.").font(.caption2)
+        Toggle("Desfoque de movimento", isOn: Binding(get: { camera.motionBlur }, set: { camera.setMotionBlur($0) }))
+        if camera.motionBlur {
+          Picker("Intensidade", selection: Binding(get: { camera.blurStrong }, set: { camera.setBlurStrong($0) })) {
+            Text("Natural 180°").tag(false); Text("Forte 360°").tag(true)
+          }.pickerStyle(.segmented)
+          Picker("Aplicar", selection: Binding(get: { camera.fxRender }, set: { camera.setFXRender($0) })) {
+            Text("Live").tag(false); Text("Render").tag(true)
+          }.pickerStyle(.segmented).disabled(camera.recording)
+          if camera.fxRender { Toggle("Ver como render (na tela)", isOn: Binding(get: { camera.previewAsRender }, set: { camera.setPreviewAsRender($0) })) }
+          Text(camera.fxRender ? "Render: grava limpo (o iPhone trabalha menos) e a nuvem aplica o desfoque depois, com a mesma conta — o vídeo na galeria sai com o efeito. \"Ver como render\" mostra o rastro na tela enquanto grava." : "Live: o rastro entra na hora, na tela e no arquivo — só nos quadros com zoom ou movimento rápido (parado não gasta nada).").font(.caption2)
+          Text("Rastro de câmera de cinema (obturador \(camera.blurStrong ? "360°, estilo After Effects" : "180°")): no zoom ele sai do centro; nos movimentos rápidos, na direção do giro. O tremor que a estabilização tira não vira rastro, e de noite a própria exposição já borra (não soma).").font(.caption2)
+          if !camera.bake709 { Text("Com o arquivo em Log (Rec.709 no iPhone desligado), o desfoque fica só na tela.").font(.caption2).foregroundStyle(.orange) }
+        }
+      }
       Section("Lente e formato reais") {
         Picker("Câmera", selection: Binding(get: { camera.lensID }, set: { camera.selectLens($0) })) {
           ForEach(camera.lenses) { lens in Text(lens.name).tag(lens.id) }

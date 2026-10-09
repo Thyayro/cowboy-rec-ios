@@ -15,6 +15,8 @@ final class MotionHub: @unchecked Sendable {
   private var latest: CMDeviceMotion?
   private var flipped: Bool?
   private var log: GyroLog?
+  // giro dos últimos ~4 s (hora no relógio dos quadros, x, y, z em rad/s) — desfoque de movimento (0.8.9)
+  private var rates: [(Double, Double, Double, Double)] = []
 
   func start() {
     lock.lock(); defer { lock.unlock() }
@@ -22,7 +24,10 @@ final class MotionHub: @unchecked Sendable {
     manager.deviceMotionUpdateInterval = log == nil ? 1.0 / 30 : 1.0 / 100   // 100 Hz só gravando (log do Gyroflow)
     manager.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, _ in
       guard let self, let motion else { return }
-      self.lock.lock(); self.latest = motion; let log = self.log; self.lock.unlock()
+      let r = motion.rotationRate
+      self.lock.lock(); self.latest = motion; let log = self.log
+      self.rates.append((motion.timestamp, r.x, r.y, r.z)); if self.rates.count > 480 { self.rates.removeFirst(self.rates.count - 400) }
+      self.lock.unlock()
       log?.write(motion)
     }
   }
@@ -32,7 +37,20 @@ final class MotionHub: @unchecked Sendable {
     guard let r = m?.rotationRate else { return 0 }
     return (r.x * r.x + r.y * r.y + r.z * r.z).squareRoot()
   }
-  func stop() { lock.lock(); manager.stopDeviceMotionUpdates(); latest = nil; lock.unlock() }
+  // giro MÉDIO em volta do instante t (relógio dos quadros), ±half s: o tremor que a estabilização tira some na média e
+  // fica o movimento que o quadro estabilizado faz de verdade (panorâmica, virada rápida)
+  func rotation(around t: Double, half: Double = 0.25) -> (x: Double, y: Double, z: Double)? {
+    lock.lock(); defer { lock.unlock() }
+    var sx = 0.0, sy = 0.0, sz = 0.0, n = 0.0
+    for e in rates.reversed() {
+      if e.0 > t + half { continue }
+      if e.0 < t - half { break }
+      sx += e.1; sy += e.2; sz += e.3; n += 1
+    }
+    guard n > 0 else { return nil }
+    return (x: sx / n, y: sy / n, z: sz / n)
+  }
+  func stop() { lock.lock(); manager.stopDeviceMotionUpdates(); latest = nil; rates.removeAll(); lock.unlock() }
   func attach(_ log: GyroLog?) { lock.lock(); self.log = log; manager.deviceMotionUpdateInterval = log == nil ? 1.0 / 30 : 1.0 / 100; lock.unlock() }
 
   func snapshot() -> Snapshot? {

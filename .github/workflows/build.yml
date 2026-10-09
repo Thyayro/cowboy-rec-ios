@@ -15,6 +15,8 @@ jobs:
         run: swiftc Sources/CapturePolicy.swift Sources/ColorMath.swift Tests/CapturePolicyTests.swift -o /tmp/cowboy-capture-policy && /tmp/cowboy-capture-policy
       - name: Verify zoom calibration (simulated camera must pass before the app is built)
         run: swiftc -O Sources/ZoomKernel.swift Sources/SwitchAligner.swift Tests/ZoomCalibTests.swift -o /tmp/zoomcalib && /tmp/zoomcalib
+      - name: Verify motion blur math (tela, arquivo e render da VPS)
+        run: swiftc -O Sources/MotionBlur.swift Tests/MotionBlurTests.swift -o /tmp/motionblur && /tmp/motionblur
       - name: Verify Metal shader (compiled at runtime on the iPhone)
         run: python3 tools/extract_shader.py /tmp/bake.metal && xcrun -sdk iphoneos metal -c /tmp/bake.metal -o /tmp/bake.air && echo SHADER OK
       - name: Build native camera

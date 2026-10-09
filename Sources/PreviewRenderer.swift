@@ -61,6 +61,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   var digitalNow: (() -> Double)?
   var digitalAt: ((Double) -> Double)?
   private var lastDZ = 1.0
+  // DESFOQUE DE MOVIMENTO (0.8.9, ver MotionBlur): tela com rastro no Live (ou no Render com "ver como render")
+  var blurPreview = false
+  var blurShutter: (() -> Double)?   // obturador sintético agora (s), já sem a exposição real
+  var blurFOV = 106.0                // campo horizontal do formato no zoom 1 do aparelho (graus)
+  var blurHot = false                // aparelho quente: menos cópias na tela (o arquivo não muda)
   private var focusWatch: (t0: Double, before: Float, items: [String], from: Int, to: Int)?
   var stabSampling = false   // amostras do estabilizado pro alinhador antigo (só o teste antigo; o arquivo usa a troca medida)
   var frameZoom: ((Double) -> Double?)?
@@ -261,6 +266,48 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let d = Float(max(1, digitalAt?(pts) ?? 1))
     return d > 1.0005 ? SwitchPlan.compose(SwitchGeometry(s: d, tx: 0, ty: 0, exact: true), g) : g
   }
+  // desfoque do quadro captado em p — a MESMA conta pra tela e arquivo (o arquivo chama da fila dos quadros): zoom do
+  // conteúdo (registro da tela, adiantado como o resto da ampliação) × digital, giro suavizado e distância focal do quadro
+  func blurParams(at p: Double, width: Double, height: Double) -> BlurParams {
+    guard let shutter = blurShutter?(), shutter > 0.0002 else { return .none }
+    let h = 1.0 / 60
+    lock.lock()
+    let za = zoomAt(p + Self.contentLead - h), zb = zoomAt(p + Self.contentLead + h), z0 = zoomAt(p + Self.contentLead), c = crop
+    lock.unlock()
+    var v = 0.0
+    if let za, let zb, za > 0, zb > 0 { v = log(zb / za) / (2 * h) }
+    var d0 = 1.0
+    if let dAt = digitalAt { d0 = dAt(p); let da = dAt(p - h), db = dAt(p + h); if da > 0, db > 0 { v += log(db / da) / (2 * h) } }
+    let w = MotionHub.shared.rotation(around: p) ?? (x: 0, y: 0, z: 0)
+    let f = MotionBlur.focalNorm(fovDegrees: blurFOV, zoomRaw: z0 ?? 1, crop: c, digital: d0)
+    return MotionBlur.params(zoomSpeed: v, omega: w, shutter: shutter, focalNorm: f, width: width, height: height)
+  }
+  // rastro na tela: cópias do quadro (já na escala da tela, antes do LUT — igual ao arquivo) ao longo do caminho; só nos
+  // quadros com movimento (parado = nada a mais pra GPU)
+  private func previewBlur(_ image: CIImage, raw: CIImage, at p: Double, orient: CGImagePropertyOrientation, mirror: Bool, scale: Double, fit: CGRect) -> CIImage {
+    let W = Double(raw.extent.width), H = Double(raw.extent.height)
+    let bp = blurParams(at: p, width: W, height: H)
+    let n = bp.samples(pxScale: scale, spacing: 5, max: blurHot ? 3 : 6)
+    guard n > 1 else { return image }
+    // vetor: quadro do sensor (y pra baixo) -> Core Image (y pra cima) -> orientação da tela -> escala da tela
+    let t = raw.orientationTransform(for: orient)
+    let vx = bp.mx * W, vy = -bp.my * H
+    var dx = Double(t.a) * vx + Double(t.c) * vy, dy = Double(t.b) * vx + Double(t.d) * vy
+    if mirror { dx = -dx }
+    return Self.blurred(image, zoom: bp.zoom, dx: dx * scale, dy: dy * scale, n: n, center: CGPoint(x: fit.midX, y: fit.midY), fit: fit)
+  }
+  static func blurred(_ image: CIImage, zoom: Double, dx: Double, dy: Double, n: Int, center c: CGPoint, fit: CGRect) -> CIImage {
+    let src = image.clampedToExtent()
+    var acc: CIImage?
+    for i in 0..<n {
+      let u = MotionBlur.u(i, n), s = exp(zoom * u)
+      let t = CGAffineTransform(translationX: -c.x, y: -c.y).concatenating(CGAffineTransform(scaleX: s, y: s)).concatenating(CGAffineTransform(translationX: c.x + dx * u, y: c.y + dy * u))
+      let copy = src.transformed(by: t).cropped(to: fit)
+      // média uniforme por dissolução encadeada (a k-ésima cópia entra com peso 1/k): sem alfa parcial no caminho
+      acc = acc.map { $0.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: copy, kCIInputTimeKey: 1.0 / Double(i + 1)]) } ?? copy
+    }
+    return (acc ?? image).cropped(to: fit)
+  }
   // quadro pequeno 96×54 (orientação do sensor): cor/luz (depois do LUT, antes da correção) + luma pro alinhamento
   private func sample(_ buffer: CVPixelBuffer, cube useCube: Bool) -> (stats: FrameStats, luma: [Float])? {
     var img = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
@@ -387,7 +434,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if live {
       guard let liveFrame else { return }
       drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now, lens: LensID.name(liveFrame)) ?? .identity,
-        geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity, shake: corrNow)
+        geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity, shake: corrNow, pts: livePTS)
       return
     }
     // troca de lente (0.8.0): preparo/saída sem pulo; ida-e-volta rápida = a tela segura o quadro anterior
@@ -422,6 +469,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = image.transformed(by: CGAffineTransform(scaleX: scale * k * dz, y: scale * k * dz))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
     image = image.cropped(to: fit)
+    if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: scale * k * dz, fit: fit) }
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
@@ -434,7 +482,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     frames += 1
   }
 
-  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection, geo: SwitchGeometry, shake: (Double, Double) = (0, 0)) {
+  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection, geo: SwitchGeometry, shake: (Double, Double) = (0, 0), pts: Double? = nil) {
     guard let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
@@ -448,6 +496,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let sc = fitScale * max(1, crop) * Double(geo.cover)
     image = image.transformed(by: CGAffineTransform(scaleX: sc, y: sc))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY)).cropped(to: fit)
+    if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: sc, fit: fit) }
     image = Self.matched(Self.filtered(image, cube: cube, size: size), match).cropped(to: fit)
     image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target)))
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }

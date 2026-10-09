@@ -193,6 +193,31 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
   @Published var bake709 = UserDefaults.standard.object(forKey: "bake709") as? Bool ?? true { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
   @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
+  // EFEITOS E ZOOM (0.8.9): velocidade do toque nas lentes, desfoque de movimento e onde ele é aplicado
+  //  - Live (padrão): tela e arquivo com o rastro (no shader do arquivo, só nos quadros com movimento: parado não custa);
+  //  - Render: grava LIMPO (menos GPU gravando) e a VPS aplica depois, pela mesma conta (arquivo de efeitos .fx);
+  //    "ver como render" mostra na tela exatamente o rastro que o render vai pôr.
+  static let zoomSpeeds: [(label: String, seconds: Double, floor: Double)] = [("Rápido", 0.16, 0.09), ("Médio", 0.27, 0.14), ("Lento", 0.42, 0.2)]
+  @Published var zoomSpeed = max(0, min(2, UserDefaults.standard.object(forKey: "zoomSpeed") as? Int ?? 1))
+  @Published var motionBlur = UserDefaults.standard.object(forKey: "motionBlur") as? Bool ?? true
+  @Published var blurStrong = UserDefaults.standard.object(forKey: "blurStrong") as? Bool ?? false
+  @Published var fxRender = UserDefaults.standard.object(forKey: "fxRender") as? Bool ?? false
+  @Published var previewAsRender = UserDefaults.standard.object(forKey: "previewAsRender") as? Bool ?? false
+  private var fxAngle = 180.0     // cópia do "forte" pra quem lê fora da thread principal
+  private var fileBlur = false    // tomada atual: o shader do arquivo aplica (Live)
+  private var fxLogOn = false     // tomada atual: cada quadro com rastro vira linha no arquivo de efeitos (Render)
+  private var fxBuffer = ""
+  private var fxLines = 0
+  func setZoomSpeed(_ v: Int) { zoomSpeed = max(0, min(2, v)); UserDefaults.standard.set(zoomSpeed, forKey: "zoomSpeed"); Diag.step("fx", ["zoom": Self.zoomSpeeds[zoomSpeed].label], send: false) }
+  func setMotionBlur(_ on: Bool) { motionBlur = on; UserDefaults.standard.set(on, forKey: "motionBlur"); syncEffects() }
+  func setBlurStrong(_ on: Bool) { blurStrong = on; UserDefaults.standard.set(on, forKey: "blurStrong"); syncEffects() }
+  func setFXRender(_ on: Bool) { fxRender = on; UserDefaults.standard.set(on, forKey: "fxRender"); syncEffects() }
+  func setPreviewAsRender(_ on: Bool) { previewAsRender = on; UserDefaults.standard.set(on, forKey: "previewAsRender"); syncEffects() }
+  func syncEffects() {
+    renderer.blurPreview = motionBlur && (!fxRender || previewAsRender)
+    fxAngle = blurStrong ? 360 : 180
+    Diag.step("fx", ["desfoque": motionBlur ? (blurStrong ? "360" : "180") : "off", "modo": fxRender ? "render" : "live", "tela": renderer.blurPreview ? "com rastro" : "limpa", "zoom": Self.zoomSpeeds[zoomSpeed].label], send: false)
+  }
   static let thumbURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("last_thumb.jpg")
   private var recBaker: LutBaker?
   let zoomDriver = ZoomDriver()
@@ -271,6 +296,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
   func start() {
     renderer.tap.refill()
+    syncEffects()
     Task {
       let camera = await AVCaptureDevice.requestAccess(for: .video)
       let audio = await AVCaptureDevice.requestAccess(for: .audio)
@@ -502,6 +528,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
+      renderer.blurShutter = { [weak self, weak cam] in
+        guard let self, let cam else { return 0 }
+        let fd = CMTimeGetSeconds(cam.activeVideoMinFrameDuration), ex = CMTimeGetSeconds(cam.exposureDuration)
+        return MotionBlur.shutter(angle: self.fxAngle, frameDuration: fd.isFinite && fd > 0 ? fd : 1.0 / 60, exposure: ex.isFinite ? ex : 0)
+      }
+      renderer.blurHot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+      lastPrimary = nil
       renderer.digitalNow = { [weak self] in self?.zoomDriver.digital ?? 1 }
       renderer.digitalAt = { [weak self] p in self?.zoomDriver.digital(at: p) ?? 1 }
       let bounds = (cam.isVirtualDevice ? cam.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue } : []) + cam.activeFormat.secondaryNativeResolutionZoomFactors.map { Double($0) }
@@ -571,6 +604,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           match.lensChanged(LensMatch.name(cam.activePrimaryConstituent?.deviceType))
           self?.queue.async {
             self?.applyLensLock(cam)
+            self?.focusNewLens(cam)
             // lente física nova: o foco fica com o iPhone (0.8.4). Reafirmar o contínuo aqui fazia a lente de foco dar um
             // passinho 0,4–0,7 s depois de cada troca (medido: 0,227→0,216, 0,518→0,502…) = o "foco ajustando entre as lentes"
           }
@@ -586,6 +620,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if thermalObserver == nil {
         thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { [weak self] _ in
           Diag.step("thermal", ["estado": Self.thermalName()])
+          self?.renderer.blurHot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
           self?.applyIdleRate()
         }
       }
@@ -612,6 +647,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let exposureMinimum = CMTimeGetSeconds(cam.activeFormat.minExposureDuration)
       let dims = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
       let fov = Double(cam.activeFormat.videoFieldOfView)
+      renderer.blurFOV = fov
       renderer.setOrientation(isFront ? .up : Self.orientation(previewAngle), mirrored: isFront)
       let portrait = isFront ? false : (previewAngle == 90 || previewAngle == 270)
       let shown = portrait ? CGSize(width: Int(dims.height), height: Int(dims.width)) : CGSize(width: Int(dims.width), height: Int(dims.height))
@@ -786,6 +822,32 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = cam.focusPointOfInterest }
     cam.focusMode = .continuousAutoFocus
   }
+  // LENTE NOVA CHEGA EM FOCO (0.8.9): medido nos trechos da 0.8.6–0.8.8, a principal ficava ~0,8 s PARADA (L0,922) depois
+  // da troca vinda do 0,5× e só então procurava = "sai focado do 0,5 e chega desfocado". Na troca: UM foco na hora
+  // (one-shot — o foco por fase da lente nova acha em ~0,1–0,3 s) e, assentou, contínuo de novo, sem mexer no ponto. Não é
+  // o "reafirmar o contínuo" da 0.8.4 (que reiniciava a busca 0,4–0,7 s DEPOIS, com a lente já focada): aqui a busca é já.
+  private var lastPrimary: AVCaptureDevice.DeviceType?
+  private var lensFocus: (gen: Int, t0: Double, l0: Float, moved: Bool, from: String, to: String)?
+  private func focusNewLens(_ cam: AVCaptureDevice) {
+    let type = cam.activePrimaryConstituent?.deviceType
+    let before = lastPrimary; lastPrimary = type
+    guard let before, let type, before != type, cam.position == .back, !manualFocus,
+      cam.isFocusModeSupported(.autoFocus), cam.isFocusModeSupported(.continuousAutoFocus) else { return }
+    focusGen += 1
+    lensFocus = (focusGen, CACurrentMediaTime(), cam.lensPosition, false, LensMatch.name(before), LensMatch.name(type))
+    _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .autoFocus; cam.unlockForConfiguration() } }
+    queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }
+  }
+  private func lensFocusTick() {
+    guard var w = lensFocus, let cam = device else { return }
+    guard w.gen == focusGen else { lensFocus = nil; return }   // toque/zoom/foco manual assumiu: não mexe
+    if cam.isAdjustingFocus { w.moved = true; lensFocus = w }
+    let el = CACurrentMediaTime() - w.t0
+    guard (w.moved && !cam.isAdjustingFocus) || el > 1.2 else { queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }; return }
+    lensFocus = nil
+    if !manualFocus { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .continuousAutoFocus; cam.unlockForConfiguration() } } }
+    Diag.step("focus-new-lens", ["de": w.from, "para": w.to, "ms": Int(el * 1000), "L": String(format: "%.3f>%.3f", w.l0, cam.lensPosition), "achou": w.moved])
+  }
   static func thermalName() -> String {
     switch ProcessInfo.processInfo.thermalState { case .nominal: return "normal"; case .fair: return "morno"; case .serious: return "quente"; case .critical: return "crítico"; @unknown default: return "?" }
   }
@@ -860,7 +922,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         if !toUltra { self.applyLensLock(cam, leaving: true) }
       }
       DispatchQueue.main.async {
-        let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base)
+        let sp = Self.zoomSpeeds[max(0, min(2, self.zoomSpeed))]
+        let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base, seconds: sp.seconds, floor: sp.floor)
         self.zoomDriver.leaveDigital(toRaw: value * Double(self.base), dur: dur)
         self.holdFocus(dur + 0.15)
         let tag = self.selfTestMode
@@ -1049,6 +1112,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // ---- gravar: direto na nuvem
   func record(owner: String, aspect: String, look: LookPreset) {
     let convert = convertRec709, bitrate = Self.bitrates[max(0, min(Self.bitrates.count - 1, bitrateChoice))].bps
+    let fxLive = motionBlur && !fxRender, fxRend = motionBlur && fxRender, fxDeg = blurStrong ? 360 : 180
     let horizon: Double? = rotation.map { Double($0.videoRotationAngleForHorizonLevelCapture) }   // lido na thread principal
     queue.async {
       guard self.configured, self.session.isRunning, !self.isRecording, let cam = self.device else { return }
@@ -1104,6 +1168,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         var meta = NativeCaptureMetadata(width: profile.width, height: profile.height, frameRate: profile.fps, hdr: self.requestedHDR, codec: self.requestedCodec.rawValue, lens: self.name(cam), stabilization: Self.label(mode), colorProfile: colorProfile, convertRec709: convert, captureMode: "avfoundation-stream").settings
         if baker != nil { meta["baked"] = "\(source == .appleLog ? "Apple Log" : source == .hlg ? "HLG" : "SDR") -> Rec.709\(look.neutral ? "" : " + look " + look.label) (no iPhone, 10 bits)" }
         meta["zoom"] = Double(cam.videoZoomFactor / self.base); meta["bitrate"] = bitrate ?? (compression[AVVideoAverageBitRateKey] as? Int ?? 0); meta["rotation"] = angle
+        // efeitos (0.8.9): live = já no arquivo; render = a VPS aplica pelo arquivo .fx; live sem conversão no iPhone = só na tela
+        meta["efeitos"] = fxRend ? "render" : fxLive ? (baker != nil ? "live" : "live-so-tela") : "off"
+        if fxLive || fxRend { meta["desfoque"] = "\(fxDeg)°" }
         let lookBody: Any = look.neutral ? NSNull() : ["id": look.id, "p": look.p]
         let body: [String: Any] = ["label": self.name(cam), "mime": "video/mp4", "settings": meta, "stabilization": ["enabled": false], "facing": isFront ? "user" : "environment",
           "convert": (colorProfile != "rec709" && convert) ? "keep" : "none", "aspect": aspect, "look": lookBody, "recorded_at": ISO8601DateFormatter().string(from: Date())]
@@ -1115,6 +1182,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           self.dataQueue.async {
             self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
             self.recBaker = baker
+            self.fileBlur = fxLive && baker != nil; self.fxLogOn = false; self.fxBuffer = ""; self.fxLines = 0
             self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = nil; self.elapsedMs = 0
             self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
           }
@@ -1133,6 +1201,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         self.dataQueue.async {
           self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
           self.recBaker = baker
+          self.fileBlur = fxLive && baker != nil; self.fxLogOn = fxRend; self.fxBuffer = ""; self.fxLines = 0
           self.writer = writer; self.recCid = cid; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = gyro; self.elapsedMs = 0
           MotionHub.shared.attach(gyro)
           self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
@@ -1186,6 +1255,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       self.applyIdleRate()
       if let b = self.recBaker, b.failures > 0 { Diag.step("bake-failures", ["n": b.failures, "err": b.lastError]) }
       self.recBaker = nil
+      let fx = self.fxBuffer, fxN = self.fxLines
+      self.fxBuffer = ""; self.fxLines = 0; self.fileBlur = false; self.fxLogOn = false
       if let file = writer.fileURL {
         let owner = self.recOwner; self.recOwner = nil
         self.publish { self.recording = false; self.finishing = true }
@@ -1199,6 +1270,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       self.recCid = nil
       let gyro = self.gyro; self.gyro = nil; MotionHub.shared.attach(nil)
       let duration = self.elapsedMs, dropped = writer.dropped
+      if !fx.isEmpty { CloudStream.shared.side(cid, kind: "fx", data: Data(fx.utf8)); Diag.step("fx-file", ["linhas": fxN]) }
       if let meta = self.spaceMeta?() {
         var space = meta; space["camera"] = self.lensName; space["source"] = "ios-native"; space["fov_long_deg"] = self.fieldOfView; space["dropped_frames"] = dropped
         if let data = try? JSONSerialization.data(withJSONObject: space) { CloudStream.shared.side(cid, kind: "space", data: data) }
@@ -1280,13 +1352,21 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if pts.seconds - (prevVideoPTS ?? 0) > 1.5 / want && CACurrentMediaTime() < recCadenceUntil { return }
       recCadence = nil
     }
+    // desfoque de movimento (0.8.9): Live = no shader do arquivo; Render = linha no arquivo de efeitos (a VPS aplica)
+    var blur = BlurParams.none, blurN = 1
+    if fileBlur || fxLogOn, let pixel {
+      blur = renderer.blurParams(at: pts.seconds, width: Double(CVPixelBufferGetWidth(pixel)), height: Double(CVPixelBufferGetHeight(pixel)))
+      blurN = blur.samples(max: 12)
+    }
     var baked: CMSampleBuffer?
     if let recBaker {
-      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds, lens: pixel.flatMap { LensID.name($0) }) ?? .identity, geo: renderer.fileSwitchGeometry(pixel, pts: pts.seconds))
+      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds, lens: pixel.flatMap { LensID.name($0) }) ?? .identity, geo: renderer.fileSwitchGeometry(pixel, pts: pts.seconds),
+        blur: fileBlur ? blur : .none, samples: blurN)
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)
     if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds) }
+    if fxLogOn, blur.active, let s = recStart { fxBuffer += MotionBlur.line(t: (pts - s).seconds, blur, samples: blurN); fxLines += 1 }
     if let s = recStart { elapsedMs = Int((pts - s).seconds * 1000) }
     if !thumbDone, let pixel {
       thumbDone = true
