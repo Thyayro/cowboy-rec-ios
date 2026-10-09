@@ -473,6 +473,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let nativeBase = displayBase(cam)
       let relative = zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor / base) : Double(cam.minAvailableVideoZoomFactor / nativeBase))
       cam.videoZoomFactor = max(cam.minAvailableVideoZoomFactor, min(CGFloat(relative) * nativeBase, cam.maxAvailableVideoZoomFactor))
+      if relative <= 0.51 { publish { self.ultraLock = true; UserDefaults.standard.set(true, forKey: "ultraLock") } }
       if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
       if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = false }   // modo suave demorava >2 s pra achar o foco
       if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
@@ -501,6 +502,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       UserDefaults.standard.set(cam.uniqueID, forKey: "lens"); UserDefaults.standard.set(wantsLog, forKey: "log")
       DispatchQueue.main.async { self.rotation = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: nil) }
       renderer.zoomNow = { [weak cam] in cam.map { Double($0.videoZoomFactor) } }
+      renderer.digitalNow = { [weak self] in self?.zoomDriver.digital ?? 1 }
+      renderer.digitalAt = { [weak self] p in self?.zoomDriver.digital(at: p) ?? 1 }
       let bounds = (cam.isVirtualDevice ? cam.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue } : []) + cam.activeFormat.secondaryNativeResolutionZoomFactors.map { Double($0) }
       DispatchQueue.main.async {
         self.setFrameLag(ZoomLag.load()); self.zoomBoundaries = bounds
@@ -595,7 +598,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
         guard let self else { return }
         let value = Double(cam.videoZoomFactor / nativeBase), raw = Double(cam.videoZoomFactor)
-        self.publish { self.zoom = value; self.zoomFactorRaw = raw }
+        let total = value * self.zoomDriver.digital
+        self.publish { self.zoom = total; self.zoomFactorRaw = raw }
       }
       let low = Double(cam.minAvailableVideoZoomFactor / nativeBase), high = Double(min(cam.maxAvailableVideoZoomFactor / nativeBase, 25))
       let switches = cam.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue }
@@ -746,10 +750,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // sem o iOS alternar ultra↔principal perto do 1× (medido na 0.8.3/0.8.4 com a troca automática: ia e voltava). Tocou
     // em 1×/2×/5× = troca automática (o iOS escolhe a lente e cuida do foco na passagem). Pinça que bate no limite digital
     // da ultra destrava (onStuck) e segue pela principal.
-    // no 0,5× é SEMPRE travada (botão, pinça que terminou lá ou o app abrindo lá); `leaving` = tocou 1×/2×/5× pra sair
-    let atHalf = Double(cam.videoZoomFactor / base) <= 0.51
-    let lockUltra = !leaving && (ultraLock || atHalf) && cam.activePrimaryConstituent?.deviceType == .builtInUltraWideCamera
-    let want: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior = lockUltra ? .locked : .auto
+    // 0.8.7: NUNCA travada — `.locked` congelou o foco em 1,000 (infinito) e outros devs relatam o mesmo no 16 Pro Max.
+    // A regra do 0,5× é feita pelo zoom digital na ultra (ZoomDriver), com o iPhone sempre no automático.
+    let lockUltra = false
+    let want: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior = .auto
     guard cam.primaryConstituentDeviceSwitchingBehavior != want else { return }
     _ = CowboyObjC.catching {
       if (try? cam.lockForConfiguration()) != nil {
@@ -790,7 +794,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     queue.async {
       guard self.configured, let cam = self.device, !self.isRecording else { return }
       let full = self.selectedProfile.fps
-      let hot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.fair.rawValue
+      // 0.8.7: só no CRÍTICO — a 30 qps o atraso da Extrema DOBRA (0,57 -> 1,08 s, medido nos trechos): zoom e tela lentos
+      let hot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.critical.rawValue
       let slow = hot && full > 31 && cam.activeFormat.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30.01 && $0.maxFrameRate >= 29.99 }
       guard slow != self.idleSlow else { return }
       self.idleSlow = slow
@@ -800,7 +805,21 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   private var pinchTarget: Double?
-  func followZoom(_ display: Double) { pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3); zoomDriver.follow(CGFloat(display) * base) }
+  static let ultraEdge = 0.99   // logo abaixo do 1× (onde a principal entraria)
+  // digital só se o arquivo for convertido no iPhone (o shader amplia o quadro); senão a tela mostraria o que o arquivo não tem
+  var maxDigital: Double { bake709 ? 2.0 : 1.0 }
+  func followZoom(_ display: Double) {
+    pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3)
+    if ultraLock {
+      let want = min(display, Self.ultraEdge * maxDigital)
+      zoomDriver.setDigital(max(1, want / Self.ultraEdge))
+      zoomDriver.follow(CGFloat(min(want, Self.ultraEdge)) * base)
+      if want > Self.ultraEdge { zoom = want }   // o aparelho parou em 0,99×: o rótulo mostra o total
+    } else {
+      zoomDriver.setDigital(1)
+      zoomDriver.follow(CGFloat(display) * base)
+    }
+  }
   // foco e luz de volta pro centro, contínuos (o ponto tocado antigo não vale mais depois de zoom ou de a cena mudar)
   func recenterFocus(_ why: String) {
     queue.async {
@@ -842,6 +861,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
       DispatchQueue.main.async {
         let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base)
+        self.zoomDriver.leaveDigital(toRaw: value * Double(self.base), dur: dur)
         self.holdFocus(dur + 0.15)
         let tag = self.selfTestMode
         DispatchQueue.main.asyncAfter(deadline: .now() + dur) { if !self.recording && !self.calibrating && !tag.isEmpty { self.aligner?.startSettle(CACurrentMediaTime(), tag: tag) } }
@@ -961,7 +981,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let angle = previewAngle, isFront = front
     // a tela mostra o quadro ESTABILIZADO = recorte do centro do campo do sensor (corte medido, ~1,12): o toque é levado pro
     // campo inteiro (0.8.1; antes o foco caía fora do toque, até ~5% perto das bordas)
-    let c = max(1, min(1.4, renderer.displayCrop))
+    let c = max(1, min(1.4, renderer.displayCrop)) * max(1, zoomDriver.digital)
     let p = CGPoint(x: 0.5 + (p0.x - 0.5) / c, y: 0.5 + (p0.y - 0.5) / c)
     let point: CGPoint
     if isFront { point = CGPoint(x: p.y, y: p.x) }

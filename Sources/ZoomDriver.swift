@@ -25,8 +25,37 @@ final class ZoomDriver: @unchecked Sendable {
   // captura dele menos a "trava" do aparelho (calibrada; ver ZoomCalibration)
   private var setLog: [(Double, Double)] = []
   private var glideGen = 0
+  // ZOOM DIGITAL NA ULTRA (0.8.7) — regra do filmmaker: pinça que parte do 0,5× fica na 0,5. Travar a lente (.locked, 0.8.5)
+  // CONGELOU o foco em 1,000 (infinito) no 16 Pro Max (medido nos trechos + relatos de outros devs). Então o iPhone fica no
+  // automático e a pinça leva o zoom do aparelho só até 0,99× (abaixo do 1× a principal nem pode entrar = sem alternar);
+  // dali pra frente a ampliação é DIGITAL do app, na tela (na hora) e no arquivo (pelo pts de cada quadro).
+  private var digitalTarget = 1.0, digitalNow = 1.0
+  private var digitalLog: [(Double, Double)] = []   // (pts, ampliação digital)
+  private var digitalGlide: (fromRaw: Double, toRaw: Double, devFrom: Double, devTo: Double, t0: Double?, dur: Double)?
+  var digital: Double { lock.lock(); defer { lock.unlock() }; return digitalNow }
+  // ampliação digital do quadro captado em p (arquivo)
+  func digital(at p: Double) -> Double {
+    lock.lock(); defer { lock.unlock() }
+    guard let first = digitalLog.first else { return digitalNow }
+    if p < first.0 { return 1 }
+    return digitalLog.last(where: { $0.0 <= p })?.1 ?? 1
+  }
+  func setDigital(_ v: Double) {
+    lock.lock(); defer { lock.unlock() }
+    digitalGlide = nil; digitalTarget = max(1, v)
+    if CACurrentMediaTime() - lastTickWall > 0.25 { digitalNow = digitalTarget; digitalLog.append((CACurrentMediaTime(), digitalNow)) }   // sem quadros: direto
+  }
+  // toque numa lente saindo do digital: a parte digital desce acompanhando o progresso REAL da rampa do aparelho — a tela
+  // anda sempre pro mesmo lado (sem mergulho nem passar do ponto)
+  func leaveDigital(toRaw: Double, dur: Double) {
+    lock.lock(); defer { lock.unlock() }
+    digitalTarget = 1
+    guard digitalNow > 1.0005, let d = device else { digitalGlide = nil; return }
+    let dev = Double(d.videoZoomFactor)
+    digitalGlide = (dev * digitalNow, toRaw, dev, toRaw, nil, max(0.25, dur))
+  }
 
-  func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; glidePlan = nil; setLog = []; lock.unlock() }
+  func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; glidePlan = nil; setLog = []; digitalTarget = 1; digitalNow = 1; digitalLog = []; digitalGlide = nil; lock.unlock() }
   private func clamp(_ d: AVCaptureDevice, _ z: CGFloat) -> CGFloat { max(d.minAvailableVideoZoomFactor, min(d.maxAvailableVideoZoomFactor, z)) }
   private func configure(_ d: AVCaptureDevice, _ body: () -> Void) {
     _ = CowboyObjC.catching { if (try? d.lockForConfiguration()) != nil { body(); d.unlockForConfiguration() } }
@@ -110,6 +139,19 @@ final class ZoomDriver: @unchecked Sendable {
     lock.lock()
     guard let d = device else { lock.unlock(); return }
     let dt = lastTick == 0 ? 1.0 / 60 : min(0.05, max(0.004, t - lastTick)); lastTick = t; lastTickWall = CACurrentMediaTime()
+    // zoom digital: amortecido como a pinça; saindo por toque de lente, segue a rampa do aparelho
+    var dNew = digitalNow
+    if var g = digitalGlide {
+      if g.t0 == nil { g.t0 = t; digitalGlide = g }
+      let dev = Double(d.videoZoomFactor)
+      var prog = abs(log(g.devTo / g.devFrom)) > 0.02 ? log(dev / g.devFrom) / log(g.devTo / g.devFrom) : (t - g.t0!) / g.dur
+      prog = min(1, max(0, prog))
+      dNew = prog >= 1 ? 1 : max(1, g.fromRaw * pow(g.toRaw / g.fromRaw, prog) / max(1e-6, dev))
+      if prog >= 1 { digitalGlide = nil }
+    } else if abs(log(digitalTarget / digitalNow)) > 0.0006 {
+      dNew = exp(log(digitalNow) + log(digitalTarget / digitalNow) * (1 - exp(-dt / 0.07)))
+    } else { dNew = digitalTarget }
+    if dNew != digitalNow { digitalNow = dNew; digitalLog.append((t, dNew)); if digitalLog.count > 1200 { digitalLog.removeFirst(digitalLog.count - 1200) } }
     if var g = glidePlan {
       if g.t0 == nil { g.t0 = t; glidePlan = g }
       let k = min(1, max(0, (t - g.t0!) / max(0.001, g.dur)))

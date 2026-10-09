@@ -57,6 +57,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // nitidez da saída rápida antes e 2 s depois de cada troca de lente (prova do foco sem pedir teste, 0.8.2)
   private var lastSharp: Float = 0
   var focusProbe: (() -> String)?
+  // zoom digital na ultra (0.8.7): agora na tela, pelo pts no arquivo
+  var digitalNow: (() -> Double)?
+  var digitalAt: ((Double) -> Double)?
+  private var lastDZ = 1.0
   private var focusWatch: (t0: Double, before: Float, items: [String], from: Int, to: Int)?
   var stabSampling = false   // amostras do estabilizado pro alinhador antigo (só o teste antigo; o arquivo usa a troca medida)
   var frameZoom: ((Double) -> Double?)?
@@ -253,7 +257,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // arquivo: a mesma troca medida que a tela usa (sem segurar quadro: no arquivo a ida-e-volta vira um respiro suave)
   func fileSwitchGeometry(_ pb: CVPixelBuffer?, pts: Double) -> SwitchGeometry {
     guard let pb else { return .identity }
-    return switchHider.geometry(pts: pts, sensor: LensID.of(pb), file: true).g
+    let g = switchHider.geometry(pts: pts, sensor: LensID.of(pb), file: true).g
+    let d = Float(max(1, digitalAt?(pts) ?? 1))
+    return d > 1.0005 ? SwitchPlan.compose(SwitchGeometry(s: d, tx: 0, ty: 0, exact: true), g) : g
   }
   // quadro pequeno 96×54 (orientação do sensor): cor/luz (depois do LUT, antes da correção) + luma pro alinhamento
   private func sample(_ buffer: CVPixelBuffer, cube useCube: Bool) -> (stats: FrameStats, luma: [Float])? {
@@ -373,7 +379,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let livePTS = fastPTS
     if live { fastFresh = false; pending = nil }
     lock.unlock()
-    tap.tick(now: now, moving: zoomMovedNow)
+    let dz = max(1, digitalNow?() ?? 1)
+    let dMoved = abs(dz - lastDZ) > 1e-4; lastDZ = dz
+    tap.tick(now: now, moving: zoomMovedNow || dMoved)
     if live {
       guard let liveFrame else { return }
       drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now, lens: LensID.name(liveFrame)) ?? .identity,
@@ -403,13 +411,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     // No zoom out o quadro estabilizado (atrasado) ainda não tem a borda nova: só essa borda vem do quadro em tempo real
     // (saída sem estabilização, no mesmo enquadramento — corte medido pelo Vision), com emenda suave de poucos pixels.
     // Sem troca de fonte (não pula) e sem pixel inventado (não repete nem borra).
-    image = image.transformed(by: CGAffineTransform(scaleX: scale * k, y: scale * k))
+    image = image.transformed(by: CGAffineTransform(scaleX: scale * k * dz, y: scale * k * dz))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
     image = image.cropped(to: fit)
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
-    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "") }
+    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)
