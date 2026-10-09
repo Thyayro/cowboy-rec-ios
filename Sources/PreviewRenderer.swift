@@ -150,16 +150,21 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.15, zHistFast = zoomAt(pts + Self.contentLead) ?? 0
     // troca de lente (0.8.0): sensor deste quadro rápido × o do anterior, com o zoom PARADO nos dois
     let prevFast = lastFast; lastFast = (buffer, sid, pts)
-    var switchJob = false, still = false
+    var switchJob = false, still = false, switchStep = 1.0
     if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
       if focusWatch == nil { focusWatch = (pts, lastSharp, [], pf.id, sid) }
-      still = !trackMoving && abs(log(max(1e-6, zHistFast) / max(1e-6, zoomAt(pf.pts + Self.contentLead) ?? 0))) < 1e-4
+      // 0.8.6: com a troca automática o iOS troca NA CHEGADA do zoom (não ~1 s depois): a troca no fim do zoom também é
+      // preparada — o passo de zoom entre os dois quadros (registrado) é descontado da medida. Zoom rápido (>1,2% por
+      // quadro): o movimento esconde. (Antes exigia zoom parado há 150 ms: a troca do clique ficava sem preparo = +1,1%.)
+      let zPrev = zoomAt(pf.pts + Self.contentLead) ?? 0
+      switchStep = zHistFast > 0 && zPrev > 0 ? zHistFast / zPrev : 1
+      still = abs(log(switchStep)) < 0.012
       if still && !switchBusy { switchBusy = true; switchJob = true }
     }
     let cropNow = crop; lock.unlock()
     if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
       lensColorSwitch(pf.buffer, buffer, pts: pts)   // cor/luz: em TODA troca (parado ou andando)
-      if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow) }
+      if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow, step: switchStep) }
       else { onSwitch?(["etapa": "rapida", "de": "\(pf.id)", "para": "\(sid)", "medido": still ? "ocupado" : "zoom andando (o movimento esconde)"]) }
     }
     if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving, sensor: sid) }
@@ -190,17 +195,19 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   }
   // troca vista na saída rápida (zoom parado): mede o pulo entre o último quadro da lente velha e o 1º da nova e avisa a
   // tela/arquivo ~0,45 s antes de o quadro estabilizado da nova chegar
-  private func measureFastSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, pts: Double, from: Int, to: Int, crop: Double) {
+  private func measureFastSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, pts: Double, from: Int, to: Int, crop: Double, step: Double = 1) {
     switchQueue.async {
       var m: (g: SwitchGeometry, conf: Float, gain: Float)?
       if let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) { m = ZoomImage.switchGeo(ZoomImage.prep(ta), ZoomImage.prep(tb)) }
+      // só o pulo da LENTE: o quadro novo também está `step` mais perto pelo próprio zoom (a ampliação k cuida disso)
+      m = m.map { (SwitchGeometry(s: $0.g.s * Float(step), tx: $0.g.tx, ty: $0.g.ty, exact: true), $0.conf, $0.gain) }
       // previsão pro quadro estabilizado: escala × razão aprendida deste par (o corte da estabilização pode mudar com a lente),
       // deslocamento × corte (o estabilizado mostra 1/corte do quadro rápido); sem medida: o que este par costuma fazer
       var pred: SwitchGeometry?
       if let m { let c = Float(max(1, crop)); pred = SwitchGeometry(s: m.g.s * SwitchMemory.ratio(from: from, to: to), tx: m.g.tx * c, ty: m.g.ty * c, exact: true) }
       else if let s = SwitchMemory.scale(from: from, to: to) { pred = SwitchGeometry(s: s, tx: 0, ty: 0, exact: true) }
-      self.switchHider.add(t: pts, from: from, to: to, fast: m?.g, pred: pred)
-      var info: [String: String] = ["etapa": "rapida", "de": "\(from)", "para": "\(to)", "medido": m.map { Self.geoText($0.g) + String(format: " conf %.2f", $0.conf) } ?? "não deu"]
+      self.switchHider.add(t: pts, from: from, to: to, fast: m?.g, pred: pred, step: step)
+      var info: [String: String] = ["etapa": "rapida", "de": "\(from)", "para": "\(to)", "passo": String(format: "%.4f", step), "medido": m.map { Self.geoText($0.g) + String(format: " conf %.2f", $0.conf) } ?? "não deu"]
       if let pred { info["previsto"] = Self.geoText(pred); info["preparo"] = Self.geoText(SwitchPlan.pre(pred)) }
       self.onSwitch?(info)
       self.lock.lock(); self.switchBusy = false; self.lock.unlock()
@@ -232,7 +239,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // 1º quadro estabilizado da lente nova (fila dos quadros, antes da tela e do arquivo): mede em volta da previsão
   private func measureStabSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, ev: LensSwitchHider.Event) {
     var m: (g: SwitchGeometry, conf: Float, gain: Float)?
-    if let around = ev.pred, let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) { m = ZoomImage.switchGeo(ZoomImage.prep(ta), ZoomImage.prep(tb), around: around) }
+    if let around = ev.pred, let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) {
+      let st = Float(ev.step)
+      m = ZoomImage.switchGeo(ZoomImage.prep(ta), ZoomImage.prep(tb), around: SwitchGeometry(s: around.s / st, tx: around.tx, ty: around.ty, exact: true))
+      m = m.map { (SwitchGeometry(s: $0.g.s * st, tx: $0.g.tx, ty: $0.g.ty, exact: true), $0.conf, $0.gain) }
+    }
     switchHider.stabMeasured(t: ev.t, g: m?.g)
     if let m { SwitchMemory.record(from: ev.from, to: ev.to, stab: m.g.s, fast: ev.fast?.s) }
     onSwitch?(["etapa": "estabilizado", "de": "\(ev.from)", "para": "\(ev.to)", "previsto": ev.pred.map { Self.geoText($0) } ?? "nada",

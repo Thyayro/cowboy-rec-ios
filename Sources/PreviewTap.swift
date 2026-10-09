@@ -16,6 +16,8 @@ final class PreviewTap: @unchecked Sendable {
   private var frames: [Frame] = []
   private var clipsLeft = 3
   var allowed: () -> Bool = { false }
+  // de volta pra tela = mais 3 trechos (o app fica dias aberto no fundo: os 3 da abertura acabavam de madrugada)
+  func refill() { DispatchQueue.main.async { if !self.active { self.clipsLeft = 3 } } }
   var onClip: ((Data) -> Void)?
 
   // thread da tela, a cada desenho

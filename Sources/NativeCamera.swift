@@ -270,6 +270,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   static let bitrates: [(label: String, bps: Int?)] = [("Máxima do iPhone", nil), ("80 Mb/s", 80_000_000), ("50 Mb/s", 50_000_000), ("35 Mb/s", 35_000_000), ("20 Mb/s (4G)", 20_000_000)]
 
   func start() {
+    renderer.tap.refill()
     Task {
       let camera = await AVCaptureDevice.requestAccess(for: .video)
       let audio = await AVCaptureDevice.requestAccess(for: .audio)

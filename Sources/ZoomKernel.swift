@@ -546,6 +546,7 @@ final class LensSwitchHider: @unchecked Sendable {
     let pre: SwitchGeometry     // preparo da lente velha
     var stab: SwitchGeometry?   // medido no próprio quadro estabilizado
     var stabDone = false
+    var step: Double = 1        // passo de zoom entre o último quadro velho e o 1º novo (troca no fim do zoom), já descontado
     var firstSeen: Double?      // pts do 1º quadro (tela/arquivo) que já via esta troca: a rampa nunca começa antes dele
     // janela do preparo: os últimos 0,35 s da lente velha, ou do 1º quadro que já sabia da troca (estabilização com pouco
     // atraso); sem tempo nenhum = sem preparo (fica como antes: nunca pior)
@@ -558,11 +559,11 @@ final class LensSwitchHider: @unchecked Sendable {
   func reset() { lock.lock(); events.removeAll(); lock.unlock() }
   var count: Int { lock.lock(); defer { lock.unlock() }; return events.count }
   // saída rápida: trocou de sensor com o zoom parado (t = pts do 1º quadro da lente nova)
-  func add(t: Double, from: Int, to: Int, fast: SwitchGeometry?, pred: SwitchGeometry?) {
+  func add(t: Double, from: Int, to: Int, fast: SwitchGeometry?, pred: SwitchGeometry?, step: Double = 1) {
     let p = pred.map { SwitchPlan.pre($0) } ?? SwitchGeometry(exact: true)
     lock.lock()
     events.removeAll { $0.t < t - 4 }
-    events.append(Event(t: t, from: from, to: to, fast: fast, pred: pred, pre: p, stab: nil))
+    events.append(Event(t: t, from: from, to: to, fast: fast, pred: pred, pre: p, stab: nil, step: step))
     events.sort { $0.t < $1.t }
     lock.unlock()
   }
