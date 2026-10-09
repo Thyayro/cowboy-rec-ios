@@ -560,7 +560,12 @@ final class LensSwitchHider: @unchecked Sendable {
   func reset() { lock.lock(); events.removeAll(); lock.unlock() }
   var count: Int { lock.lock(); defer { lock.unlock() }; return events.count }
   // saída rápida: trocou de sensor com o zoom parado (t = pts do 1º quadro da lente nova)
+  // deslocamento abaixo do ruído da medida (~0,3% do quadro, fração de ponto) = zero: corrigir ruído só mexia a imagem
+  static func quiet(_ g: SwitchGeometry?) -> SwitchGeometry? {
+    g.map { SwitchGeometry(s: $0.s, tx: abs($0.tx) < 0.003 ? 0 : $0.tx, ty: abs($0.ty) < 0.003 ? 0 : $0.ty, exact: true) }
+  }
   func add(t: Double, from: Int, to: Int, fast: SwitchGeometry?, pred: SwitchGeometry?, step: Double = 1) {
+    let pred = Self.quiet(pred)
     let p = pred.map { SwitchPlan.pre($0) } ?? SwitchGeometry(exact: true)
     lock.lock()
     events.removeAll { $0.t < t - 4 }
@@ -574,6 +579,7 @@ final class LensSwitchHider: @unchecked Sendable {
     return events.last { $0.from == from && $0.to == to && !$0.stabDone && abs($0.t - p) < 0.1 }
   }
   func stabMeasured(t: Double, g: SwitchGeometry?) {
+    let g = Self.quiet(g)
     lock.lock(); if let i = events.firstIndex(where: { $0.t == t }) { events[i].stab = g; events[i].stabDone = true }; lock.unlock()
   }
   // geometria do quadro estabilizado de pts p feito pelo sensor id; hold = a tela não mostra este quadro (segura o anterior)
