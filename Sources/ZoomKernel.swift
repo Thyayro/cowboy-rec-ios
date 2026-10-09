@@ -392,11 +392,12 @@ final class FastZoomTracker: @unchecked Sendable {
   private var key: (pts: Double, img: [Float], acc: Double, predAcc: Double)?
   private var chain: [(Double, Double)] = []   // (pts, log do zoom real acumulado)
   private var acc = 0.0, predAcc = 0.0
+  private var seg: (acc: Double, pred: Double, pts: Double)?   // início do zoom em andamento (pra ancorar no fim)
   var useKey = true   // medir contra quadro de referência (true) ou contra o vizinho (false)
   private(set) var measured = 0, guessed = 0
   private(set) var confs: [Float] = []
   private(set) var resids: [Float] = []
-  func reset() { queue.async { self.prev = nil; self.key = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.predAcc = 0; self.lock.unlock() } }
+  func reset() { queue.async { self.prev = nil; self.key = nil; self.seg = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.predAcc = 0; self.lock.unlock() } }
   var newestPTS: Double? { lock.lock(); defer { lock.unlock() }; return chain.last?.0 }
   // fila da saída rápida: só enfileira (a medida roda na fila própria, em ordem)
   func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool, sensor: Int = 0) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving, sensor: sensor) } }
@@ -406,6 +407,7 @@ final class FastZoomTracker: @unchecked Sendable {
     // lente trocou (0.8.2): não mede entre quadros de lentes diferentes (a troca é do LensSwitchHider; medir por cima dela
     // dava ampliação errada = "volta estranha" na pinça que cruza lente)
     if sensor != keySensor { key = nil; keySensor = sensor }
+    if moving && seg == nil { seg = (acc, predAcc, pts) }
     var pred = 1.0
     if let pv = prev, pts > pv.pts, zHist > 0, pv.z > 0 { pred = zHist / pv.z }
     prev = (pts, zHist)
@@ -426,6 +428,18 @@ final class FastZoomTracker: @unchecked Sendable {
       } else { key = (pts, img, next, predAcc) }
     } else if !moving { key = nil }
     acc = next
+    if !moving, let sg = seg {
+      seg = nil
+      // FIM DO ZOOM (0.9.0): parado, o zoom real é o pedido. A medida encadeada que derivou (1–2% num zoom longo) é
+      // redistribuída ao longo do zoom, proporcional ao caminho — sem isso a tela "voltava" quando o quadro parado chegava
+      let meas = acc - sg.acc, d = meas - (predAcc - sg.pred)
+      if abs(meas) > 0.01, abs(d) > 1e-4, abs(d) < log(1.15) {
+        lock.lock()
+        for i in chain.indices where chain[i].0 >= sg.pts { chain[i].1 -= d * min(1, max(0, (chain[i].1 - sg.acc) / meas)) }
+        lock.unlock()
+        acc -= d
+      }
+    }
     lock.lock(); chain.append((pts, acc)); if chain.count > 600 { chain.removeFirst(chain.count - 600) }; lock.unlock()
   }
   // zoom real do quadro rápido mais novo ÷ zoom real do quadro de horário t (nil = horário fora da curva)
@@ -540,6 +554,10 @@ enum SwitchPlan {
 
 final class LensSwitchHider: @unchecked Sendable {
   static let preWindow = 0.35, postWindow = 0.6, flash = 0.2
+  // 0.9.0: o app DESLIGA a geometria (troca com o zoom parado = dissolve curto na tela e no arquivo). O preparo ampliava
+  // até ~5% antes da troca e desampliava depois, com a imagem parada = a "volta" ao estacionar (medido nos trechos da 0.8.9,
+  // com deslocamento medido em confiança 0,04). Ida-e-volta rápida continua segurando o quadro.
+  static var geometryOn = true
   struct Event {
     let t: Double; let from: Int; let to: Int
     let fast: SwitchGeometry?   // medido na saída rápida
@@ -596,6 +614,7 @@ final class LensSwitchHider: @unchecked Sendable {
         if id == ev[i].to && p >= ev[i].t - 0.001 && p < ev[j].t - 0.001 { hold = true }
       } }
     }
+    if !Self.geometryOn { return (.identity, hold) }
     // com que geometria a lente nova ENTRA: preparo ∘ pulo medido, somado ao que a lente anterior ainda carregava (troca
     // logo depois de outra — no arquivo a ida-e-volta não é segurada)
     var q: [Int: SwitchGeometry] = [:]

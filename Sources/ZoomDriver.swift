@@ -101,36 +101,21 @@ final class ZoomDriver: @unchecked Sendable {
   var onTrace: ((String) -> Void)?
   func endFollow() { lock.lock(); gestureDir = 0; gestureRef = 0; traceUntil = lastTick + 1.2; trace = []; lock.unlock() }   // soltou o dedo: o zoom termina de chegar no alvo (amortecido) e para sozinho
   // lente: deslizamento com velocidade constante (em potências de 2), um valor por quadro
-  @discardableResult func glide(to factor: CGFloat, seconds: Double = 0.42, floor minDur: Double = 0.2) -> Double {
-    lock.lock(); target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
+  // ZOOM DE EDIÇÃO (0.9.0): o toque numa lente vai QUADRO A QUADRO por uma rampa que acelera do parado e desacelera até
+  // parar (ease in-out), na duração pedida (rápido ≈ 0,13–0,16 s). A rampa NATIVA não obedece a velocidade: acelera devagar
+  // por dentro, e a chegada em 3 etapas (0.8.8) pegava o zoom no meio do caminho — medido nos trechos da 0.8.9: 0,5→1 levava
+  // 1,1 s em vez de 0,3, e o "rápido" ficava MAIS lento que o lento. Aqui cada valor tem hora exata (registro `setLog`).
+  @discardableResult func glide(to factor: CGFloat, seconds: Double = 0.32, floor minDur: Double = 0.15) -> Double {
+    lock.lock(); target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; glideGen += 1; let d = device; lock.unlock()
     guard let d else { return 0 }
     let to = clamp(d, factor), from = d.videoZoomFactor
     let stops = abs(log2(Double(to / from)))
     guard stops > 0.003 else { return 0 }
-    let spread: Double = 0.6 + 0.4 * min(1.0, stops / 2.0)
-    let duration: Double = max(minDur, seconds * spread)   // 0.8.9: rápido/médio/lento (lento = o de até a 0.8.8)
-    let rate = max(0.8, stops / duration)
-    let dur = stops / rate
-    // rampa nativa (0.7.7): o deslizamento por quadro (0.7.5–0.7.6) deixou o foco estranho na troca de lente — a rampa do
-    // AVFoundation prepara a próxima câmera; o registro exato fica só pra pinça.
-    // CHEGADA SUAVE (0.8.2): 85% do caminho na velocidade normal e o fim a 1/3 dela (duas rampas nativas). Parada seca =
-    // qualquer erro de tempo no fim vira "volta" de escala na tela (o 0,5→1 ainda mostrava); devagar no fim, quase nada.
-    guard stops > 0.12 else { configure(d) { d.ramp(toVideoZoomFactor: to, withRate: Float(rate)) }; return dur }
-    // 0.8.8: 3 etapas (85% normal, 12% a 1/3, 3% a 1/9) — o zoom chega QUASE PARANDO: o erro de tempo da tela no pouso
-    // (que vira "estacionar") cai junto com a velocidade final
-    func at(_ f: Double) -> CGFloat { CGFloat(exp(log(Double(from)) + (log(Double(to)) - log(Double(from))) * f)) }
-    let d1 = 0.85 * stops / rate, d2 = 0.12 * stops / (rate / 3), d3 = 0.03 * stops / (rate / 9)
-    lock.lock(); glideGen += 1; let gen = glideGen; lock.unlock()
-    configure(d) { d.ramp(toVideoZoomFactor: at(0.85), withRate: Float(rate)) }
-    for (delay, goal, r) in [(d1, at(0.97), rate / 3), (d1 + d2, to, rate / 9)] {
-      DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) { [weak self] in
-        guard let self else { return }
-        self.lock.lock(); let ok = self.glideGen == gen && self.target == nil; let dev = self.device; self.lock.unlock()
-        guard ok, let dev else { return }
-        self.configure(dev) { dev.ramp(toVideoZoomFactor: goal, withRate: Float(r)) }
-      }
-    }
-    return d1 + d2 + d3
+    let dur = max(minDur, seconds * (0.7 + 0.3 * min(1, stops / 3.3)))
+    configure(d) { if d.isRampingVideoZoom { d.cancelVideoZoomRamp() } }
+    lock.lock(); glidePlan = (from, to, dur, nil); let direct = CACurrentMediaTime() - lastTickWall > 0.25; lock.unlock()
+    if direct { put(d, to) }   // sem quadros chegando: direto
+    return dur
   }
   // degrau direto (calibração)
   func jump(to factor: CGFloat) {
@@ -161,7 +146,8 @@ final class ZoomDriver: @unchecked Sendable {
       let k = min(1, max(0, (t - g.t0!) / max(0.001, g.dur)))
       // o 1º quadro do deslizamento já anda um passo (igual à rampa nativa)
       let kk = min(1, k + 1.0 / 60 / max(0.001, g.dur))
-      let z = CGFloat(exp(log(Double(g.from)) + (log(Double(g.to)) - log(Double(g.from))) * kk))
+      let e = kk * kk * (3 - 2 * kk)   // rampa de edição: acelera do parado e desacelera até parar
+      let z = CGFloat(exp(log(Double(g.from)) + (log(Double(g.to)) - log(Double(g.from))) * e))
       if kk >= 1 { glidePlan = nil }
       lock.unlock()
       put(d, clamp(d, z))

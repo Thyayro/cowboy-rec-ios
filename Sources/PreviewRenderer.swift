@@ -66,6 +66,18 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   var blurShutter: (() -> Double)?   // obturador sintético agora (s), já sem a exposição real
   var blurFOV = 106.0                // campo horizontal do formato no zoom 1 do aparelho (graus)
   var blurHot = false                // aparelho quente: menos cópias na tela (o arquivo não muda)
+  // TOQUE NAS LENTES (0.9.0): do toque em diante a tela mostra o QUADRO como ele é (igual ao arquivo: o zoom de edição com o
+  // rastro dele), sem ampliação adivinhada — num zoom de milissegundos, 5 ms de erro na adivinhação viram ~10% de escala
+  // ("volta" ao estacionar). A pinça continua "na hora" (amplia o quadro atrasado pelo zoom medido).
+  private var tapRef: Double?
+  private var tapDZ = 1.0
+  func tapStart(dz: Double) { lock.lock(); tapRef = CACurrentMediaTime(); tapDZ = max(1, dz); lock.unlock() }
+  func tapEnd() { lock.lock(); if tapRef != nil { tapRef = nil }; lock.unlock() }
+  // troca de lente com o zoom parado (0.9.0): dissolve curto do último quadro da lente velha, sem ampliar/desampliar
+  private var prevShown: (image: CIImage, sid: Int)?
+  private var xfade: (image: CIImage, t0: Double)?
+  static let xfadeDur = 0.18
+  private var lastDrawAt = 0.0
   private var focusWatch: (t0: Double, before: Float, items: [String], from: Int, to: Int)?
   var stabSampling = false   // amostras do estabilizado pro alinhador antigo (só o teste antigo; o arquivo usa a troca medida)
   var frameZoom: ((Double) -> Double?)?
@@ -268,7 +280,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   }
   // desfoque do quadro captado em p — a MESMA conta pra tela e arquivo (o arquivo chama da fila dos quadros): zoom do
   // conteúdo (registro da tela, adiantado como o resto da ampliação) × digital, giro suavizado e distância focal do quadro
-  func blurParams(at p: Double, width: Double, height: Double) -> BlurParams {
+  func contentZoomSpeed(at p: Double) -> Double {   // d ln(zoom)/dt do conteúdo do quadro captado em p (só o aparelho)
+    let h = 1.0 / 60
+    lock.lock(); let a = zoomAt(p + Self.contentLead - h), b = zoomAt(p + Self.contentLead + h); lock.unlock()
+    guard let a, let b, a > 0, b > 0 else { return 0 }
+    return log(b / a) / (2 * h)
+  }
+  func blurParams(at p: Double, width: Double, height: Double, zoomSpeed: Double? = nil) -> BlurParams {
     guard let shutter = blurShutter?(), shutter > 0.0002 else { return .none }
     let h = 1.0 / 60
     lock.lock()
@@ -278,30 +296,34 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let za, let zb, za > 0, zb > 0 { v = log(zb / za) / (2 * h) }
     var d0 = 1.0
     if let dAt = digitalAt { d0 = dAt(p); let da = dAt(p - h), db = dAt(p + h); if da > 0, db > 0 { v += log(db / da) / (2 * h) } }
+    if let zoomSpeed { v = zoomSpeed }
     let w = MotionHub.shared.rotation(around: p) ?? (x: 0, y: 0, z: 0)
     let f = MotionBlur.focalNorm(fovDegrees: blurFOV, zoomRaw: z0 ?? 1, crop: c, digital: d0)
     return MotionBlur.params(zoomSpeed: v, omega: w, shutter: shutter, focalNorm: f, width: width, height: height)
   }
   // rastro na tela: cópias do quadro (já na escala da tela, antes do LUT — igual ao arquivo) ao longo do caminho; só nos
   // quadros com movimento (parado = nada a mais pra GPU)
-  private func previewBlur(_ image: CIImage, raw: CIImage, at p: Double, orient: CGImagePropertyOrientation, mirror: Bool, scale: Double, fit: CGRect) -> CIImage {
+  private func previewBlur(_ image: CIImage, raw: CIImage, at p: Double, orient: CGImagePropertyOrientation, mirror: Bool, scale: Double, fit: CGRect, zoomSpeed: Double? = nil) -> CIImage {
     let W = Double(raw.extent.width), H = Double(raw.extent.height)
-    let bp = blurParams(at: p, width: W, height: H)
-    let n = bp.samples(pxScale: scale, spacing: 5, max: blurHot ? 3 : 6)
-    guard n > 1 else { return image }
+    let bp = blurParams(at: p, width: W, height: H, zoomSpeed: zoomSpeed)
+    let st = bp.stages(pxScale: scale, spacing: 5, cap: blurHot ? 3 : 5)
+    guard st.0 > 1 else { return image }
     // vetor: quadro do sensor (y pra baixo) -> Core Image (y pra cima) -> orientação da tela -> escala da tela
     let t = raw.orientationTransform(for: orient)
     let vx = bp.mx * W, vy = -bp.my * H
     var dx = Double(t.a) * vx + Double(t.c) * vy, dy = Double(t.b) * vx + Double(t.d) * vy
     if mirror { dx = -dx }
-    return Self.blurred(image, zoom: bp.zoom, dx: dx * scale, dy: dy * scale, n: n, center: CGPoint(x: fit.midX, y: fit.midY), fit: fit)
+    let c = CGPoint(x: fit.midX, y: fit.midY)
+    var out = Self.blurred(image, zoom: bp.zoom, dx: dx * scale, dy: dy * scale, roll: bp.roll, n: st.0, center: c, fit: fit)
+    if st.1 > 1 { let k = Double(st.0); out = Self.blurred(out, zoom: bp.zoom / k, dx: dx * scale / k, dy: dy * scale / k, roll: bp.roll / k, n: st.1, center: c, fit: fit) }   // 2ª etapa: o passo da 1ª
+    return out
   }
-  static func blurred(_ image: CIImage, zoom: Double, dx: Double, dy: Double, n: Int, center c: CGPoint, fit: CGRect) -> CIImage {
+  static func blurred(_ image: CIImage, zoom: Double, dx: Double, dy: Double, roll: Double = 0, n: Int, center c: CGPoint, fit: CGRect) -> CIImage {
     let src = image.clampedToExtent()
     var acc: CIImage?
     for i in 0..<n {
       let u = MotionBlur.u(i, n), s = exp(zoom * u)
-      let t = CGAffineTransform(translationX: -c.x, y: -c.y).concatenating(CGAffineTransform(scaleX: s, y: s)).concatenating(CGAffineTransform(translationX: c.x + dx * u, y: c.y + dy * u))
+      let t = CGAffineTransform(translationX: -c.x, y: -c.y).concatenating(CGAffineTransform(rotationAngle: roll * u)).concatenating(CGAffineTransform(scaleX: s, y: s)).concatenating(CGAffineTransform(translationX: c.x + dx * u, y: c.y + dy * u))
       let copy = src.transformed(by: t).cropped(to: fit)
       // média uniforme por dissolução encadeada (a k-ésima cópia entra com peso 1/k): sem alfa parcial no caminho
       acc = acc.map { $0.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: copy, kCIInputTimeKey: 1.0 / Double(i + 1)]) } ?? copy
@@ -370,7 +392,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; prevShown = nil; xfade = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -417,6 +439,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let buffer = pending, pts = pendingPTS, sid = pendingSID; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0 + Self.contentLead) }
     let zNewest = newestFast.flatMap { zoomAt($0 + Self.contentLead) }   // conteúdo adiantado ~25 ms em relação ao zoom lido
+    let tapT = tapRef, tapDz = tapDZ, zTap = tapRef.flatMap { zoomAt($0) }, zDisp30 = zoomAt(now - 1.0 / 30)
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
@@ -428,8 +451,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let livePTS = fastPTS
     if live { fastFresh = false; pending = nil }
     lock.unlock()
-    let dz = max(1, digitalNow?() ?? 1)
-    let dMoved = abs(dz - lastDZ) > 1e-4; lastDZ = dz
+    let dzNow = max(1, digitalNow?() ?? 1)
+    let dMoved = abs(dzNow - lastDZ) > 1e-4
+    let dzSpeed = lastDrawAt > 0 ? log(dzNow / max(1, lastDZ)) / max(1.0 / 120, now - lastDrawAt) : 0
+    lastDZ = dzNow; lastDrawAt = now
+    var dz = dzNow
     tap.tick(now: now, moving: zoomMovedNow || dMoved)
     if live {
       guard let liveFrame else { return }
@@ -447,17 +473,22 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if !sw.g.isIdentity { raw = Self.aligned(raw, sw.g) }   // no quadro do sensor (mesma conta do arquivo)
     var image = Self.orient(raw, orient, mirrored: mirror)
     // ampliação = zoom pedido agora ÷ zoom do conteúdo do quadro; nunca < 1 (zoom out: o quadro como está, sem borda inventada)
+    // toque: a referência é o zoom do instante do toque (a tela não corre na frente do quadro); do toque em diante, k = 1
+    let zRef: Double? = zTap ?? zNow
+    let tapContent = tapT != nil && (pts ?? 0) >= (tapT ?? 0) - 0.01
+    if let tr = tapT { dz = (pts ?? 0) >= tr - 0.01 ? max(1, digitalAt?(pts ?? 0) ?? 1) : tapDz }
     var kOld = 1.0
-    if zoomInstant, let zNow, let zFrame, zFrame > 0 { kOld = max(1, min(6, zNow / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
+    if zoomInstant, let zN0 = zRef, let zFrame, zFrame > 0 { kOld = max(1, min(6, zN0 / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
     var k = kOld
     if zoomInstant, let p = pts, let rr = zoomTrack.ratio(newestOver: p) {
       // 0.8.8: o quadro rápido mais novo medido é de ~50 ms atrás — o zoom que ainda andou até agora (pelo zoom pedido, liso
       // e conhecido) entra junto; sem isso a tela POUSAVA curta (~3,6% no 0,5→1 de dia) e completava depois de parar
       var r = rr
-      if let zN = zNow, zN > 0, let zH = zNewest, zH > 0 { r *= zN / zH }
+      if let zN = zRef, zN > 0, let zH = zNewest, zH > 0 { r *= zN / zH }
       k = max(1, min(6, r)); if abs(k - 1) < 0.0005 { k = 1 }
     }   // zoom REAL medido
-    else if zoomInstant, let zNow, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
+    else if zoomInstant, let zN0 = zRef, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zN0 / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
+    if tapContent { k = 1; kOld = 1 }
     if let pts { lock.lock(); shownK.append((pts, k, kOld, now)); if shownK.count > 600 { shownK.removeFirst(shownK.count - 600) }; lock.unlock() }
     // scale first: the LUT runs on screen pixels, not on 4K
     let scale = min(target.width / image.extent.width, target.height / image.extent.height)
@@ -469,10 +500,22 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = image.transformed(by: CGAffineTransform(scaleX: scale * k * dz, y: scale * k * dz))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
     image = image.cropped(to: fit)
-    if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: scale * k * dz, fit: fit) }
+    // rastro do zoom na tela: na pinça "na hora" a tela anda com o zoom de AGORA (o quadro atrasado é ampliado); no toque a tela
+    // mostra o quadro como ele é, com o movimento que ele carrega
+    var screenSpeed: Double?
+    if zoomInstant && tapT == nil, let zN = zNow, zN > 0, let z30 = zDisp30, z30 > 0 { screenSpeed = log(zN / z30) * 30 + dzSpeed }
+    if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: scale * k * dz, fit: fit, zoomSpeed: screenSpeed) }
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
+    // troca de lente com o zoom parado: dissolve curto do último quadro da lente velha (0.9.0) — no meio do zoom o movimento esconde
+    if let pv = prevShown, pv.sid != 0, sid != 0, pv.sid != sid, let p = pts, abs(contentZoomSpeed(at: p)) < 0.4 { xfade = (pv.image, now) }
+    let fresh = image
+    if let x = xfade {
+      let a = (now - x.t0) / Self.xfadeDur
+      if a >= 1 || a < 0 { xfade = nil } else { image = x.image.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: image, kCIInputTimeKey: a * a * (3 - 2 * a)]) }
+    }
+    prevShown = (fresh, sid)
     if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true

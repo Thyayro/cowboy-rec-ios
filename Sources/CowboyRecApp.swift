@@ -333,7 +333,7 @@ struct RecorderView: View {
         Image(systemName: "sparkles").font(.system(size: 12, weight: .bold))
         Text(camera.fxRender ? "RENDER" : "LIVE").font(.system(size: 12, weight: .heavy))
         Text("·").opacity(0.6)
-        Text(camera.motionBlur ? (camera.blurStrong ? "Desfoque forte" : "Desfoque") : "Sem desfoque").font(.system(size: 12, weight: .semibold))
+        Text(camera.motionBlur ? (camera.blurAngle >= 720 ? "Desfoque pesado" : camera.blurAngle >= 360 ? "Desfoque forte" : "Desfoque") : "Sem desfoque").font(.system(size: 12, weight: .semibold))
         Text("·").opacity(0.6)
         Text("Zoom " + NativeCamera.zoomSpeeds[max(0, min(2, camera.zoomSpeed))].label.lowercased()).font(.system(size: 12, weight: .semibold))
       }
@@ -351,7 +351,7 @@ struct RecorderView: View {
         if camera.fxRender { pill("Ver como render", camera.previewAsRender) { camera.setPreviewAsRender(!camera.previewAsRender) } }
         Divider().frame(height: 20)
         pill(camera.motionBlur ? "Desfoque ON" : "Desfoque OFF", camera.motionBlur) { camera.setMotionBlur(!camera.motionBlur) }
-        if camera.motionBlur { pill("Forte 360°", camera.blurStrong) { camera.setBlurStrong(!camera.blurStrong) } }
+        if camera.motionBlur { ForEach(MotionBlur.angles, id: \.self) { a in pill(a == 180 ? "Natural" : a == 360 ? "Forte" : "Pesado", camera.blurAngle == a) { camera.setBlurAngle(a) } } }
         Divider().frame(height: 20)
         ForEach(NativeCamera.zoomSpeeds.indices, id: \.self) { i in pill(NativeCamera.zoomSpeeds[i].label, camera.zoomSpeed == i) { camera.setZoomSpeed(i) } }
       }.padding(.horizontal, 14)

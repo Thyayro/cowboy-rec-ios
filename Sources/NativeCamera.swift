@@ -20,6 +20,17 @@ final class SegmentWriter: NSObject, AVAssetWriterDelegate, @unchecked Sendable 
   private(set) var dropped = 0
   private(set) var error: String?
   var onSegment: ((Data) -> Void)?
+  // 0.9.0: a tomada das 18:24 (0.8.9) subiu com 0 pedaços de vídeo (32 s, 549 quadros perdidos) — contadores pro diagnóstico
+  private(set) var vOK = 0, aOK = 0, aSkip = 0, segs = 0, segBytes = 0
+  private var audioDone = false
+  var statusCode: Int { writer.status.rawValue }
+  // áudio que não entra (ou parou) faz o gravador segurar o vídeo esperando intercalar e não soltar pedaço nenhum: fecha a
+  // faixa de áudio e o vídeo segue (melhor uma tomada sem som do que nenhuma)
+  func endAudio() {
+    guard !audioDone, let a = audio, start != nil, writer.status == .writing else { return }
+    audioDone = true
+    _ = CowboyObjC.catching { a.markAsFinished() }
+  }
   static func make(video videoSettings: [String: Any], audio audioSettings: [String: Any]?, transform: CGAffineTransform, file: URL?) throws -> SegmentWriter {
     var made: SegmentWriter?
     var thrown: Error?
@@ -75,23 +86,27 @@ final class SegmentWriter: NSObject, AVAssetWriterDelegate, @unchecked Sendable 
     if video.isReadyForMoreMediaData {
       var appended = false
       if let ex = CowboyObjC.catching({ appended = self.video.append(sample) }) { error = ex; return }
-      if !appended { dropped += 1 }
+      if appended { vOK += 1 } else { dropped += 1 }
     } else { dropped += 1 }
   }
   func appendAudio(_ sample: CMSampleBuffer) {
-    guard error == nil, let start, let audio, writer.status == .writing, CMSampleBufferGetPresentationTimeStamp(sample) >= start, audio.isReadyForMoreMediaData else { return }
-    if let ex = CowboyObjC.catching({ _ = audio.append(sample) }) { error = ex }
+    guard error == nil, !audioDone, let start, let audio, writer.status == .writing, CMSampleBufferGetPresentationTimeStamp(sample) >= start else { return }
+    guard audio.isReadyForMoreMediaData else { aSkip += 1; return }
+    var ok = false
+    if let ex = CowboyObjC.catching({ ok = audio.append(sample) }) { error = ex; return }
+    if ok { aOK += 1 } else { aSkip += 1 }
   }
   func finish(_ done: @escaping @Sendable (Bool) -> Void) {
     guard start != nil, writer.status == .writing else { _ = CowboyObjC.catching { self.writer.cancelWriting() }; done(false); return }
     let w = writer
     let ex = CowboyObjC.catching {
-      self.video.markAsFinished(); self.audio?.markAsFinished()
+      self.video.markAsFinished(); if !self.audioDone { self.audio?.markAsFinished() }
       w.finishWriting { done(w.status == .completed) }
     }
     if ex != nil { done(false) }
   }
   func assetWriter(_ writer: AVAssetWriter, didOutputSegmentData segmentData: Data, segmentType: AVAssetSegmentType, segmentReport: AVAssetSegmentReport?) {
+    segs += 1; segBytes += segmentData.count
     onSegment?(segmentData)
   }
 }
@@ -197,10 +212,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   //  - Live (padrão): tela e arquivo com o rastro (no shader do arquivo, só nos quadros com movimento: parado não custa);
   //  - Render: grava LIMPO (menos GPU gravando) e a VPS aplica depois, pela mesma conta (arquivo de efeitos .fx);
   //    "ver como render" mostra na tela exatamente o rastro que o render vai pôr.
-  static let zoomSpeeds: [(label: String, seconds: Double, floor: Double)] = [("Rápido", 0.16, 0.09), ("Médio", 0.27, 0.14), ("Lento", 0.42, 0.2)]
+  static let zoomSpeeds: [(label: String, seconds: Double, floor: Double)] = [("Rápido", 0.16, 0.08), ("Médio", 0.32, 0.15), ("Lento", 0.55, 0.3)]
   @Published var zoomSpeed = max(0, min(2, UserDefaults.standard.object(forKey: "zoomSpeed") as? Int ?? 1))
   @Published var motionBlur = UserDefaults.standard.object(forKey: "motionBlur") as? Bool ?? true
-  @Published var blurStrong = UserDefaults.standard.object(forKey: "blurStrong") as? Bool ?? false
+  @Published var blurAngle = MotionBlur.angles.contains(UserDefaults.standard.integer(forKey: "blurAngle")) ? UserDefaults.standard.integer(forKey: "blurAngle") : 720   // pesado (After Effects) por padrão
   @Published var fxRender = UserDefaults.standard.object(forKey: "fxRender") as? Bool ?? false
   @Published var previewAsRender = UserDefaults.standard.object(forKey: "previewAsRender") as? Bool ?? false
   private var fxAngle = 180.0     // cópia do "forte" pra quem lê fora da thread principal
@@ -208,15 +223,18 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private var fxLogOn = false     // tomada atual: cada quadro com rastro vira linha no arquivo de efeitos (Render)
   private var fxBuffer = ""
   private var fxLines = 0
+  private var lastFileFrame: (pixel: CVPixelBuffer, sid: Int, geo: SwitchGeometry)?
+  private var fileXF: (pixel: CVPixelBuffer, t0: Double, geo: SwitchGeometry)?
+  private var writerStall = 0
   func setZoomSpeed(_ v: Int) { zoomSpeed = max(0, min(2, v)); UserDefaults.standard.set(zoomSpeed, forKey: "zoomSpeed"); Diag.step("fx", ["zoom": Self.zoomSpeeds[zoomSpeed].label], send: false) }
   func setMotionBlur(_ on: Bool) { motionBlur = on; UserDefaults.standard.set(on, forKey: "motionBlur"); syncEffects() }
-  func setBlurStrong(_ on: Bool) { blurStrong = on; UserDefaults.standard.set(on, forKey: "blurStrong"); syncEffects() }
+  func setBlurAngle(_ a: Int) { blurAngle = MotionBlur.angles.contains(a) ? a : 720; UserDefaults.standard.set(blurAngle, forKey: "blurAngle"); syncEffects() }
   func setFXRender(_ on: Bool) { fxRender = on; UserDefaults.standard.set(on, forKey: "fxRender"); syncEffects() }
   func setPreviewAsRender(_ on: Bool) { previewAsRender = on; UserDefaults.standard.set(on, forKey: "previewAsRender"); syncEffects() }
   func syncEffects() {
     renderer.blurPreview = motionBlur && (!fxRender || previewAsRender)
-    fxAngle = blurStrong ? 360 : 180
-    Diag.step("fx", ["desfoque": motionBlur ? (blurStrong ? "360" : "180") : "off", "modo": fxRender ? "render" : "live", "tela": renderer.blurPreview ? "com rastro" : "limpa", "zoom": Self.zoomSpeeds[zoomSpeed].label], send: false)
+    fxAngle = Double(blurAngle)
+    Diag.step("fx", ["desfoque": motionBlur ? "\(blurAngle)" : "off", "modo": fxRender ? "render" : "live", "tela": renderer.blurPreview ? "com rastro" : "limpa", "zoom": Self.zoomSpeeds[zoomSpeed].label], send: false)
   }
   static let thumbURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("last_thumb.jpg")
   private var recBaker: LutBaker?
@@ -297,6 +315,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   func start() {
     renderer.tap.refill()
     syncEffects()
+    LensSwitchHider.geometryOn = false   // 0.9.0: troca parada = dissolve (ver ZoomKernel)
     Task {
       let camera = await AVCaptureDevice.requestAccess(for: .video)
       let audio = await AVCaptureDevice.requestAccess(for: .audio)
@@ -871,6 +890,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // digital só se o arquivo for convertido no iPhone (o shader amplia o quadro); senão a tela mostraria o que o arquivo não tem
   var maxDigital: Double { bake709 ? 2.0 : 1.0 }
   func followZoom(_ display: Double) {
+    renderer.tapEnd()   // pinça: a tela volta pro zoom "na hora"
     pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3)
     if ultraLock {
       let want = min(display, Self.ultraEdge * maxDigital)
@@ -913,6 +933,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if !recording && !calibrating && !selfTestMode.isEmpty { aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode) }
   }
   func selectZoom(_ value: Double) {
+    renderer.tapStart(dz: zoomDriver.digital)   // toque: a tela mostra o quadro como ele é (zoom de edição, sem adivinhação)
     recenterFocus("zoom")
     let toUltra = value <= 0.51
     ultraLock = toUltra; UserDefaults.standard.set(toUltra, forKey: "ultraLock")
@@ -1112,7 +1133,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // ---- gravar: direto na nuvem
   func record(owner: String, aspect: String, look: LookPreset) {
     let convert = convertRec709, bitrate = Self.bitrates[max(0, min(Self.bitrates.count - 1, bitrateChoice))].bps
-    let fxLive = motionBlur && !fxRender, fxRend = motionBlur && fxRender, fxDeg = blurStrong ? 360 : 180
+    let fxLive = motionBlur && !fxRender, fxRend = motionBlur && fxRender, fxDeg = blurAngle
     let horizon: Double? = rotation.map { Double($0.videoRotationAngleForHorizonLevelCapture) }   // lido na thread principal
     queue.async {
       guard self.configured, self.session.isRunning, !self.isRecording, let cam = self.device else { return }
@@ -1182,7 +1203,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           self.dataQueue.async {
             self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
             self.recBaker = baker
-            self.fileBlur = fxLive && baker != nil; self.fxLogOn = false; self.fxBuffer = ""; self.fxLines = 0
+            self.fileBlur = fxLive && baker != nil; self.fxLogOn = false; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
             self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = nil; self.elapsedMs = 0
             self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
           }
@@ -1201,7 +1222,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         self.dataQueue.async {
           self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
           self.recBaker = baker
-          self.fileBlur = fxLive && baker != nil; self.fxLogOn = fxRend; self.fxBuffer = ""; self.fxLines = 0
+          self.fileBlur = fxLive && baker != nil; self.fxLogOn = fxRend; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
           self.writer = writer; self.recCid = cid; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = gyro; self.elapsedMs = 0
           MotionHub.shared.attach(gyro)
           self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
@@ -1256,7 +1277,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if let b = self.recBaker, b.failures > 0 { Diag.step("bake-failures", ["n": b.failures, "err": b.lastError]) }
       self.recBaker = nil
       let fx = self.fxBuffer, fxN = self.fxLines
-      self.fxBuffer = ""; self.fxLines = 0; self.fileBlur = false; self.fxLogOn = false
+      self.fxBuffer = ""; self.fxLines = 0; self.fileBlur = false; self.fxLogOn = false; self.lastFileFrame = nil; self.fileXF = nil
       if let file = writer.fileURL {
         let owner = self.recOwner; self.recOwner = nil
         self.publish { self.recording = false; self.finishing = true }
@@ -1280,7 +1301,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         gyro?.close()
         if (gyro?.lines ?? 0) == 0 { try? FileManager.default.removeItem(at: CloudStream.shared.sideFile(cid, kind: "gcsv")) }
         CloudStream.shared.close(cid, durationMs: duration)
-        Diag.step("stop-stream", ["ok": ok, "ms": duration, "dropped": dropped])
+        Diag.step("stop-stream", ["ok": ok, "ms": duration, "dropped": dropped, "pedacos": writer.segs, "mb": writer.segBytes / 1_000_000, "v": writer.vOK, "a": writer.aOK, "a_fora": writer.aSkip, "status": writer.statusCode])
         self.publish { self.finishing = false; if !ok { self.status = "A gravação terminou com erro — o que já subiu está salvo na nuvem" } }
       }
     }
@@ -1353,20 +1374,44 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       recCadence = nil
     }
     // desfoque de movimento (0.8.9): Live = no shader do arquivo; Render = linha no arquivo de efeitos (a VPS aplica)
-    var blur = BlurParams.none, blurN = 1
+    var blur = BlurParams.none, stages = (1, 1)
     if fileBlur || fxLogOn, let pixel {
       blur = renderer.blurParams(at: pts.seconds, width: Double(CVPixelBufferGetWidth(pixel)), height: Double(CVPixelBufferGetHeight(pixel)))
-      blurN = blur.samples(max: 12)
+      stages = blur.stages(cap: 12)
     }
+    // troca de lente com o zoom parado (0.9.0): dissolve curto do último quadro da lente velha, em vez de ampliar/desampliar
+    let sidNow = pixel.map { LensID.of($0) } ?? 0
+    let geoNow = renderer.fileSwitchGeometry(pixel, pts: pts.seconds)
+    if recBaker != nil, let lf = lastFileFrame, lf.sid != 0, sidNow != 0, lf.sid != sidNow, abs(renderer.contentZoomSpeed(at: pts.seconds)) < 0.4 { fileXF = (lf.pixel, pts.seconds, lf.geo) }
+    var xfOld: CVPixelBuffer?, xfBlend: Float = 0, xfGeo = SwitchGeometry.identity
+    if let x = fileXF {
+      let a = (pts.seconds - x.t0) / PreviewRenderer.xfadeDur
+      if a >= 1 || a < 0 { fileXF = nil } else { xfOld = x.pixel; xfBlend = Float(1 - a * a * (3 - 2 * a)); xfGeo = x.geo }
+    }
+    if let pixel, recBaker != nil { lastFileFrame = (pixel, sidNow, geoNow) }
     var baked: CMSampleBuffer?
     if let recBaker {
-      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds, lens: pixel.flatMap { LensID.name($0) }) ?? .identity, geo: renderer.fileSwitchGeometry(pixel, pts: pts.seconds),
-        blur: fileBlur ? blur : .none, samples: blurN)
+      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds, lens: pixel.flatMap { LensID.name($0) }) ?? .identity, geo: geoNow,
+        blur: fileBlur ? blur : .none, stages: stages, old: xfOld, blend: xfBlend, oldGeo: xfGeo)
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)
     if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds) }
-    if fxLogOn, blur.active, let s = recStart { fxBuffer += MotionBlur.line(t: (pts - s).seconds, blur, samples: blurN); fxLines += 1 }
+    if fxLogOn, blur.active, let s = recStart { fxBuffer += MotionBlur.line(t: (pts - s).seconds, blur, stages: stages); fxLines += 1 }
+    // gravador sem soltar pedaço nenhum (0.9.0): diagnóstico e, se o áudio não entra, fecha a faixa de áudio pro vídeo seguir
+    if let s = recStart, writer.fileURL == nil, writer.segs == 0 {
+      let el = (pts - s).seconds
+      if writerStall == 0 && el > 3.5 {
+        writerStall = 1
+        let stuckAudio = writer.hasAudio && (writer.aOK == 0 || writer.aSkip > writer.aOK)
+        Diag.step("writer-sem-pedacos", ["s": String(format: "%.1f", el), "v": writer.vOK, "v_drop": writer.dropped, "a": writer.aOK, "a_fora": writer.aSkip, "status": writer.statusCode, "solta_audio": stuckAudio])
+        if stuckAudio { writer.endAudio() }
+      } else if writerStall == 1 && el > 8 {
+        writerStall = 2
+        Diag.step("writer-sem-pedacos-2", ["v": writer.vOK, "v_drop": writer.dropped, "a": writer.aOK, "a_fora": writer.aSkip, "status": writer.statusCode])
+        writer.endAudio()
+      }
+    }
     if let s = recStart { elapsedMs = Int((pts - s).seconds * 1000) }
     if !thumbDone, let pixel {
       thumbDone = true
