@@ -56,6 +56,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private let switchQueue = DispatchQueue(label: "cowboy.preview.switch", qos: .userInitiated)
   // nitidez da saída rápida antes e 2 s depois de cada troca de lente (prova do foco sem pedir teste, 0.8.2)
   private var lastSharp: Float = 0
+  var focusProbe: (() -> String)?
   private var focusWatch: (t0: Double, before: Float, items: [String], from: Int, to: Int)?
   var stabSampling = false   // amostras do estabilizado pro alinhador antigo (só o teste antigo; o arquivo usa a troca medida)
   var frameZoom: ((Double) -> Double?)?
@@ -209,7 +210,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     lock.lock()
     var done: [String: String]?
     if var w = focusWatch {
-      w.items.append(String(format: "%.0f:%.0f", (pts - w.t0) * 1000, sharp))
+      w.items.append(String(format: "%.0f:%.0f", (pts - w.t0) * 1000, sharp) + (focusProbe?() ?? ""))
       if pts - w.t0 > 2.0 {
         done = ["etapa": "foco", "de": "\(w.from)", "para": "\(w.to)", "antes": String(format: "%.0f", w.before), "depois": w.items.joined(separator: " ")]
         focusWatch = nil

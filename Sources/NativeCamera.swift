@@ -220,10 +220,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // 0.6.8 segurava bem durante o zoom, o ruim era soltar pro contínuo 1,2 s depois (caçava). Agora:
   //  - zoom andando: foco TRAVADO (o AF caça enquanto a imagem muda de tamanho — e a "respiração" muda a escala);
   //  - zoom parou (0,3 s), lente trocou, toque, cena mudou: UM foco rápido (sem o modo suave) e, assentou, contínuo suave.
-  var focusHoldEnabled = true
+  // 0.8.3: a 0.8.2 também entrou borrada na troca (o foco nem se mexia por 2 s). Fim dos ajustes por cima do iPhone: foco
+  // CONTÍNUO sempre (sem trava no zoom, sem foco forçado, sem modo suave) e troca de lente automática — o padrão da Apple,
+  // que é o da câmera nativa. Toque = contínuo no ponto até a cena mudar ou um zoom.
+  var focusHoldEnabled = false
   private var focusHeld = false
-  private var fastFocus: (gen: Int, at: Double)?
-  private var adjustingObservation: NSKeyValueObservation?
   // CALOR (0.8.2): aparelho morno/quente e câmera parada (sem gravar) = 30 qps; gravando, a cadência do formato
   private var idleSlow = false
   private var thermalObserver: NSObjectProtocol?
@@ -463,18 +464,16 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // LEVEZA (0.7.8): a saída rápida só serve à tela e às medidas — quadro do tamanho da tela em vez do 4K inteiro
       // (o celular esquentava e travava os outros apps)
       if fastOK { _ = CowboyObjC.catching { self.fastOut.automaticallyConfiguresOutputBufferDimensions = false; self.fastOut.deliversPreviewSizedOutputBuffers = true } }
-      // troca de lente SÓ pelo zoom (no automático o iPhone também troca sozinho por foco perto/macro e pouca luz — salto no
-      // meio da tomada, com cor e luz diferentes)
-      if cam.isVirtualDevice {
-        if CowboyObjC.catching({ cam.setPrimaryConstituentDeviceSwitchingBehavior(.restricted, restrictedSwitchingBehaviorConditions: [.videoZoomChanged]) }) != nil {
-          cam.setPrimaryConstituentDeviceSwitchingBehavior(.auto, restrictedSwitchingBehaviorConditions: [])
-        }
-      }
+      // troca de lente AUTOMÁTICA (0.8.3) = o padrão da Apple, o mesmo da câmera nativa: o iOS escolhe a lente por zoom,
+      // distância de foco (perto demais pra principal = ultra), luz e obstrução, e cuida do foco na passagem. O "só pelo zoom"
+      // (restricted) e a ultra travada no 0,5× deixavam a lente entrar sem foco (medido: principal borrada por >2 s). Os
+      // pulos de tamanho/cor da troca são cuidados pelo LensSwitchHider e pelo igualar câmeras.
+      if cam.isVirtualDevice { _ = CowboyObjC.catching { cam.setPrimaryConstituentDeviceSwitchingBehavior(.auto, restrictedSwitchingBehaviorConditions: []) } }
       let nativeBase = displayBase(cam)
       let relative = zoom ?? (cam.uniqueID == device?.uniqueID ? Double(cam.videoZoomFactor / base) : Double(cam.minAvailableVideoZoomFactor / nativeBase))
       cam.videoZoomFactor = max(cam.minAvailableVideoZoomFactor, min(CGFloat(relative) * nativeBase, cam.maxAvailableVideoZoomFactor))
       if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
-      if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = true }
+      if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = false }   // modo suave demorava >2 s pra achar o foco
       if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
       if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
       guard let connection = videoOut.connection(with: .video) else { throw failure("Saída de vídeo indisponível") }
@@ -568,17 +567,17 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           match.lensChanged(LensMatch.name(cam.activePrimaryConstituent?.deviceType))
           self?.queue.async {
             self?.applyLensLock(cam)
-            // lente física nova: UM foco rápido nela (a lente que entra pode vir com o foco longe) e depois contínuo suave
-            self?.refocusFast()
+            // lente física nova: reafirma o foco contínuo no ponto atual (reinicia o AF na lente que entrou)
+            self?.queue.asyncAfter(deadline: .now() + 0.15) { self?.restartContinuousFocus() }
           }
         }
       } else { match.lensChanged(LensMatch.name(cam.deviceType)) }
       let st0 = match.status()
       zoomDriver.attach(cam)
-      adjustingObservation?.invalidate()
-      adjustingObservation = cam.observe(\.isAdjustingFocus, options: [.new]) { [weak self] c, _ in
-        guard !c.isAdjustingFocus else { return }
-        self?.queue.async { guard let self, let f = self.fastFocus, CACurrentMediaTime() - f.at > 0.12 else { return }; self.settleFocus(f.gen) }
+      // diagnóstico: posição da lente de foco e se o AF está andando, junto da nitidez depois de cada troca de lente
+      renderer.focusProbe = { [weak cam] in
+        guard let c = cam else { return "" }
+        return String(format: "L%.3f", c.lensPosition) + (c.isAdjustingFocus ? "A" : "") + (c.focusMode == .continuousAutoFocus ? "" : c.focusMode == .locked ? "T" : "U")
       }
       if thermalObserver == nil {
         thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { [weak self] _ in
@@ -742,16 +741,16 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // 0,5×: lente travada na ultra (zoom digital nela). 1× em diante: troca de lente pelo zoom.
   private func applyLensLock(_ cam: AVCaptureDevice) {
     guard cam.isVirtualDevice, cam.position == .back else { return }
-    let lockUltra = ultraLock && cam.activePrimaryConstituent?.deviceType == .builtInUltraWideCamera
-    let want: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior = lockUltra ? .locked : .restricted
+    // 0.8.3: sempre automática (ultra travada no 0,5× deixava a pinça presa e a lente seguinte entrar sem foco)
+    let want: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior = .auto
     guard cam.primaryConstituentDeviceSwitchingBehavior != want else { return }
     _ = CowboyObjC.catching {
       if (try? cam.lockForConfiguration()) != nil {
-        cam.setPrimaryConstituentDeviceSwitchingBehavior(want, restrictedSwitchingBehaviorConditions: want == .restricted ? [.videoZoomChanged] : [])
+        cam.setPrimaryConstituentDeviceSwitchingBehavior(want, restrictedSwitchingBehaviorConditions: [])
         cam.unlockForConfiguration()
       }
     }
-    Diag.step("lens-lock", ["mode": lockUltra ? "ultra" : "cruzando"], send: false)
+    Diag.step("lens-lock", ["mode": "auto"], send: false)
   }
   private func holdFocus(_ seconds: Double) {
     queue.async {
@@ -765,37 +764,20 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         guard gen == self.focusGen, self.focusHeld else { return }
         self.focusHeld = false
         guard !self.manualFocus, let cam = self.device else { return }
-        _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { self.fastFocusLocked(cam); cam.unlockForConfiguration() } }
+        _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { self.continuousFocusLocked(cam); cam.unlockForConfiguration() } }
       }
     }
   }
-  // UM foco rápido (sem o modo suave) e, quando assentar (ou 1,5 s), contínuo suave. Fila da câmera, configuração travada.
-  private func fastFocusLocked(_ cam: AVCaptureDevice, force: Bool = false) {
-    guard force || !manualFocus, cam.isFocusModeSupported(.autoFocus) else { return }
-    focusGen += 1; let gen = focusGen
-    focusHeld = false
-    if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = false }
-    cam.focusMode = .autoFocus
-    fastFocus = (gen, CACurrentMediaTime())
-    queue.asyncAfter(deadline: .now() + 1.5) { self.settleFocus(gen) }
+  // foco contínuo no ponto de interesse atual (pôr o ponto e o modo de novo = o AF recomeça ali). Fila da câmera, travada.
+  private func continuousFocusLocked(_ cam: AVCaptureDevice, force: Bool = false) {
+    guard force || !manualFocus, cam.isFocusModeSupported(.continuousAutoFocus) else { return }
+    focusGen += 1; focusHeld = false
+    if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = cam.focusPointOfInterest }
+    cam.focusMode = .continuousAutoFocus
   }
-  private func refocusFast() {
-    queue.async {
-      guard let cam = self.device, cam.position == .back, !self.manualFocus else { return }
-      _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { self.fastFocusLocked(cam); cam.unlockForConfiguration() } }
-    }
-  }
-  private func settleFocus(_ gen: Int) {
-    guard let f = fastFocus, f.gen == gen, gen == focusGen, let cam = device else { return }
-    fastFocus = nil
-    guard !manualFocus else { return }
-    _ = CowboyObjC.catching {
-      if (try? cam.lockForConfiguration()) != nil {
-        if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
-        if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = true }
-        cam.unlockForConfiguration()
-      }
-    }
+  private func restartContinuousFocus() {
+    guard let cam = device, cam.position == .back, !manualFocus else { return }
+    _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { self.continuousFocusLocked(cam); cam.unlockForConfiguration() } }
   }
   static func thermalName() -> String {
     switch ProcessInfo.processInfo.thermalState { case .nominal: return "normal"; case .fair: return "morno"; case .serious: return "quente"; case .critical: return "crítico"; @unknown default: return "?" }
@@ -826,7 +808,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = c }
           if cam.isExposurePointOfInterestSupported && cam.exposureMode != .locked && cam.exposureMode != .custom { cam.exposurePointOfInterest = c; cam.exposureMode = .continuousAutoExposure }
           cam.isSubjectAreaChangeMonitoringEnabled = false
-          self.fastFocusLocked(cam)
+          self.continuousFocusLocked(cam)
           cam.unlockForConfiguration()
         }
       }
@@ -956,7 +938,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   }
   func setFocus(_ manual: Bool, position: Double? = nil) {
     control { cam in
-      self.focusGen += 1; self.fastFocus = nil; self.focusHeld = false
+      self.focusGen += 1; self.focusHeld = false
       if manual {
         guard cam.isFocusModeSupported(.locked), cam.isLockingFocusWithCustomLensPositionSupported else { throw self.failure("Foco manual indisponível nesta lente") }
         cam.setFocusModeLocked(lensPosition: Float(max(0, min(1, position ?? Double(cam.lensPosition)))), completionHandler: nil)
@@ -987,7 +969,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // contínuo NO PONTO (segue o assunto se ele chegar perto/longe), até a cena mudar ou um zoom
       if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.autoFocus) {
         cam.focusPointOfInterest = point
-        self.fastFocusLocked(cam, force: true)   // rápido no ponto e depois contínuo no ponto
+        self.continuousFocusLocked(cam, force: true)   // contínuo no ponto tocado
         self.publish { self.manualFocus = false }
       }
       if cam.isExposurePointOfInterestSupported && cam.exposureMode != .locked && cam.exposureMode != .custom {
