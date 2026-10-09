@@ -739,10 +739,16 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   }
   // pinça/roda: segue o dedo com uma rampa rápida (suaviza sem atraso perceptível)
   // 0,5×: lente travada na ultra (zoom digital nela). 1× em diante: troca de lente pelo zoom.
-  private func applyLensLock(_ cam: AVCaptureDevice) {
+  private func applyLensLock(_ cam: AVCaptureDevice, leaving: Bool = false) {
     guard cam.isVirtualDevice, cam.position == .back else { return }
-    // 0.8.3: sempre automática (ultra travada no 0,5× deixava a pinça presa e a lente seguinte entrar sem foco)
-    let want: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior = .auto
+    // REGRA DO FILMMAKER (0.8.5): no 0,5× a ULTRA fica TRAVADA — pinça partindo do 0,5× vai pela 0,5 (zoom digital nela),
+    // sem o iOS alternar ultra↔principal perto do 1× (medido na 0.8.3/0.8.4 com a troca automática: ia e voltava). Tocou
+    // em 1×/2×/5× = troca automática (o iOS escolhe a lente e cuida do foco na passagem). Pinça que bate no limite digital
+    // da ultra destrava (onStuck) e segue pela principal.
+    // no 0,5× é SEMPRE travada (botão, pinça que terminou lá ou o app abrindo lá); `leaving` = tocou 1×/2×/5× pra sair
+    let atHalf = Double(cam.videoZoomFactor / base) <= 0.51
+    let lockUltra = !leaving && (ultraLock || atHalf) && cam.activePrimaryConstituent?.deviceType == .builtInUltraWideCamera
+    let want: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior = lockUltra ? .locked : .auto
     guard cam.primaryConstituentDeviceSwitchingBehavior != want else { return }
     _ = CowboyObjC.catching {
       if (try? cam.lockForConfiguration()) != nil {
@@ -750,7 +756,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         cam.unlockForConfiguration()
       }
     }
-    Diag.step("lens-lock", ["mode": "auto"], send: false)
+    Diag.step("lens-lock", ["mode": lockUltra ? "ultra" : "auto"])
   }
   private func holdFocus(_ seconds: Double) {
     queue.async {
@@ -792,7 +798,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       Diag.step("idle-rate", ["qps": slow ? 30 : full, "calor": Self.thermalName()])
     }
   }
-  func followZoom(_ display: Double) { recenterFocus("zoom"); holdFocus(0.3); zoomDriver.follow(CGFloat(display) * base) }
+  private var pinchTarget: Double?
+  func followZoom(_ display: Double) { pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3); zoomDriver.follow(CGFloat(display) * base) }
   // foco e luz de volta pro centro, contínuos (o ponto tocado antigo não vale mais depois de zoom ou de a cena mudar)
   func recenterFocus(_ why: String) {
     queue.async {
@@ -813,6 +820,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   }
   func endZoomGesture() {
     holdFocus(0.3); zoomDriver.endFollow()
+    // pinça que terminou no 0,5× = "está no 0,5": trava a ultra de novo (a próxima pinça vai pela 0,5)
+    if let t = pinchTarget, t <= 0.51, !ultraLock {
+      ultraLock = true; UserDefaults.standard.set(true, forKey: "ultraLock")
+      queue.async { if let c = self.device { self.applyLensLock(c) } }
+    }
+    pinchTarget = nil
     let user = selfTestMode.hasPrefix("VOCÊ")
     if user { userPinches += 1 }
     if !recording && !calibrating && !selfTestMode.isEmpty { aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode) }
@@ -824,7 +837,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     queue.async {
       if let cam = self.device {
         // destrava ANTES de subir (pra cruzar as lentes); voltando pra 0,5 trava quando a ultra assumir (observador acima)
-        if !toUltra { self.applyLensLock(cam) }
+        if !toUltra { self.applyLensLock(cam, leaving: true) }
       }
       DispatchQueue.main.async {
         let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base)
