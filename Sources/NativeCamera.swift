@@ -567,8 +567,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           match.lensChanged(LensMatch.name(cam.activePrimaryConstituent?.deviceType))
           self?.queue.async {
             self?.applyLensLock(cam)
-            // lente física nova: reafirma o foco contínuo no ponto atual (reinicia o AF na lente que entrou)
-            self?.queue.asyncAfter(deadline: .now() + 0.15) { self?.restartContinuousFocus() }
+            // lente física nova: o foco fica com o iPhone (0.8.4). Reafirmar o contínuo aqui fazia a lente de foco dar um
+            // passinho 0,4–0,7 s depois de cada troca (medido: 0,227→0,216, 0,518→0,502…) = o "foco ajustando entre as lentes"
           }
         }
       } else { match.lensChanged(LensMatch.name(cam.deviceType)) }
@@ -577,7 +577,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // diagnóstico: posição da lente de foco e se o AF está andando, junto da nitidez depois de cada troca de lente
       renderer.focusProbe = { [weak cam] in
         guard let c = cam else { return "" }
-        return String(format: "L%.3f", c.lensPosition) + (c.isAdjustingFocus ? "A" : "") + (c.focusMode == .continuousAutoFocus ? "" : c.focusMode == .locked ? "T" : "U")
+        return String(format: "L%.3fI%.0fE%.0f", c.lensPosition, c.iso, CMTimeGetSeconds(c.exposureDuration) * 10000) + (c.isAdjustingFocus ? "A" : "") + (c.isAdjustingExposure ? "X" : "") + (c.focusMode == .continuousAutoFocus ? "" : c.focusMode == .locked ? "T" : "U")
       }
       if thermalObserver == nil {
         thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { [weak self] _ in
@@ -774,10 +774,6 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     focusGen += 1; focusHeld = false
     if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = cam.focusPointOfInterest }
     cam.focusMode = .continuousAutoFocus
-  }
-  private func restartContinuousFocus() {
-    guard let cam = device, cam.position == .back, !manualFocus else { return }
-    _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { self.continuousFocusLocked(cam); cam.unlockForConfiguration() } }
   }
   static func thermalName() -> String {
     switch ProcessInfo.processInfo.thermalState { case .nominal: return "normal"; case .fair: return "morno"; case .serious: return "quente"; case .critical: return "crítico"; @unknown default: return "?" }
