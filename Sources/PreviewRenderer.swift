@@ -54,6 +54,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var pendingSID = 0
   private var switchBusy = false
   private let switchQueue = DispatchQueue(label: "cowboy.preview.switch", qos: .userInitiated)
+  // nitidez da saída rápida antes e 2 s depois de cada troca de lente (prova do foco sem pedir teste, 0.8.2)
+  private var lastSharp: Float = 0
+  private var focusWatch: (t0: Double, before: Float, items: [String], from: Int, to: Int)?
   var stabSampling = false   // amostras do estabilizado pro alinhador antigo (só o teste antigo; o arquivo usa a troca medida)
   var frameZoom: ((Double) -> Double?)?
   // por quadro estabilizado desenhado: ampliação usada, a que a conta antiga daria e a hora (medição do estacionar/calibração)
@@ -148,6 +151,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let prevFast = lastFast; lastFast = (buffer, sid, pts)
     var switchJob = false, still = false
     if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
+      if focusWatch == nil { focusWatch = (pts, lastSharp, [], pf.id, sid) }
       still = !trackMoving && abs(log(max(1e-6, zHistFast) / max(1e-6, zoomAt(pf.pts + Self.contentLead) ?? 0))) < 1e-4
       if still && !switchBusy { switchBusy = true; switchJob = true }
     }
@@ -157,7 +161,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow) }
       else { onSwitch?(["etapa": "rapida", "de": "\(pf.id)", "para": "\(sid)", "medido": still ? "ocupado" : "zoom andando (o movimento esconde)"]) }
     }
-    if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving) }
+    if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving, sensor: sid) }
     let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming) : (0, 0)
     lock.lock()
     if frozen { lock.unlock(); return }
@@ -176,6 +180,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
         if let r = self.sample(buffer, cube: true) {
           if let lm, lm.enabled { lm.observe(r.stats, at: pts) }
           al?.feed("fast", t: pts, luma: r.luma)
+          self.watchFocus(pts: pts, sharp: ZoomImage.sharpness(r.luma))
         }
         self.lock.lock(); self.statsBusy = false; self.lock.unlock()
       }
@@ -199,6 +204,20 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       self.onSwitch?(info)
       self.lock.lock(); self.switchBusy = false; self.lock.unlock()
     }
+  }
+  private func watchFocus(pts: Double, sharp: Float) {
+    lock.lock()
+    var done: [String: String]?
+    if var w = focusWatch {
+      w.items.append(String(format: "%.0f:%.0f", (pts - w.t0) * 1000, sharp))
+      if pts - w.t0 > 2.0 {
+        done = ["etapa": "foco", "de": "\(w.from)", "para": "\(w.to)", "antes": String(format: "%.0f", w.before), "depois": w.items.joined(separator: " ")]
+        focusWatch = nil
+      } else { focusWatch = w }
+    }
+    lastSharp = sharp
+    lock.unlock()
+    if let done { onSwitch?(done) }
   }
   // igualar câmeras no quadro EXATO da troca (0.8.1): cor/luz do último quadro da lente velha × 1º da nova, registrado
   // ~0,45 s antes de o quadro estabilizado da nova chegar na tela/arquivo

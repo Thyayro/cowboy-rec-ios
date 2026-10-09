@@ -19,7 +19,7 @@ final class MotionHub: @unchecked Sendable {
   func start() {
     lock.lock(); defer { lock.unlock() }
     guard manager.isDeviceMotionAvailable, !manager.isDeviceMotionActive else { return }
-    manager.deviceMotionUpdateInterval = 1.0 / 100
+    manager.deviceMotionUpdateInterval = log == nil ? 1.0 / 30 : 1.0 / 100   // 100 Hz só gravando (log do Gyroflow)
     manager.startDeviceMotionUpdates(using: .xArbitraryCorrectedZVertical, to: queue) { [weak self] motion, _ in
       guard let self, let motion else { return }
       self.lock.lock(); self.latest = motion; let log = self.log; self.lock.unlock()
@@ -33,7 +33,7 @@ final class MotionHub: @unchecked Sendable {
     return (r.x * r.x + r.y * r.y + r.z * r.z).squareRoot()
   }
   func stop() { lock.lock(); manager.stopDeviceMotionUpdates(); latest = nil; lock.unlock() }
-  func attach(_ log: GyroLog?) { lock.lock(); self.log = log; lock.unlock() }
+  func attach(_ log: GyroLog?) { lock.lock(); self.log = log; manager.deviceMotionUpdateInterval = log == nil ? 1.0 / 30 : 1.0 / 100; lock.unlock() }
 
   func snapshot() -> Snapshot? {
     lock.lock(); let motion = latest; lock.unlock()

@@ -24,6 +24,7 @@ final class ZoomDriver: @unchecked Sendable {
   // REGISTRO DE CADA VALOR POSTO (hora exata, valor) — o zoom que um quadro carrega é o último valor posto até a hora de
   // captura dele menos a "trava" do aparelho (calibrada; ver ZoomCalibration)
   private var setLog: [(Double, Double)] = []
+  private var glideGen = 0
 
   func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; glidePlan = nil; setLog = []; lock.unlock() }
   private func clamp(_ d: AVCaptureDevice, _ z: CGFloat) -> CGFloat { max(d.minAvailableVideoZoomFactor, min(d.maxAvailableVideoZoomFactor, z)) }
@@ -48,7 +49,7 @@ final class ZoomDriver: @unchecked Sendable {
 
   // gesto: só atualiza o alvo; quem anda é o tick de cada quadro
   func follow(_ factor: CGFloat) {
-    lock.lock()
+    lock.lock(); glideGen += 1
     guard let d = device else { lock.unlock(); return }
     glidePlan = nil
     var z = clamp(d, factor)
@@ -82,13 +83,25 @@ final class ZoomDriver: @unchecked Sendable {
     let rate = max(0.8, stops / duration)
     let dur = stops / rate
     // rampa nativa (0.7.7): o deslizamento por quadro (0.7.5–0.7.6) deixou o foco estranho na troca de lente — a rampa do
-    // AVFoundation prepara a próxima câmera; o registro exato fica só pra pinça
-    configure(d) { d.ramp(toVideoZoomFactor: to, withRate: Float(rate)) }
-    return dur
+    // AVFoundation prepara a próxima câmera; o registro exato fica só pra pinça.
+    // CHEGADA SUAVE (0.8.2): 85% do caminho na velocidade normal e o fim a 1/3 dela (duas rampas nativas). Parada seca =
+    // qualquer erro de tempo no fim vira "volta" de escala na tela (o 0,5→1 ainda mostrava); devagar no fim, quase nada.
+    guard stops > 0.12 else { configure(d) { d.ramp(toVideoZoomFactor: to, withRate: Float(rate)) }; return dur }
+    let mid = CGFloat(exp(log(Double(from)) + (log(Double(to)) - log(Double(from))) * 0.85))
+    let d1 = 0.85 * stops / rate, d2 = 0.15 * stops / (rate / 3)
+    lock.lock(); glideGen += 1; let gen = glideGen; lock.unlock()
+    configure(d) { d.ramp(toVideoZoomFactor: mid, withRate: Float(rate)) }
+    DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + d1) { [weak self] in
+      guard let self else { return }
+      self.lock.lock(); let ok = self.glideGen == gen && self.target == nil; let dev = self.device; self.lock.unlock()
+      guard ok, let dev else { return }
+      self.configure(dev) { dev.ramp(toVideoZoomFactor: to, withRate: Float(rate / 3)) }
+    }
+    return d1 + d2
   }
   // degrau direto (calibração)
   func jump(to factor: CGFloat) {
-    lock.lock(); target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
+    lock.lock(); glideGen += 1; target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
     guard let d else { return }
     put(d, clamp(d, factor))
   }

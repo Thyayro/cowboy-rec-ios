@@ -47,7 +47,7 @@ struct CameraOverlay: View {
       if tools.grid && !camera.recording { grid }
       if !tools.frame.isEmpty && !camera.recording { instagram }
       if (tools.level || tools.space) && !camera.front && !camera.recording {
-        TimelineView(.animation) { _ in
+        TimelineView(.periodic(from: .now, by: 1.0 / 20)) { _ in   // 20 Hz basta pro nível (era até 120 Hz: calor)
           Canvas { ctx, _ in
             guard let m = MotionHub.shared.snapshot() else { return }
             if tools.space { drawFloor(ctx, m) }

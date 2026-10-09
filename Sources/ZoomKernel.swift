@@ -89,6 +89,18 @@ enum ZoomImage {
     }
     return out
   }
+  // nitidez (energia do Laplaciano ÷ brilho²) de uma miniatura 96×54 0–1 — só pra comparar o mesmo quadro no tempo
+  static func sharpness(_ a: [Float]) -> Float {
+    guard a.count == w * h else { return 0 }
+    var s: Float = 0, m: Float = 0
+    for y in 1..<(h - 1) { for x in 1..<(w - 1) {
+      let i = y * w + x
+      let l = 4 * a[i] - a[i - 1] - a[i + 1] - a[i - w] - a[i + w]
+      s += l * l; m += a[i]
+    } }
+    let n = Float((w - 2) * (h - 2)); m /= n
+    return s / n / max(1e-4, m * m) * 1000
+  }
   // desfoque leve [1 2 1]/4 (sem ele o ruído puxa a medida: a interpolação "alisa" ruído fora do ponto certo e o custo
   // cai ali — 0,78% de erro em quadros PARADOS no teste; com ele, 0,11%) + passa-alta (tira vinheta e sombreamento, que
   // não mudam com o zoom) + normaliza
@@ -386,9 +398,13 @@ final class FastZoomTracker: @unchecked Sendable {
   private(set) var resids: [Float] = []
   func reset() { queue.async { self.prev = nil; self.key = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.predAcc = 0; self.lock.unlock() } }
   // fila da saída rápida: só enfileira (a medida roda na fila própria, em ordem)
-  func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving) } }
+  func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool, sensor: Int = 0) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving, sensor: sensor) } }
+  private var keySensor = 0
   // zHist = zoom registrado previsto pro instante do quadro (com o adiantamento médio); moving = o zoom pode estar mudando
-  func step(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool) {
+  func step(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool, sensor: Int = 0) {
+    // lente trocou (0.8.2): não mede entre quadros de lentes diferentes (a troca é do LensSwitchHider; medir por cima dela
+    // dava ampliação errada = "volta estranha" na pinça que cruza lente)
+    if sensor != keySensor { key = nil; keySensor = sensor }
     var pred = 1.0
     if let pv = prev, pts > pv.pts, zHist > 0, pv.z > 0 { pred = zHist / pv.z }
     prev = (pts, zHist)
