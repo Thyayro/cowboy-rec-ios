@@ -336,6 +336,102 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     }
     }
     if softFail { print("FALHA (zoom medido em algum sorteio)"); exit(1) }
+    // (6) TROCA DE LENTE SEM PULO (0.8.0): câmera simulada a 60 qps; a lente troca com o zoom PARADO, com pulo de escala e
+    // de posição como os medidos na tela do aparelho (ultra→principal +3–5%, tele com paralaxe, ida-e-volta de 133 ms perto
+    // de objeto). Tela e arquivo recebem o quadro estabilizado 0,5 s depois (corte 1,12). A saída rápida mede a troca ~60 ms
+    // depois dela; o 1º quadro estabilizado da lente nova é medido antes de ir pra tela/arquivo. Exigido: nenhum quadro
+    // mostrado muda mais de 0,6% de tamanho / 0,4% de posição pro vizinho (sem a correção: o pulo inteiro de uma vez), nunca
+    // borda (só amplia), e 0,65 s depois da troca a imagem é a da lente nova pura. Escuro / estabilização sem atraso: não piora.
+    var worstMeas = (s: 0.0, t: 0.0)
+    for (J, sx, sy) in [(1.05, 0.0, 0.0), (1 / 1.05, 0.003, -0.002), (1.10, -0.006, 0.004), (0.9, 0.0, 0.005), (1.03, 0.01, 0.0)] {
+      let z = 2.2
+      let a = ZoomImage.prep(scene.thumb(z, 0, 0, noise: 0.004, &rng)), b = ZoomImage.prep(scene.thumb(z * J, sx, sy, noise: 0.004, &rng))
+      guard let m = ZoomImage.switchGeo(a, b) else { check(false, String(format: "troca: a medida falhou numa cena com textura (pulo %.3f)", J)); continue }
+      // nova (zoom z·J, cena deslocada o) -> velha (zoom z): s = 1/J, t = o·z/0,9 (fração do quadro)
+      worstMeas.s = max(worstMeas.s, abs(Double(m.g.s) * J - 1))
+      worstMeas.t = max(worstMeas.t, abs(Double(m.g.tx) - sx * z / 0.9) * 96, abs(Double(m.g.ty) - sy * z / 0.9) * 54)
+    }
+    check(worstMeas.s < 0.003 && worstMeas.t < 0.35, String(format: "troca de lente: medida do pulo (até ±10%%, deslocada) — pior erro %.3f%% de escala, %.2f ponto de posição", worstMeas.s * 100, worstMeas.t))
+
+    func lensSim(_ name: String, J: Double, ox: Double, oy: Double, ratio: Double, contrast: Double, L: Double, flashFrames: Int, file: Bool, strict: Bool, maxStep: Double = 0.006) {
+      let fps = 60.0, Z = 2.0, crop = 1.12, te = 2.0
+      let hider = LensSwitchHider()
+      struct V { let p: Double; let id: Int; let z: Double; let x: Double; let y: Double; let jx: Double; let jy: Double }
+      var vs: [V] = []
+      var jx = 0.0, jy = 0.0
+      let t2 = flashFrames > 0 ? te + Double(flashFrames) / fps : Double.infinity
+      for n in 0..<Int(4 * fps) {
+        let p = Double(n) / fps
+        jx = jx * 0.95 + rng.normal() * 0.0003; jy = jy * 0.95 + rng.normal() * 0.0003
+        let new = p >= te - 1e-9 && p < t2 - 1e-9
+        vs.append(V(p: p, id: new ? 2 : 1, z: new ? Z * J : Z, x: (new ? ox : 0) + jx, y: (new ? oy : 0) + jy, jx: jx, jy: jy))
+      }
+      // quadro rápido (sem corte) ou estabilizado (corte; a lente nova pode cortar diferente: ratio); ruído depois do contraste
+      func pic(_ v: V, stab: Bool) -> [Float] {
+        let z = v.z * (stab ? crop * (v.id == 2 ? ratio : 1) : 1)
+        return scene.thumb(z, v.x, v.y, noise: 0, &rng).map { Float(0.5) + ($0 - Float(0.5)) * Float(contrast) + Float(rng.normal() * 0.004) }
+      }
+      var switches: [Int] = []
+      for i in 1..<vs.count where vs[i].id != vs[i - 1].id { switches.append(i) }
+      var fastKnown: [(at: Double, i: Int, g: SwitchGeometry?)] = []
+      for i in switches {
+        let m = ZoomImage.switchGeo(ZoomImage.prep(pic(vs[i - 1], stab: false)), ZoomImage.prep(pic(vs[i], stab: false)))
+        fastKnown.append((vs[i].p + 0.06, i, m?.g))
+      }
+      var added = Set<Int>(), stabbed = Set<Int>()
+      var shown: [(z: Double, x: Double, y: Double)] = [], held = 0, border = 0.0, endPure = true
+      for v in vs {
+        let wall = v.p + L   // hora em que este quadro estabilizado chega na tela/arquivo
+        for f in fastKnown where f.at <= wall && !added.contains(f.i) {
+          added.insert(f.i)
+          let pred = f.g.map { SwitchGeometry(s: $0.s, tx: $0.tx * Float(crop), ty: $0.ty * Float(crop), exact: true) }
+          hider.add(t: vs[f.i].p, from: vs[f.i - 1].id, to: vs[f.i].id, fast: f.g, pred: pred)
+        }
+        if let i = switches.first(where: { vs[$0].p == v.p }), !stabbed.contains(i) {
+          stabbed.insert(i)
+          if let ev = hider.awaiting(from: vs[i - 1].id, to: v.id, at: v.p) {
+            let m = ev.pred.flatMap { ZoomImage.switchGeo(ZoomImage.prep(pic(vs[i - 1], stab: true)), ZoomImage.prep(pic(v, stab: true)), around: $0) }
+            hider.stabMeasured(t: ev.t, g: m?.g)
+          }
+        }
+        let r = hider.geometry(pts: v.p, sensor: v.id, file: file)
+        if r.hold { held += 1; continue }
+        let g = r.g
+        border = max(border, Double(max(0, 1 - g.s)), Double(max(abs(g.tx), abs(g.ty)) - (g.s - 1) / 2))
+        if v.p > (t2.isFinite ? t2 : te) + 0.65 && !g.isIdentity { endPure = false }
+        // o que a tela mostra: a cena com zoom zs·s e deslocamento O − t·0,9/(zs·s) (convenção do aligned/shader); tremor da
+        // mão tirado (é igual com e sem correção)
+        let zs = v.z * crop * (v.id == 2 ? ratio : 1), zd = zs * Double(g.s)
+        shown.append((zd, v.x - v.jx - Double(g.tx) * 0.9 / zd, v.y - v.jy - Double(g.ty) * 0.9 / zd))
+      }
+      var dz = 0.0, dp = 0.0
+      for k in 1..<shown.count {
+        let a = shown[k - 1], b = shown[k]
+        dz = max(dz, abs(log(b.z / a.z))); dp = max(dp, abs(b.x - a.x) * b.z / 0.9, abs(b.y - a.y) * b.z / 0.9)
+      }
+      let baseZ = abs(log(J * ratio)), baseP = max(abs(ox), abs(oy)) * Z * crop * J / 0.9
+      let tag = (file ? "ARQUIVO " : "tela ") + name
+      let txt = String(format: "%@: maior passo entre quadros %.2f%% de tamanho, %.2f%% de posição (sem correção: %.2f%% / %.2f%%), segurou %d", tag, dz * 100, dp * 100, baseZ * 100, baseP * 100, held)
+      check(border < 1e-4, tag + ": nunca mostra borda (só amplia)")
+      if strict {
+        check(dz <= maxStep && dp <= 0.004 && endPure, txt + (endPure ? "" : " — NÃO voltou à lente nova pura"))
+        if flashFrames > 0 && !file { check(held == flashFrames, tag + ": segura exatamente os quadros do pulso (\(held)/\(flashFrames))") }
+      } else {
+        check(dz <= baseZ + 0.002 && dp <= baseP + 0.002, txt + " (não pode piorar)")
+      }
+    }
+    // (o pulo grande fica fora do medido no aparelho, 2,9–5%: ali o preparo anda até 0,7% por quadro, ainda sem degrau)
+    for (name, J, ox, oy, ratio, maxStep) in [("ultra→principal +5% (1×, como na tela)", 1.05, 0.0, 0.0, 1.0, 0.006),
+                                     ("ultra→principal +3%, estabilizado 1% diferente do rápido", 1.03, 0.001, -0.001, 1.01, 0.006),
+                                     ("principal→tele +3% com paralaxe", 1.03, 0.012, 0.006, 1.0, 0.006),
+                                     ("lente nova mais ABERTA −5%", 1 / 1.05, -0.003, 0.0, 1.0, 0.006),
+                                     ("pulo grande +8% e deslocado", 1.08, -0.008, 0.006, 0.99, 0.007)] {
+      for file in [false, true] { lensSim(name, J: J, ox: ox, oy: oy, ratio: ratio, contrast: 1, L: 0.5, flashFrames: 0, file: file, strict: true, maxStep: maxStep) }
+    }
+    lensSim("ida-e-volta em 133 ms (objeto perto)", J: 1.06, ox: 0.002, oy: 0, ratio: 1, contrast: 1, L: 0.5, flashFrames: 8, file: false, strict: true)
+    lensSim("ida-e-volta em 133 ms (arquivo não segura: respira)", J: 1.06, ox: 0.002, oy: 0, ratio: 1, contrast: 1, L: 0.5, flashFrames: 8, file: true, strict: true)
+    lensSim("escuro", J: 1.05, ox: 0, oy: 0, ratio: 1, contrast: 0.2, L: 0.5, flashFrames: 0, file: false, strict: false)
+    lensSim("estabilização sem atraso (0,15 s): não dá tempo de preparar", J: 1.05, ox: 0, oy: 0, ratio: 1, contrast: 1, L: 0.15, flashFrames: 0, file: false, strict: false)
     print("TESTE DO ZOOM OK")
   }
 }

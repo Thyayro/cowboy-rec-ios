@@ -425,3 +425,187 @@ final class FastZoomTracker: @unchecked Sendable {
   }
   var counts: (Int, Int) { (measured, guessed) }
 }
+
+// ---- TROCA DE LENTE SEM PULO NA TELA E NO ARQUIVO (0.8.0) ----
+// Medido na tela do aparelho (trechos da 0.7.7/0.7.8, SIFT): parado no 1× (bruto 2,0) o iPhone troca ultra→principal
+// 0,5–1,4 s DEPOIS do zoom parar e o quadro estabilizado pula 2,9–5,0% de tamanho (+ um pouco de posição); na tele (5×) é a
+// mesma coisa, com mais paralaxe. Perto de objeto próximo a lente chegou a ir e voltar em 133 ms (pulso de 6%). O pulo está
+// no quadro do próprio iPhone (a saída rápida também pula), não na conta do zoom.
+// Cada quadro traz o sensor que o fez (anexo MetadataDictionary.SensorID, nas DUAS saídas) -> a troca é marcada no quadro
+// exato. A saída rápida vê a troca ~0,45 s antes de o quadro estabilizado chegar na tela/arquivo: mede o pulo ali e a
+// tela/arquivo se PREPARAM, só ampliando (nunca borda): lente nova mais fechada -> os últimos 0,35 s da velha fecham devagar
+// até o enquadramento da nova; mais aberta -> a nova entra no enquadramento da velha e abre devagar em 0,6 s. No primeiro
+// quadro estabilizado da nova o pulo é medido de novo (é o que a tela e o arquivo mostram) e a sobra sai devagar.
+// Ida-e-volta em ≤0,2 s: a tela segura o último quadro bom. Só troca com o zoom PARADO (no meio do zoom o movimento esconde).
+enum LensID {
+  // sensor que fez o quadro; 0 = o iPhone não disse (aí nada é corrigido)
+  static func of(_ pb: CVPixelBuffer) -> Int {
+    guard let md = CVBufferCopyAttachment(pb, "MetadataDictionary" as CFString, nil) as? NSDictionary else { return 0 }
+    if let n = md["SensorID"] as? NSNumber, n.intValue != 0 { return n.intValue }
+    switch md["PortType"] as? String {
+    case "PortTypeBackSuperWide"?: return 1
+    case "PortTypeBack"?: return 2
+    case "PortTypeBackTelephoto"?: return 3
+    case .some: return 9
+    case nil: return 0
+    }
+  }
+}
+
+extension ZoomImage {
+  // geometria da troca entre miniaturas preparadas: imagem NOVA -> enquadramento da VELHA (convenção do SwitchGeometry,
+  // do aligned da tela e do shader do arquivo). Sem previsão: escala 0,86–1,18 e deslocamento ±8 × ±6 pontos; com previsão:
+  // ±4% e ±3 pontos em volta dela (rápido: roda no quadro estabilizado antes de ele ir pra tela/arquivo).
+  // nil = cena sem textura, resposta na borda da busca ou confiança baixa — aí não se corrige nada (nunca piora).
+  static func switchGeo(_ ref: [Float], _ img: [Float], around: SwitchGeometry? = nil) -> (g: SwitchGeometry, conf: Float, gain: Float)? {
+    let W = Float(w), H = Float(h)
+    var best = (s: Float(1), dx: Float(0), dy: Float(0), e: Float.infinity)
+    func t1(_ s: Float, _ dx: Float, _ dy: Float, _ step: Int) {
+      let e = cost(ref, img, s, dx / W, dy / H, step: step); if e < best.e { best = (s, dx, dy, e) }
+    }
+    let sLo: Float, sHi: Float, cx: Float, cy: Float, rx: Int, ry: Int
+    if let a = around { sLo = a.s / 1.04; sHi = a.s * 1.04; cx = (a.tx * W).rounded(); cy = (a.ty * H).rounded(); rx = 3; ry = 3 }
+    else { sLo = 0.86; sHi = 1.18; cx = 0; cy = 0; rx = 8; ry = 6 }
+    var s = sLo
+    while s <= sHi * 1.0001 {
+      for dy in -ry...ry { for dx in -rx...rx { t1(s, cx + Float(dx), cy + Float(dy), 2) } }
+      s *= 1.008
+    }
+    var c = best; best.e = cost(ref, img, c.s, c.dx / W, c.dy / H, step: 1)
+    for k in -5...5 { for dy in -2...2 { for dx in -2...2 { t1(c.s * (1 + Float(k) * 0.0016), c.dx + Float(dx) * 0.5, c.dy + Float(dy) * 0.5, 1) } } }
+    c = best
+    for k in -4...4 { for dy in -2...2 { for dx in -2...2 { t1(c.s * (1 + Float(k) * 0.0004), c.dx + Float(dx) * 0.125, c.dy + Float(dy) * 0.125, 1) } } }
+    let e = best.e, e0 = cost(ref, img, 1, 0, 0, step: 1)
+    guard e.isFinite, e > 0 else { return nil }
+    let ep = cost(ref, img, best.s * 1.006, best.dx / W, best.dy / H, step: 1), em = cost(ref, img, best.s / 1.006, best.dx / W, best.dy / H, step: 1)
+    let conf = ((ep + em) / 2 - e) / e
+    let gain = e0.isFinite && e0 > 0 ? 1 - e / e0 : 0
+    // encostou na borda da busca = o pulo de verdade está fora do alcance (não confia)
+    if best.s < sLo * 1.004 || best.s > sHi / 1.004 || abs(best.dx - cx) > Float(rx) - 0.3 || abs(best.dy - cy) > Float(ry) - 0.3 { return nil }
+    guard conf.isFinite, conf >= 0.04 else { return nil }
+    return (SwitchGeometry(s: best.s, tx: best.dx / W, ty: best.dy / H, exact: true), conf, gain)
+  }
+}
+
+enum SwitchPlan {
+  static let spare: Float = 1.008   // o preparo fecha 0,8% a mais: sobra do estabilizado ≠ rápido sai devagar, não em degrau
+  static func smooth(_ x: Double) -> Float { let c = Float(min(1, max(0, x))); return c * c * (3 - 2 * c) }
+  // aplica g e depois p (mesma convenção do aligned/shader: saída(u) = fonte((u − 0,5 − t) / s + 0,5))
+  static func compose(_ p: SwitchGeometry, _ g: SwitchGeometry) -> SwitchGeometry {
+    SwitchGeometry(s: p.s * g.s, tx: p.tx + p.s * g.tx, ty: p.ty + p.s * g.ty, exact: true)
+  }
+  // nunca encolhe (borda) e o deslocamento cabe na sobra da ampliação
+  static func valid(_ g: SwitchGeometry) -> SwitchGeometry {
+    let s = max(1, g.s), m = (s - 1) / 2
+    return SwitchGeometry(s: s, tx: min(m, max(-m, g.tx)), ty: min(m, max(-m, g.ty)), exact: true)
+  }
+  // preparo da lente VELHA pra troca g (nova→velha): a menor ampliação que deixa velha e nova contínuas e sem borda
+  // (nova = preparo ∘ g, também ampliando com o deslocamento dentro da sobra)
+  static func pre(_ g: SwitchGeometry) -> SwitchGeometry {
+    let m = max(abs(g.tx), abs(g.ty)), den = 1 + g.s - 2 * m
+    guard den > 0.05, g.s > 0.5 else { return SwitchGeometry(exact: true) }
+    var sP = max(1, 1 / g.s, 2 / den)
+    if 1 / g.s > 1.002 { sP *= spare }
+    let lim = (sP - 1) / 2
+    return SwitchGeometry(s: sP, tx: min(lim, max(-lim, -sP * g.tx)), ty: min(lim, max(-lim, -sP * g.ty)), exact: true)
+  }
+}
+
+final class LensSwitchHider: @unchecked Sendable {
+  static let preWindow = 0.35, postWindow = 0.6, flash = 0.2
+  struct Event {
+    let t: Double; let from: Int; let to: Int
+    let fast: SwitchGeometry?   // medido na saída rápida
+    let pred: SwitchGeometry?   // previsto pro quadro estabilizado
+    let pre: SwitchGeometry     // preparo da lente velha
+    var stab: SwitchGeometry?   // medido no próprio quadro estabilizado
+    var stabDone = false
+    var firstSeen: Double?      // pts do 1º quadro (tela/arquivo) que já via esta troca: a rampa nunca começa antes dele
+    // janela do preparo: os últimos 0,35 s da lente velha, ou do 1º quadro que já sabia da troca (estabilização com pouco
+    // atraso); sem tempo nenhum = sem preparo (fica como antes: nunca pior)
+    var rampStart: Double { max(t - LensSwitchHider.preWindow, firstSeen ?? (t - LensSwitchHider.preWindow)) }
+    var late: Bool { t - 0.017 - rampStart < 0.05 }
+    var prep: SwitchGeometry { late ? SwitchGeometry(exact: true) : pre }
+  }
+  private let lock = NSLock()
+  private var events: [Event] = []
+  func reset() { lock.lock(); events.removeAll(); lock.unlock() }
+  var count: Int { lock.lock(); defer { lock.unlock() }; return events.count }
+  // saída rápida: trocou de sensor com o zoom parado (t = pts do 1º quadro da lente nova)
+  func add(t: Double, from: Int, to: Int, fast: SwitchGeometry?, pred: SwitchGeometry?) {
+    let p = pred.map { SwitchPlan.pre($0) } ?? SwitchGeometry(exact: true)
+    lock.lock()
+    events.removeAll { $0.t < t - 4 }
+    events.append(Event(t: t, from: from, to: to, fast: fast, pred: pred, pre: p, stab: nil))
+    events.sort { $0.t < $1.t }
+    lock.unlock()
+  }
+  // primeiro quadro estabilizado da lente nova chegou: tem troca esperando medida?
+  func awaiting(from: Int, to: Int, at p: Double) -> Event? {
+    lock.lock(); defer { lock.unlock() }
+    return events.last { $0.from == from && $0.to == to && !$0.stabDone && abs($0.t - p) < 0.1 }
+  }
+  func stabMeasured(t: Double, g: SwitchGeometry?) {
+    lock.lock(); if let i = events.firstIndex(where: { $0.t == t }) { events[i].stab = g; events[i].stabDone = true }; lock.unlock()
+  }
+  // geometria do quadro estabilizado de pts p feito pelo sensor id; hold = a tela não mostra este quadro (segura o anterior)
+  func geometry(pts p: Double, sensor id: Int, file: Bool) -> (g: SwitchGeometry, hold: Bool) {
+    lock.lock()
+    for i in events.indices where events[i].firstSeen == nil { events[i].firstSeen = p }
+    let ev = events
+    lock.unlock()
+    guard id != 0, !ev.isEmpty else { return (.identity, false) }
+    var skip = Set<Int>(), hold = false
+    if !file {
+      for i in ev.indices { for j in ev.indices where j > i && ev[j].t - ev[i].t <= Self.flash && ev[j].from == ev[i].to && ev[j].to == ev[i].from {
+        skip.insert(i); skip.insert(j)
+        if id == ev[i].to && p >= ev[i].t - 0.001 && p < ev[j].t - 0.001 { hold = true }
+      } }
+    }
+    // com que geometria a lente nova ENTRA: preparo ∘ pulo medido, somado ao que a lente anterior ainda carregava (troca
+    // logo depois de outra — no arquivo a ida-e-volta não é segurada)
+    var q: [Int: SwitchGeometry] = [:]
+    for i in ev.indices where !skip.contains(i) {
+      var g = SwitchPlan.compose(ev[i].prep, ev[i].stab ?? ev[i].pred ?? SwitchGeometry(exact: true))
+      if let j = ev.indices.last(where: { $0 < i && !skip.contains($0) && ev[$0].to == ev[i].from && ev[i].t - ev[$0].t < Self.postWindow }), let qj = q[j] {
+        g = SwitchPlan.compose(qj.mix(1 - SwitchPlan.smooth((ev[i].t - ev[j].t) / Self.postWindow)), g)
+      }
+      q[i] = SwitchPlan.valid(g)
+    }
+    var out = SwitchGeometry(exact: true)
+    for (i, e) in ev.enumerated() where !skip.contains(i) && abs(p - e.t) < 2 {
+      if p < e.t - 0.001 {
+        guard id == e.from else { continue }
+        guard !e.late else { continue }
+        let x = (p - e.rampStart) / (e.t - 0.017 - e.rampStart)
+        if x > 0 { out = SwitchPlan.compose(out, e.pre.mix(SwitchPlan.smooth(x))) }
+      } else {
+        guard id == e.to, let qi = q[i] else { continue }
+        let y = (p - e.t) / Self.postWindow
+        guard y < 1 else { continue }
+        out = SwitchPlan.compose(out, qi.mix(1 - SwitchPlan.smooth(y)))
+      }
+    }
+    return (SwitchPlan.valid(out), hold)
+  }
+}
+
+// o que a troca de cada par de sensores costuma fazer (aprende sozinho no uso): escala medida no quadro estabilizado e a
+// razão estabilizado ÷ rápido (o corte da estabilização pode ser diferente em cada lente)
+enum SwitchMemory {
+  static func key(_ a: Int, _ b: Int) -> String { "lsw1_\(a)_\(b)" }
+  static func median(_ x: [Double]) -> Double? { guard !x.isEmpty else { return nil }; let s = x.sorted(); return s[s.count / 2] }
+  static func record(from a: Int, to b: Int, stab: Float, fast: Float?) {
+    let d = UserDefaults.standard
+    var s = d.array(forKey: key(a, b)) as? [Double] ?? []; s.append(Double(stab)); if s.count > 7 { s.removeFirst(s.count - 7) }
+    d.set(s, forKey: key(a, b))
+    if let fast, fast > 0 {
+      var r = d.array(forKey: key(a, b) + "r") as? [Double] ?? []; r.append(Double(stab / fast)); if r.count > 7 { r.removeFirst(r.count - 7) }
+      d.set(r, forKey: key(a, b) + "r")
+    }
+  }
+  static func scale(from a: Int, to b: Int) -> Float? { median(UserDefaults.standard.array(forKey: key(a, b)) as? [Double] ?? []).map { Float($0) } }
+  static func ratio(from a: Int, to b: Int) -> Float {
+    Float(min(1.05, max(0.95, median(UserDefaults.standard.array(forKey: key(a, b) + "r") as? [Double] ?? []) ?? 1)))
+  }
+}

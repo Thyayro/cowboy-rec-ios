@@ -45,6 +45,16 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant") as? Bool ?? true
   static let contentLead = 0.025
   let zoomTrack = FastZoomTracker()   // zoom real de cada instante, medido na saída rápida (0.7.9)
+  // TROCA DE LENTE SEM PULO (0.8.0, ver LensSwitchHider): sensor de cada quadro nas duas saídas; a rápida mede a troca e
+  // tela + arquivo se preparam antes de o quadro estabilizado da lente nova chegar
+  let switchHider = LensSwitchHider()
+  var onSwitch: (([String: String]) -> Void)?
+  private var lastFast: (buffer: CVPixelBuffer, id: Int, pts: Double)?
+  private var lastStab: (buffer: CVPixelBuffer, id: Int)?
+  private var pendingSID = 0
+  private var switchBusy = false
+  private let switchQueue = DispatchQueue(label: "cowboy.preview.switch", qos: .userInitiated)
+  var stabSampling = false   // amostras do estabilizado pro alinhador antigo (só o teste antigo; o arquivo usa a troca medida)
   var frameZoom: ((Double) -> Double?)?
   // por quadro estabilizado desenhado: ampliação usada, a que a conta antiga daria e a hora (medição do estacionar/calibração)
   private var shownK: [(pts: Double, k: Double, kOld: Double, at: Double)] = []
@@ -92,12 +102,22 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     super.init()
   }
   func push(_ buffer: CVPixelBuffer, pts: Double? = nil) {
+    let sid = LensID.of(buffer)
+    lock.lock()
+    if frozen { lock.unlock(); return }
+    let prevStab = lastStab; lastStab = (buffer, sid)
+    lock.unlock()
+    // primeiro quadro estabilizado da lente nova: mede o pulo NELE (é o que a tela e o arquivo mostram), em volta da previsão
+    // da saída rápida, ANTES de ele ir pra tela e pro arquivo (só na troca; poucos ms)
+    if let pts, let ps = prevStab, ps.id != sid, ps.id != 0, sid != 0, let ev = switchHider.awaiting(from: ps.id, to: sid, at: pts) {
+      measureStabSwitch(ps.buffer, buffer, ev: ev)
+    }
     lock.lock()
     if frozen { lock.unlock(); return }
     if dropFrames > 0 { dropFrames -= 1; lock.unlock(); return }
-    pending = buffer; pendingPTS = pts
+    pending = buffer; pendingPTS = pts; pendingSID = sid
     let nowS = CACurrentMediaTime()
-    let wantStab = aligner != nil && !stabBusy && nowS >= nextStab && pts != nil
+    let wantStab = stabSampling && aligner != nil && !stabBusy && nowS >= nextStab && pts != nil
     if wantStab { stabBusy = true; nextStab = nowS + 0.1 }   // 10/s (era 33/s: aquecia)
     var match: (pts: Double, image: CGImage)?
     if let cf = calibFast, let pts {
@@ -114,6 +134,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     }
   }
   func pushFast(_ buffer: CVPixelBuffer, pts: Double) {
+    let sid = LensID.of(buffer)
     if calibRec.active { calibRec.feed(buffer, pts: pts, stabilized: false) }
     // estabilização própria da tela (só deslocamento; cega ao zoom) — calculada aqui, antes de mostrar
     lock.lock(); let fr = frozen; eis.margin = max(0.01, min(0.035, (crop - 1) / 2 - 0.006)); lock.unlock()
@@ -122,7 +143,19 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     lock.lock(); let zooming = CACurrentMediaTime() - lastZoomMove < 0.2
     // só mede enquanto o zoom pedido mudou há pouco (o conteúdo chega ≤35 ms adiantado e o quadro rápido chega ~40 ms depois):
     // parado, o quadro não muda mais — medir só somaria ruído (e trocaria a referência à toa: degrau de ~1%)
-    let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.15, zHistFast = zoomAt(pts + Self.contentLead) ?? 0; lock.unlock()
+    let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.15, zHistFast = zoomAt(pts + Self.contentLead) ?? 0
+    // troca de lente (0.8.0): sensor deste quadro rápido × o do anterior, com o zoom PARADO nos dois
+    let prevFast = lastFast; lastFast = (buffer, sid, pts)
+    var switchJob = false, still = false
+    if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
+      still = !trackMoving && abs(log(max(1e-6, zHistFast) / max(1e-6, zoomAt(pf.pts + Self.contentLead) ?? 0))) < 1e-4
+      if still && !switchBusy { switchBusy = true; switchJob = true }
+    }
+    let cropNow = crop; lock.unlock()
+    if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
+      if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow) }
+      else { onSwitch?(["etapa": "rapida", "de": "\(pf.id)", "para": "\(sid)", "medido": still ? "ocupado" : "zoom andando (o movimento esconde)"]) }
+    }
     if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving) }
     let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming) : (0, 0)
     lock.lock()
@@ -147,6 +180,39 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       }
     }
     if go { calibQueue.async { if let img = self.small(buffer) { self.lock.lock(); self.calibFast = (pts, img); self.lock.unlock() } else { self.lock.lock(); self.calibBusy = false; self.lock.unlock() } } }
+  }
+  // troca vista na saída rápida (zoom parado): mede o pulo entre o último quadro da lente velha e o 1º da nova e avisa a
+  // tela/arquivo ~0,45 s antes de o quadro estabilizado da nova chegar
+  private func measureFastSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, pts: Double, from: Int, to: Int, crop: Double) {
+    switchQueue.async {
+      var m: (g: SwitchGeometry, conf: Float, gain: Float)?
+      if let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) { m = ZoomImage.switchGeo(ZoomImage.prep(ta), ZoomImage.prep(tb)) }
+      // previsão pro quadro estabilizado: escala × razão aprendida deste par (o corte da estabilização pode mudar com a lente),
+      // deslocamento × corte (o estabilizado mostra 1/corte do quadro rápido); sem medida: o que este par costuma fazer
+      var pred: SwitchGeometry?
+      if let m { let c = Float(max(1, crop)); pred = SwitchGeometry(s: m.g.s * SwitchMemory.ratio(from: from, to: to), tx: m.g.tx * c, ty: m.g.ty * c, exact: true) }
+      else if let s = SwitchMemory.scale(from: from, to: to) { pred = SwitchGeometry(s: s, tx: 0, ty: 0, exact: true) }
+      self.switchHider.add(t: pts, from: from, to: to, fast: m?.g, pred: pred)
+      var info: [String: String] = ["etapa": "rapida", "de": "\(from)", "para": "\(to)", "medido": m.map { Self.geoText($0.g) + String(format: " conf %.2f", $0.conf) } ?? "não deu"]
+      if let pred { info["previsto"] = Self.geoText(pred); info["preparo"] = Self.geoText(SwitchPlan.pre(pred)) }
+      self.onSwitch?(info)
+      self.lock.lock(); self.switchBusy = false; self.lock.unlock()
+    }
+  }
+  // 1º quadro estabilizado da lente nova (fila dos quadros, antes da tela e do arquivo): mede em volta da previsão
+  private func measureStabSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, ev: LensSwitchHider.Event) {
+    var m: (g: SwitchGeometry, conf: Float, gain: Float)?
+    if let around = ev.pred, let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) { m = ZoomImage.switchGeo(ZoomImage.prep(ta), ZoomImage.prep(tb), around: around) }
+    switchHider.stabMeasured(t: ev.t, g: m?.g)
+    if let m { SwitchMemory.record(from: ev.from, to: ev.to, stab: m.g.s, fast: ev.fast?.s) }
+    onSwitch?(["etapa": "estabilizado", "de": "\(ev.from)", "para": "\(ev.to)", "previsto": ev.pred.map { Self.geoText($0) } ?? "nada",
+      "medido": m.map { Self.geoText($0.g) + String(format: " conf %.2f", $0.conf) } ?? "não deu"])
+  }
+  static func geoText(_ g: SwitchGeometry) -> String { String(format: "%.4f %+.4f %+.4f", g.s, g.tx, g.ty) }
+  // arquivo: a mesma troca medida que a tela usa (sem segurar quadro: no arquivo a ida-e-volta vira um respiro suave)
+  func fileSwitchGeometry(_ pb: CVPixelBuffer?, pts: Double) -> SwitchGeometry {
+    guard let pb else { return .identity }
+    return switchHider.geometry(pts: pts, sensor: LensID.of(pb), file: true).g
   }
   // quadro pequeno 96×54 (orientação do sensor): cor/luz (depois do LUT, antes da correção) + luma pro alinhamento
   private func sample(_ buffer: CVPixelBuffer, cube useCube: Bool) -> (stats: FrameStats, luma: [Float])? {
@@ -210,7 +276,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -253,7 +319,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let zNow = zoomNow?()
     lock.lock()
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
-    let buffer = pending, pts = pendingPTS; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
+    let buffer = pending, pts = pendingPTS, sid = pendingSID; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0 + Self.contentLead) }   // conteúdo adiantado ~25 ms em relação ao zoom lido
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
@@ -273,10 +339,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
         geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity, shake: corrNow)
       return
     }
+    // troca de lente (0.8.0): preparo/saída sem pulo; ida-e-volta rápida = a tela segura o quadro anterior
+    let sw = pts.map { switchHider.geometry(pts: $0, sensor: sid, file: false) } ?? (g: SwitchGeometry.identity, hold: false)
+    if sw.hold && buffer != nil { return }
     guard let buffer, let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
-    var image = Self.oriented(buffer, orient, mirrored: mirror)
+    var raw = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
+    if !sw.g.isIdentity { raw = Self.aligned(raw, sw.g) }   // no quadro do sensor (mesma conta do arquivo)
+    var image = Self.orient(raw, orient, mirrored: mirror)
     // ampliação = zoom pedido agora ÷ zoom do conteúdo do quadro; nunca < 1 (zoom out: o quadro como está, sem borda inventada)
     var kOld = 1.0
     if zoomInstant, let zNow, let zFrame, zFrame > 0 { kOld = max(1, min(6, zNow / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
@@ -297,7 +368,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
-    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k, kOld: kOld, z: zNow ?? 0, lens: lensMatch?.lens(at: pts ?? now) ?? "") }
+    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: lensMatch?.lens(at: pts ?? now) ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)

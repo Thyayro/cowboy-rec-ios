@@ -9,7 +9,7 @@ import UniformTypeIdentifiers
 // Lá o quadro a quadro mostra exatamente o que o filmmaker viu — escala, posição, troca de lente — pra medir antes de
 // mexer. No máximo 8 trechos por abertura; nunca gravando.
 final class PreviewTap: @unchecked Sendable {
-  struct Frame { let at: Double; let pts: Double; let k: Double; let kOld: Double; let z: Double; let lens: String; let jpg: Data }
+  struct Frame { let at: Double; let pts: Double; let k: Double; let kOld: Double; let g: Double; let z: Double; let lens: String; let jpg: Data }
   private let queue = DispatchQueue(label: "cowboy.previewtap", qos: .utility)
   private(set) var active = false
   private var start = 0.0, lastMove = 0.0, skip = false
@@ -28,7 +28,7 @@ final class PreviewTap: @unchecked Sendable {
     if now - lastMove > 2.5 || now - start > 8 || !allowed() { finish() }
   }
   // thread da tela: o quadro que acabou de ir pra tela (imagem final, no tamanho da tela)
-  func offer(_ image: CIImage, size: CGSize, context: CIContext, at: Double, pts: Double, k: Double, kOld: Double, z: Double, lens: String) {
+  func offer(_ image: CIImage, size: CGSize, context: CIContext, at: Double, pts: Double, k: Double, kOld: Double, g: Double, z: Double, lens: String) {
     guard active else { return }
     skip.toggle(); if skip { return }   // 30 qps
     let s = 160 / max(1, size.width)
@@ -40,7 +40,7 @@ final class PreviewTap: @unchecked Sendable {
       guard let dst = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return }
       CGImageDestinationAddImage(dst, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
       guard CGImageDestinationFinalize(dst) else { return }
-      let f = Frame(at: at, pts: pts, k: k, kOld: kOld, z: z, lens: lens, jpg: data as Data)
+      let f = Frame(at: at, pts: pts, k: k, kOld: kOld, g: g, z: z, lens: lens, jpg: data as Data)
       DispatchQueue.main.async { if self.active { self.frames.append(f) } }
     }
   }
@@ -52,7 +52,7 @@ final class PreviewTap: @unchecked Sendable {
         let fr = self.frames; self.frames = []
         guard fr.count > 10 else { return }
         let body: [String: Any] = ["app": "cowboy-rec-ios " + Diag.version, "inicio": start, "parou": lastMove,
-          "quadros": fr.map { ["at": $0.at, "pts": $0.pts, "k": $0.k, "ko": $0.kOld, "z": $0.z, "lente": $0.lens, "img": $0.jpg.base64EncodedString()] }]
+          "quadros": fr.map { ["at": $0.at, "pts": $0.pts, "k": $0.k, "ko": $0.kOld, "g": $0.g, "z": $0.z, "lente": $0.lens, "img": $0.jpg.base64EncodedString()] }]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
         self.onClip?(data)
       }

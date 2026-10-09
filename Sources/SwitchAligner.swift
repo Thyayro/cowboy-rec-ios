@@ -11,10 +11,11 @@ struct SwitchGeometry: Equatable {
   var s: Float = 1
   var tx: Float = 0
   var ty: Float = 0
+  var exact = false   // troca medida (0.8.0): já só amplia e o deslocamento cabe na sobra — sem zoom de cobertura
   static let identity = SwitchGeometry()
   var isIdentity: Bool { abs(s - 1) < 0.0005 && abs(tx) < 0.0005 && abs(ty) < 0.0005 }
-  var cover: Float { 1 + 2 * max(abs(tx), abs(ty)) + max(0, 1 - s) * 1.05 }
-  func mix(_ k: Float) -> SwitchGeometry { SwitchGeometry(s: 1 + (s - 1) * k, tx: tx * k, ty: ty * k) }
+  var cover: Float { exact ? 1 : 1 + 2 * max(abs(tx), abs(ty)) + max(0, 1 - s) * 1.05 }
+  func mix(_ k: Float) -> SwitchGeometry { SwitchGeometry(s: 1 + (s - 1) * k, tx: tx * k, ty: ty * k, exact: exact) }
 }
 
 final class SwitchAligner: @unchecked Sendable {

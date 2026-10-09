@@ -216,7 +216,7 @@ struct RecorderView: View {
   }
   private var statusLine: String {
     if !camera.ready { return camera.status }
-    var parts = ["Estab. \(NativeCamera.label(camera.activeMode))"]
+    var parts = ["v" + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"), "Estab. \(NativeCamera.label(camera.activeMode))"]
     if camera.logEnabled { parts.append(camera.rawLog ? "Apple Log (cru)" : "Apple Log → prévia Rec.709") }
     if !LookPreset.named(camera.lookID).neutral { parts.append("look \(LookPreset.named(camera.lookID).label)") }
     parts.append(camera.recording ? (stream.line.isEmpty ? "gravando direto na nuvem" : stream.line) : "grava direto na nuvem")
