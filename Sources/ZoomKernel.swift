@@ -450,6 +450,16 @@ enum LensID {
     case nil: return 0
     }
   }
+  // nome da lente do quadro ("ultra"/"wide"/"tele", como no LensMatch); nil = o quadro não disse (aí vale o horário)
+  static func name(_ pb: CVPixelBuffer) -> String? {
+    guard let md = CVBufferCopyAttachment(pb, "MetadataDictionary" as CFString, nil) as? NSDictionary else { return nil }
+    switch md["PortType"] as? String {
+    case "PortTypeBackSuperWide"?: return "ultra"
+    case "PortTypeBack"?: return "wide"
+    case "PortTypeBackTelephoto"?: return "tele"
+    default: return nil
+    }
+  }
 }
 
 extension ZoomImage {

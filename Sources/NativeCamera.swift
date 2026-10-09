@@ -211,8 +211,15 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // (o zoom dentro de uma lente é recorte digital: muda a área que o AF analisa e ele caça; as lentes do iPhone mudam de
   // tamanho de imagem quando o foco anda — "focus breathing", forte na tele). Durante o zoom e 1,2 s depois o foco fica
   // TRAVADO onde está (a distância do assunto não mudou); na troca de lente física faz UM ajuste e trava de novo.
-  var focusHoldEnabled = true
+  // 0.8.1: DESLIGADO. Medido na tela (trechos 0.8.0): travar no zoom deixava a imagem desfocada depois de cada zoom e a
+  // lente nova entrava fora de foco (o "um ajuste" na troca caçava) — ~1 s depois o foco contínuo voltava e procurava.
+  // O vai-e-volta de escala era outra coisa (ampliação da tela e troca de lente, já resolvidos). Foco contínuo e suave o
+  // tempo todo, como a câmera do iPhone (o iPhone passa o foco de uma lente pra outra sozinho).
+  var focusHoldEnabled = false
   private var focusHeld = false
+  // toque pra focar: foco e luz seguem o ponto tocado até a cena mudar (aviso do iPhone) ou um zoom — aí voltam pro centro
+  private var pointFocused = false
+  private var subjectObserver: NSObjectProtocol?
   private var focusGen = 0
   @Published var selfTest = ""          // texto do teste automático em andamento ("" = parado)
   private var selfTestResults: [String: [Float]] = [:]
@@ -557,6 +564,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       } else { match.lensChanged(LensMatch.name(cam.deviceType)) }
       let st0 = match.status()
       zoomDriver.attach(cam)
+      if let o = subjectObserver { NotificationCenter.default.removeObserver(o) }
+      subjectObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: cam, queue: nil) { [weak self] _ in self?.recenterFocus("cena mudou") }
       DispatchQueue.main.async { self.lensMatchStatus = st0 }
       renderer.onCrop = { c in Diag.step("crop-calib", ["crop": String(format: "%.3f", c)]) }
       zoomObservation = cam.observe(\.videoZoomFactor, options: [.initial, .new]) { [weak self] cam, _ in
@@ -736,7 +745,25 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
     }
   }
-  func followZoom(_ display: Double) { holdFocus(1.2); zoomDriver.follow(CGFloat(display) * base) }
+  func followZoom(_ display: Double) { recenterFocus("zoom"); holdFocus(1.2); zoomDriver.follow(CGFloat(display) * base) }
+  // foco e luz de volta pro centro, contínuos (o ponto tocado antigo não vale mais depois de zoom ou de a cena mudar)
+  func recenterFocus(_ why: String) {
+    queue.async {
+      guard self.pointFocused, let cam = self.device, !self.manualFocus else { return }
+      self.pointFocused = false
+      _ = CowboyObjC.catching {
+        if (try? cam.lockForConfiguration()) != nil {
+          let c = CGPoint(x: 0.5, y: 0.5)
+          if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = c }
+          if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
+          if cam.isExposurePointOfInterestSupported && cam.exposureMode != .locked && cam.exposureMode != .custom { cam.exposurePointOfInterest = c; cam.exposureMode = .continuousAutoExposure }
+          cam.isSubjectAreaChangeMonitoringEnabled = false
+          cam.unlockForConfiguration()
+        }
+      }
+      Diag.step("focus-center", ["por": why])
+    }
+  }
   func endZoomGesture() {
     holdFocus(1.2); zoomDriver.endFollow()
     let user = selfTestMode.hasPrefix("VOCÊ")
@@ -744,6 +771,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if !recording && !calibrating && !selfTestMode.isEmpty { aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode) }
   }
   func selectZoom(_ value: Double) {
+    recenterFocus("zoom")
     let toUltra = value <= 0.51
     ultraLock = toUltra; UserDefaults.standard.set(toUltra, forKey: "ultraLock")
     queue.async {
@@ -867,8 +895,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   // ponto na imagem mostrada (0–1 em x/y da tela) -> ponto do sensor
-  func focusAt(normalized p: CGPoint) {
+  func focusAt(normalized p0: CGPoint) {
     let angle = previewAngle, isFront = front
+    // a tela mostra o quadro ESTABILIZADO = recorte do centro do campo do sensor (corte medido, ~1,12): o toque é levado pro
+    // campo inteiro (0.8.1; antes o foco caía fora do toque, até ~5% perto das bordas)
+    let c = max(1, min(1.4, renderer.displayCrop))
+    let p = CGPoint(x: 0.5 + (p0.x - 0.5) / c, y: 0.5 + (p0.y - 0.5) / c)
     let point: CGPoint
     if isFront { point = CGPoint(x: p.y, y: p.x) }
     else {
@@ -879,15 +911,19 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       default: point = CGPoint(x: p.y, y: 1 - p.x)
       }
     }
+    Diag.step("focus-tap", ["toque": String(format: "%.3f,%.3f", p0.x, p0.y), "sensor": String(format: "%.3f,%.3f", point.x, point.y), "corte": String(format: "%.3f", c)])
     control { cam in
       self.focusGen += 1; self.focusHeld = false
-      if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.autoFocus) {
-        cam.focusPointOfInterest = point; cam.focusMode = .autoFocus
+      // contínuo NO PONTO (segue o assunto se ele chegar perto/longe), até a cena mudar ou um zoom
+      if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.continuousAutoFocus) {
+        cam.focusPointOfInterest = point; cam.focusMode = .continuousAutoFocus
         self.publish { self.manualFocus = false }
       }
       if cam.isExposurePointOfInterestSupported && cam.exposureMode != .locked && cam.exposureMode != .custom {
         cam.exposurePointOfInterest = point; cam.exposureMode = .continuousAutoExposure
       }
+      cam.isSubjectAreaChangeMonitoringEnabled = true
+      self.pointFocused = true
     }
   }
   func setExposure(_ manual: Bool, iso: Double? = nil, shutter: Double? = nil) {
@@ -1149,7 +1185,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     guard let writer, !stopping else { return }
     var baked: CMSampleBuffer?
     if let recBaker {
-      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds) ?? .identity, geo: renderer.fileSwitchGeometry(pixel, pts: pts.seconds))
+      baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds, lens: pixel.flatMap { LensID.name($0) }) ?? .identity, geo: renderer.fileSwitchGeometry(pixel, pts: pts.seconds))
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)

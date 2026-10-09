@@ -153,6 +153,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     }
     let cropNow = crop; lock.unlock()
     if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
+      lensColorSwitch(pf.buffer, buffer, pts: pts)   // cor/luz: em TODA troca (parado ou andando)
       if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow) }
       else { onSwitch?(["etapa": "rapida", "de": "\(pf.id)", "para": "\(sid)", "medido": still ? "ocupado" : "zoom andando (o movimento esconde)"]) }
     }
@@ -197,6 +198,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if let pred { info["previsto"] = Self.geoText(pred); info["preparo"] = Self.geoText(SwitchPlan.pre(pred)) }
       self.onSwitch?(info)
       self.lock.lock(); self.switchBusy = false; self.lock.unlock()
+    }
+  }
+  // igualar câmeras no quadro EXATO da troca (0.8.1): cor/luz do último quadro da lente velha × 1º da nova, registrado
+  // ~0,45 s antes de o quadro estabilizado da nova chegar na tela/arquivo
+  private func lensColorSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, pts: Double) {
+    guard let lm = lensMatch, lm.enabled, let la = LensID.name(a), let lb = LensID.name(b), la != lb else { return }
+    switchQueue.async {
+      guard let sa = self.sample(a, cube: true)?.stats, let sb = self.sample(b, cube: true)?.stats else { return }
+      lm.switched(at: pts, from: la, before: sa, to: lb, after: sb)
     }
   }
   // 1º quadro estabilizado da lente nova (fila dos quadros, antes da tela e do arquivo): mede em volta da previsão
@@ -335,7 +345,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     tap.tick(now: now, moving: zoomMovedNow)
     if live {
       guard let liveFrame else { return }
-      drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now) ?? .identity,
+      drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now, lens: LensID.name(liveFrame)) ?? .identity,
         geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity, shake: corrNow)
       return
     }
@@ -365,10 +375,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = image.transformed(by: CGAffineTransform(scaleX: scale * k, y: scale * k))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY))
     image = image.cropped(to: fit)
-    image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now) ?? .identity).cropped(to: fit)
+    image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
-    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: lensMatch?.lens(at: pts ?? now) ?? "") }
+    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)

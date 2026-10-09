@@ -82,11 +82,12 @@ final class LensMatch: @unchecked Sendable {
   func lens(at t: Double) -> String { lock.lock(); defer { lock.unlock() }; return lensLocked(at: t) }
   private func staticLocked(_ l: String) -> LensCorrection { l == Self.reference ? .identity : (table[l] ?? .identity) }
 
-  // correção do quadro captado em t: fixa da lente + transição da última troca (se ainda soltando)
-  func correction(at t: Double) -> LensCorrection {
+  // correção do quadro captado em t: fixa da lente + transição da última troca (se ainda soltando). lens = a lente que o
+  // PRÓPRIO quadro diz que o fez (0.8.1); sem ela, a do horário (aviso do iOS, que pode errar 1–3 quadros na troca)
+  func correction(at t: Double, lens: String? = nil) -> LensCorrection {
     lock.lock(); defer { lock.unlock() }
     guard enabled else { return .identity }
-    let l = lensLocked(at: t)
+    let l = lens ?? lensLocked(at: t)
     var c = staticLocked(l)
     if let tr = transitions.last(where: { $0.t0 <= t }), tr.lens == l, t - tr.t0 < Self.fade {
       let k = Float(1 - (t - tr.t0) / Self.fade)
@@ -95,13 +96,25 @@ final class LensMatch: @unchecked Sendable {
     return c
   }
 
+  // TROCA NO QUADRO EXATO (0.8.1): o último quadro da lente velha e o 1º da nova (sensor de cada quadro) — a nova fica
+  // igual à velha desde o 1º quadro e solta em 1,2 s. Antes a troca era vista na amostra de 10×/s: a correção entrava
+  // até 6 quadros depois (cor crua da lente nova, depois "voltava" pra da velha = piscada).
+  func switched(at t: Double, from: String, before: FrameStats, to: String, after: FrameStats) {
+    let rot = motion?() ?? 0
+    lock.lock()
+    let b = staticLocked(from).apply(before), a = staticLocked(to).apply(after)
+    if let c = LensCorrection.fit(from: a, to: b) { transitions.append((t, to, c)); if transitions.count > 20 { transitions.removeFirst() } }
+    pendingLearn = (to, t, before, from); still = rot < 0.35
+    lock.unlock()
+  }
+
   // amostra do quadro em tempo real (30×/s): detecta a troca, monta a transição e aprende a fixa
   func observe(_ s: FrameStats, at t: Double) {
     let rot = motion?() ?? 0
     lock.lock()
     let l = lensLocked(at: t)
     if rot > 0.35 { still = false }
-    if let p = last, p.lens != l, t - p.t < 0.2 {
+    if let p = last, p.lens != l, t - p.t < 0.2, !transitions.contains(where: { $0.lens == l && abs($0.t0 - t) < 0.35 }) {
       // TROCA: a lente nova (com a fixa) fica igual ao último quadro da anterior (com a fixa dela) e solta em 1,2 s
       let before = staticLocked(p.lens).apply(p.s), after = staticLocked(l).apply(s)
       if let c = LensCorrection.fit(from: after, to: before) {

@@ -171,7 +171,7 @@ struct RecorderView: View {
       }.padding(.leading, 10).padding(.top, 10)
       Spacer()
       if let panel, !camera.recording { panelView(panel).padding(.bottom, 10) }
-      if !camera.recording { lensBar.padding(.bottom, 12) }
+      lensBar.padding(.bottom, 12)   // também gravando: tocar = zoom até a lente (0.8.1)
       if (!camera.recording && stream.pendingMB > 1) || (camera.recording && (stream.health == .offline || stream.health == .slow || stream.health == .error)) { uploadLine.padding(.bottom, 8) }
       bottomRow.padding(.bottom, 6)
     }
