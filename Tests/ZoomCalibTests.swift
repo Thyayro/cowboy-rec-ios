@@ -273,7 +273,11 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
           cmd.append(zc)
         }
         func zProp(_ t: Double) -> Double {
-          if kind == "clique" { let dur = 0.35; return t <= T0 ? z0 : (t >= T0 + dur ? z1 : z0 * pow(z1 / z0, (t - T0) / dur)) }
+          if kind == "clique" {   // 3 etapas como o app (0.8.8): 85% a r, 12% a r/3, 3% a r/9 (r = 1/0,35 s)
+            let r = 1 / 0.35, d1 = 0.85 / r, d2 = 0.12 / (r / 3), d3 = 0.03 / (r / 9), u = t - T0
+            let f = u <= 0 ? 0 : u < d1 ? u * r : u < d1 + d2 ? 0.85 + (u - d1) * r / 3 : u < d1 + d2 + d3 ? 0.97 + (u - d1 - d2) * r / 9 : 1
+            return z0 * pow(z1 / z0, f)
+          }
           return t <= 0 ? z0 : cmd[min(cmd.count - 1, Int(t * fps))]
         }
         var tEnd = T0 + 0.2
@@ -307,9 +311,13 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
           var kOld = 1.0
           if let zf = ZoomLag.hist(hist, p + 0.025), zf > 0 { kOld = max(1, min(6, zNow / zf)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
           var k = kOld
-          if let rr = track.ratio(newestOver: p) { k = max(1, min(6, rr)); if abs(k - 1) < 0.0005 { k = 1 } }
-          // depois que o zoom REAL terminou de chegar na tela (último quadro rápido do zoom leva ~40 ms + 1 quadro)
-          if t > tEnd + 0.07 { newN.append(content(p) * k); oldN.append(content(p) * kOld); dbg.append(String(format: "%.0f:%.4f(k%.4f p%.0f)", (t - tEnd) * 1000, content(p) * k / z1, k, (p - T0) * 1000)) }
+          if let rr = track.ratio(newestOver: p) {
+            var r = rr
+            if let np = track.newestPTS, let zh = ZoomLag.hist(hist, np + 0.025), zh > 0 { r *= zNow / zh }   // igual ao app
+            k = max(1, min(6, r)); if abs(k - 1) < 0.0005 { k = 1 }
+          }
+          // desde o instante em que o zoom pedido parou (o pouso conta: antes começava 70 ms depois e escondia o pouso curto)
+          if t >= tEnd { newN.append(content(p) * k); oldN.append(content(p) * kOld); dbg.append(String(format: "%.0f:%.4f(k%.4f p%.0f)", (t - tEnd) * 1000, content(p) * k / z1, k, (p - T0) * 1000)) }
         }
         func spread(_ x: [Double]) -> Double { guard let mx = x.max(), let mn = x.min(), let l = x.last else { return 1 }; return (mx - mn) / l }
         let dn = spread(newN), dO = spread(oldN)

@@ -364,10 +364,12 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   func draw(in view: MTKView) {
     let now = CACurrentMediaTime()
     let zNow = zoomNow?()
+    let newestFast = zoomTrack.newestPTS
     lock.lock()
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
     let buffer = pending, pts = pendingPTS, sid = pendingSID; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
-    let zFrame = pts.flatMap { zoomAt($0 + Self.contentLead) }   // conteúdo adiantado ~25 ms em relação ao zoom lido
+    let zFrame = pts.flatMap { zoomAt($0 + Self.contentLead) }
+    let zNewest = newestFast.flatMap { zoomAt($0 + Self.contentLead) }   // conteúdo adiantado ~25 ms em relação ao zoom lido
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
@@ -401,7 +403,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     var kOld = 1.0
     if zoomInstant, let zNow, let zFrame, zFrame > 0 { kOld = max(1, min(6, zNow / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
     var k = kOld
-    if zoomInstant, let p = pts, let rr = zoomTrack.ratio(newestOver: p) { k = max(1, min(6, rr)); if abs(k - 1) < 0.0005 { k = 1 } }   // zoom REAL medido
+    if zoomInstant, let p = pts, let rr = zoomTrack.ratio(newestOver: p) {
+      // 0.8.8: o quadro rápido mais novo medido é de ~50 ms atrás — o zoom que ainda andou até agora (pelo zoom pedido, liso
+      // e conhecido) entra junto; sem isso a tela POUSAVA curta (~3,6% no 0,5→1 de dia) e completava depois de parar
+      var r = rr
+      if let zN = zNow, zN > 0, let zH = zNewest, zH > 0 { r *= zN / zH }
+      k = max(1, min(6, r)); if abs(k - 1) < 0.0005 { k = 1 }
+    }   // zoom REAL medido
     else if zoomInstant, let zNow, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zNow / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
     if let pts { lock.lock(); shownK.append((pts, k, kOld, now)); if shownK.count > 600 { shownK.removeFirst(shownK.count - 600) }; lock.unlock() }
     // scale first: the LUT runs on screen pixels, not on 4K

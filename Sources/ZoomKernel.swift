@@ -397,6 +397,7 @@ final class FastZoomTracker: @unchecked Sendable {
   private(set) var confs: [Float] = []
   private(set) var resids: [Float] = []
   func reset() { queue.async { self.prev = nil; self.key = nil; self.lock.lock(); self.chain.removeAll(); self.acc = 0; self.predAcc = 0; self.lock.unlock() } }
+  var newestPTS: Double? { lock.lock(); defer { lock.unlock() }; return chain.last?.0 }
   // fila da saída rápida: só enfileira (a medida roda na fila própria, em ordem)
   func feed(pts: Double, zHist: Double, thumb: [Float]?, moving: Bool, sensor: Int = 0) { queue.async { self.step(pts: pts, zHist: zHist, thumb: thumb, moving: moving, sensor: sensor) } }
   private var keySensor = 0

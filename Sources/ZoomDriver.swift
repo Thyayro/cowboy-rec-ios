@@ -116,17 +116,21 @@ final class ZoomDriver: @unchecked Sendable {
     // CHEGADA SUAVE (0.8.2): 85% do caminho na velocidade normal e o fim a 1/3 dela (duas rampas nativas). Parada seca =
     // qualquer erro de tempo no fim vira "volta" de escala na tela (o 0,5→1 ainda mostrava); devagar no fim, quase nada.
     guard stops > 0.12 else { configure(d) { d.ramp(toVideoZoomFactor: to, withRate: Float(rate)) }; return dur }
-    let mid = CGFloat(exp(log(Double(from)) + (log(Double(to)) - log(Double(from))) * 0.85))
-    let d1 = 0.85 * stops / rate, d2 = 0.15 * stops / (rate / 3)
+    // 0.8.8: 3 etapas (85% normal, 12% a 1/3, 3% a 1/9) — o zoom chega QUASE PARANDO: o erro de tempo da tela no pouso
+    // (que vira "estacionar") cai junto com a velocidade final
+    func at(_ f: Double) -> CGFloat { CGFloat(exp(log(Double(from)) + (log(Double(to)) - log(Double(from))) * f)) }
+    let d1 = 0.85 * stops / rate, d2 = 0.12 * stops / (rate / 3), d3 = 0.03 * stops / (rate / 9)
     lock.lock(); glideGen += 1; let gen = glideGen; lock.unlock()
-    configure(d) { d.ramp(toVideoZoomFactor: mid, withRate: Float(rate)) }
-    DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + d1) { [weak self] in
-      guard let self else { return }
-      self.lock.lock(); let ok = self.glideGen == gen && self.target == nil; let dev = self.device; self.lock.unlock()
-      guard ok, let dev else { return }
-      self.configure(dev) { dev.ramp(toVideoZoomFactor: to, withRate: Float(rate / 3)) }
+    configure(d) { d.ramp(toVideoZoomFactor: at(0.85), withRate: Float(rate)) }
+    for (delay, goal, r) in [(d1, at(0.97), rate / 3), (d1 + d2, to, rate / 9)] {
+      DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) { [weak self] in
+        guard let self else { return }
+        self.lock.lock(); let ok = self.glideGen == gen && self.target == nil; let dev = self.device; self.lock.unlock()
+        guard ok, let dev else { return }
+        self.configure(dev) { dev.ramp(toVideoZoomFactor: goal, withRate: Float(r)) }
+      }
     }
-    return d1 + d2
+    return d1 + d2 + d3
   }
   // degrau direto (calibração)
   func jump(to factor: CGFloat) {
