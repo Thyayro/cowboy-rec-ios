@@ -1097,11 +1097,18 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // contínuo NO PONTO (segue o assunto se ele chegar perto/longe), até a cena mudar ou um zoom
       if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.autoFocus) {
         cam.focusPointOfInterest = point
-        self.continuousFocusLocked(cam, force: true)   // contínuo no ponto tocado
+        // FOCO NO TOQUE como na câmera do iPhone (0.9.2): UM foco já, no ponto (o foco por fase acha em ~0,1–0,3 s) e,
+        // assentou, contínuo no MESMO ponto (segue o assunto) até a cena mudar ou um zoom
+        self.focusGen += 1; self.focusHeld = false
+        cam.focusMode = .autoFocus
+        self.lensFocus = (self.focusGen, CACurrentMediaTime(), cam.lensPosition, false, "toque", "ponto")
+        self.queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }
         self.publish { self.manualFocus = false }
       }
       if cam.isExposurePointOfInterestSupported && cam.exposureMode != .locked && cam.exposureMode != .custom {
         cam.exposurePointOfInterest = point; cam.exposureMode = .continuousAutoExposure
+        // toque novo = luz medida no ponto, sem a compensação do toque anterior (o sol volta pro meio, como no iPhone)
+        if cam.exposureTargetBias != 0 { cam.setExposureTargetBias(0, completionHandler: nil); self.publish { self.exposureBias = 0 } }
       }
       cam.isSubjectAreaChangeMonitoringEnabled = true
       self.pointFocused = true

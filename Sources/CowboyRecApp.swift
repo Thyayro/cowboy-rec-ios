@@ -5,6 +5,18 @@ import AVFoundation
   var body: some Scene { WindowGroup { RecorderView() } }
 }
 
+// TOQUE (0.9.2): a prévia inteira pega o toque pra focar/medir luz; os vãos em volta dos botões caíam nela ("ponto de luz"
+// ao errar o parar por pouco). A faixa de baixo e a coluna de ferramentas engolem o toque, cada botão tem área maior que o
+// desenho e o foco ignora toque a menos de 14 pt dos controles.
+struct ControlsTopKey: PreferenceKey {
+  static var defaultValue: CGFloat = .infinity
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = min(value, nextValue()) }
+}
+struct ToolsFrameKey: PreferenceKey {
+  static var defaultValue: CGRect = .zero
+  static func reduce(value: inout CGRect, nextValue: () -> CGRect) { let n = nextValue(); if n != .zero { value = n } }
+}
+
 enum CameraTool: String, CaseIterable, Identifiable {
   case grid, level, space, lut, match, frame, aspect
   var id: String { rawValue }
@@ -46,11 +58,15 @@ struct RecorderView: View {
   @State private var pinchStart: Double?
   @State private var dialStart: Double?
   @State private var focusPoint: CGPoint?
+  @State private var sunStart: Double?      // compensação de luz no começo do arrasto do sol
+  @State private var focusToken = 0
   @State private var toast: String?
   @State private var iconAngle: Double = 0
   @State private var noisePanel = false
   @State private var askSelfTest = false
   @State private var fxOpen = false
+  @State private var controlsTop: CGFloat = .infinity   // topo dos controles de baixo (coordenada da tela)
+  @State private var toolsFrame: CGRect = .zero          // coluna de ferramentas (coordenada da tela)
   @Environment(\.scenePhase) private var phase
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 1, green: 0.8, blue: 0)
@@ -69,16 +85,37 @@ struct RecorderView: View {
           Color.clear.contentShape(Rectangle())
             .onTapGesture(coordinateSpace: .local) { p in
               guard video.contains(p) else { return }
+              // perto dos controles (gravar/parar, lentes, pílula, ferramentas) nunca vira foco/luz
+              let g = geo.frame(in: .global), pg = CGPoint(x: p.x + g.minX, y: p.y + g.minY)
+              if pg.y > controlsTop - 14 || (toolsFrame != .zero && toolsFrame.insetBy(dx: -14, dy: -14).contains(pg)) { return }
               camera.focusAt(normalized: CGPoint(x: (p.x - video.minX) / video.width, y: (p.y - video.minY) / video.height))
-              focusPoint = p
-              DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { if focusPoint == p { focusPoint = nil } }
+              focusPoint = p; sunStart = nil; holdFocusUI()
             }
+            .simultaneousGesture(DragGesture(minimumDistance: 8).onChanged { v in
+              // SOL (luz), como na câmera do iPhone: arrastar pra cima clareia, pra baixo escurece (perto do quadrado)
+              guard let fp = focusPoint, pinchStart == nil else { return }
+              if sunStart == nil {
+                guard hypot(v.startLocation.x - fp.x, v.startLocation.y - fp.y) < 140 else { return }
+                sunStart = camera.exposureBias
+              }
+              let lo = camera.minExposureBias, hi = max(camera.minExposureBias, camera.maxExposureBias)
+              camera.setExposureBias(max(lo, min(hi, (sunStart ?? 0) - Double(v.translation.height) / 90)))
+              holdFocusUI()
+            }.onEnded { _ in if sunStart != nil { sunStart = nil; holdFocusUI() } })
             .gesture(MagnifyGesture().onChanged { v in
+              sunStart = nil
               if pinchStart == nil { pinchStart = camera.zoom }
               camera.followZoom(clampZoom((pinchStart ?? 1) * v.magnification))
             }.onEnded { _ in pinchStart = nil; camera.endZoomGesture() })
           if let p = focusPoint {
-            RoundedRectangle(cornerRadius: 3).stroke(gold, lineWidth: 1.5).frame(width: 74, height: 74).position(p).allowsHitTesting(false)
+            // quadrado do foco + sol da luz ao lado (do outro lado perto da borda); trilho só enquanto arrasta
+            let sx = p.x + 52 > geo.size.width - 18 ? p.x - 52 : p.x + 52
+            let sy = p.y - CGFloat(max(-3, min(3, camera.exposureBias))) * 22
+            ZStack {
+              RoundedRectangle(cornerRadius: 3).stroke(gold, lineWidth: 1.5).frame(width: 74, height: 74).position(p)
+              if sunStart != nil { Rectangle().fill(gold.opacity(0.7)).frame(width: 1, height: 140).position(x: sx, y: p.y) }
+              Image(systemName: "sun.max.fill").font(.system(size: 17, weight: .semibold)).foregroundStyle(gold).shadow(radius: 2).position(x: sx, y: sy)
+            }.allowsHitTesting(false).transition(.opacity)
           }
         }
         .onChange(of: geo.size) { _, _ in updateAngle() }
@@ -171,13 +208,18 @@ struct RecorderView: View {
         Spacer()
       }.padding(.leading, 10).padding(.top, 10)
       Spacer()
-      if let panel, !camera.recording { panelView(panel).padding(.bottom, 10) }
-      if fxOpen { fxPanel.padding(.bottom, 8).transition(.opacity) }
-      fxPill.padding(.bottom, 8)   // efeitos e zoom em destaque na prévia (0.8.9)
-      lensBar.padding(.bottom, 12)   // também gravando: tocar = zoom até a lente (0.8.1)
-      if (!camera.recording && stream.pendingMB > 1) || (camera.recording && (stream.health == .offline || stream.health == .slow || stream.health == .error)) { uploadLine.padding(.bottom, 8) }
-      bottomRow.padding(.bottom, 6)
+      VStack(spacing: 0) {
+        if let panel, !camera.recording { panelView(panel).padding(.bottom, 10) }
+        if fxOpen { fxPanel.padding(.bottom, 6).transition(.opacity) }
+        fxPill.padding(.bottom, 2)   // efeitos e zoom (ícones) em destaque na prévia
+        lensBar.padding(.bottom, 8)   // também gravando: tocar = zoom até a lente (0.8.1)
+        if (!camera.recording && stream.pendingMB > 1) || (camera.recording && (stream.health == .offline || stream.health == .slow || stream.health == .error)) { uploadLine.padding(.bottom, 8) }
+        bottomRow.padding(.bottom, 2)
+      }
+      .background(GeometryReader { g in Color.clear.preference(key: ControlsTopKey.self, value: g.frame(in: .global).minY) })
     }
+    .onPreferenceChange(ControlsTopKey.self) { controlsTop = $0 }
+    .onPreferenceChange(ToolsFrameKey.self) { toolsFrame = $0 }
     .animation(.easeOut(duration: 0.18), value: camera.recording)
     .animation(.easeOut(duration: 0.18), value: panel)
     .animation(.easeOut(duration: 0.18), value: fxOpen)
@@ -199,9 +241,9 @@ struct RecorderView: View {
           .padding(.horizontal, 10).padding(.vertical, 4).background(camera.recording ? rec : .white.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
         Spacer()
         if camera.torchAvailable {
-          Button { camera.setTorch(!camera.torchEnabled) } label: { Image(systemName: camera.torchEnabled ? "bolt.fill" : "bolt.slash").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(camera.torchEnabled ? gold : .white.opacity(0.12), in: Circle()).foregroundStyle(camera.torchEnabled ? .black : .white) }
+          Button { camera.setTorch(!camera.torchEnabled) } label: { Image(systemName: camera.torchEnabled ? "bolt.fill" : "bolt.slash").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(camera.torchEnabled ? gold : .white.opacity(0.12), in: Circle()).foregroundStyle(camera.torchEnabled ? .black : .white).frame(width: 46, height: 46).contentShape(Rectangle()) }.buttonStyle(.plain).accessibilityLabel("Lanterna")
         }
-        Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(.white.opacity(0.12), in: Circle()).foregroundStyle(.white) }.disabled(camera.recording)
+        Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(.white.opacity(0.12), in: Circle()).foregroundStyle(.white).frame(width: 46, height: 46).contentShape(Rectangle()) }.buttonStyle(.plain).disabled(camera.recording).accessibilityLabel("Ajustes")
       }
       AudioMeter(levels: camera.audioLevels, holds: camera.audioPeakHold, clip: camera.audioClip, noiseOn: camera.noiseLevel != .off) { withAnimation(.easeOut(duration: 0.15)) { noisePanel.toggle() } }
       if noisePanel {
@@ -267,25 +309,26 @@ struct RecorderView: View {
     }
   }
   private var toolColumn: some View {
-    VStack(spacing: 10) {
+    VStack(spacing: 0) {
       ForEach(CameraTool.allCases) { t in
         Button {
           let on = isOn(t)
-          if !on { setOn(t, true); panel = t == .level ? nil : t }
-          else if panel == t || t == .level { setOn(t, false); panel = nil }
+          if !on { setOn(t, true); panel = t == .level ? nil : t; flash(t.title) }
+          else if panel == t || t == .level { setOn(t, false); panel = nil; flash(t.title + " desligado") }
           else { panel = t }
         } label: {
-          VStack(spacing: 2) {
-            Image(systemName: t.icon).font(.system(size: 17, weight: .semibold))
-              .frame(width: 42, height: 42)
-              .background(isOn(t) ? gold : Color.black.opacity(0.45), in: Circle())
-              .overlay(Circle().stroke(panel == t ? Color.white : .clear, lineWidth: 1.5))
-              .foregroundStyle(isOn(t) ? .black : .white)
-            Text(t.title).font(.system(size: 9, weight: .semibold)).foregroundStyle(.white).shadow(radius: 2)
-          }.rotationEffect(.degrees(iconAngle))
-        }.buttonStyle(.plain)
+          Image(systemName: t.icon).font(.system(size: 17, weight: .semibold))
+            .frame(width: 42, height: 42)
+            .background(isOn(t) ? gold : Color.black.opacity(0.45), in: Circle())
+            .overlay(Circle().stroke(panel == t ? Color.white : .clear, lineWidth: 1.5))
+            .foregroundStyle(isOn(t) ? .black : .white)
+            .rotationEffect(.degrees(iconAngle))
+            .frame(width: 58, height: 50).contentShape(Rectangle())   // toque maior que o desenho
+        }.buttonStyle(.plain).accessibilityLabel(t.title)
       }
     }
+    .contentShape(Rectangle()).onTapGesture {}   // vão entre os ícones não vira foco
+    .background(GeometryReader { g in Color.clear.preference(key: ToolsFrameKey.self, value: g.frame(in: .global)) })
   }
   @ViewBuilder private func panelView(_ t: CameraTool) -> some View {
     ScrollView(.horizontal, showsIndicators: false) {
@@ -326,37 +369,54 @@ struct RecorderView: View {
     }
     .frame(height: 40)
   }
-  // ---------------------------------------------------------------- efeitos: LIVE/RENDER · desfoque · velocidade do zoom
+  // ---------------------------------------------------------------- efeitos: LIVE/RENDER · desfoque · velocidade do zoom (ícones)
+  static func blurIcon(_ a: Int) -> String { a >= 720 ? "aqi.high" : a >= 360 ? "aqi.medium" : "aqi.low" }
+  static func speedIcon(_ i: Int) -> String { i == 0 ? "hare.fill" : i == 2 ? "tortoise.fill" : "gauge.with.dots.needle.50percent" }
+  static func blurName(_ a: Int) -> String { a >= 720 ? "pesado 720°" : a >= 360 ? "forte 360°" : "natural 180°" }
   private var fxPill: some View {
     Button { fxOpen.toggle() } label: {
-      HStack(spacing: 6) {
-        Image(systemName: "sparkles").font(.system(size: 12, weight: .bold))
-        Text(camera.fxRender ? "RENDER" : "LIVE").font(.system(size: 12, weight: .heavy))
-        Text("·").opacity(0.6)
-        Text(camera.motionBlur ? (camera.blurAngle >= 720 ? "Desfoque pesado" : camera.blurAngle >= 360 ? "Desfoque forte" : "Desfoque") : "Sem desfoque").font(.system(size: 12, weight: .semibold))
-        Text("·").opacity(0.6)
-        Text("Zoom " + NativeCamera.zoomSpeeds[max(0, min(2, camera.zoomSpeed))].label.lowercased()).font(.system(size: 12, weight: .semibold))
+      HStack(spacing: 10) {
+        Image(systemName: camera.fxRender ? "cloud.fill" : "bolt.fill")
+        Image(systemName: "wind").opacity(camera.motionBlur ? 1 : 0.35)
+        Image(systemName: Self.speedIcon(camera.zoomSpeed))
       }
+      .font(.system(size: 13, weight: .bold))
       .padding(.horizontal, 12).padding(.vertical, 7)
       .background(camera.motionBlur ? gold : Color.black.opacity(0.55), in: Capsule())
       .foregroundStyle(camera.motionBlur ? .black : .white)
       .overlay(Capsule().stroke(.white.opacity(fxOpen ? 0.9 : 0), lineWidth: 1.5))
-    }.buttonStyle(.plain)
+      .padding(.horizontal, 14).padding(.vertical, 6).contentShape(Rectangle())
+    }.buttonStyle(.plain).accessibilityLabel("Efeitos e zoom")
+  }
+  private func iconPill(_ symbol: String, _ on: Bool, _ label: String, _ action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      Image(systemName: symbol).font(.system(size: 16, weight: .semibold))
+        .frame(width: 40, height: 40)
+        .background(on ? gold : Color.black.opacity(0.55), in: Circle())
+        .foregroundStyle(on ? .black : .white)
+        .rotationEffect(.degrees(iconAngle))
+        .frame(width: 46, height: 48).contentShape(Rectangle())
+    }.buttonStyle(.plain).accessibilityLabel(label)
   }
   private var fxPanel: some View {
     ScrollView(.horizontal, showsIndicators: false) {
-      HStack(spacing: 8) {
-        pill("Live", !camera.fxRender) { camera.setFXRender(false); flash("Live: o desfoque entra na hora, na tela e no arquivo") }.disabled(camera.recording)
-        pill("Render", camera.fxRender) { camera.setFXRender(true); flash("Render: grava limpo e a nuvem aplica o desfoque depois") }.disabled(camera.recording)
-        if camera.fxRender { pill("Ver como render", camera.previewAsRender) { camera.setPreviewAsRender(!camera.previewAsRender) } }
-        Divider().frame(height: 20)
-        pill(camera.motionBlur ? "Desfoque ON" : "Desfoque OFF", camera.motionBlur) { camera.setMotionBlur(!camera.motionBlur) }
-        if camera.motionBlur { ForEach(MotionBlur.angles, id: \.self) { a in pill(a == 180 ? "Natural" : a == 360 ? "Forte" : "Pesado", camera.blurAngle == a) { camera.setBlurAngle(a) } } }
-        Divider().frame(height: 20)
-        ForEach(NativeCamera.zoomSpeeds.indices, id: \.self) { i in pill(NativeCamera.zoomSpeeds[i].label, camera.zoomSpeed == i) { camera.setZoomSpeed(i) } }
-      }.padding(.horizontal, 14)
+      HStack(spacing: 2) {
+        iconPill("bolt.fill", !camera.fxRender, "Live") { camera.setFXRender(false); flash("Live: efeito na hora, na tela e no arquivo") }.disabled(camera.recording)
+        iconPill("cloud.fill", camera.fxRender, "Render") { camera.setFXRender(true); flash("Render: grava limpo, a nuvem aplica depois") }.disabled(camera.recording)
+        if camera.fxRender { iconPill(camera.previewAsRender ? "eye.fill" : "eye", camera.previewAsRender, "Ver como render") { camera.setPreviewAsRender(!camera.previewAsRender); flash(camera.previewAsRender ? "Tela mostra o render" : "Tela limpa (render só no arquivo)") } }
+        Divider().frame(height: 26).padding(.horizontal, 4)
+        iconPill("wind", camera.motionBlur, "Desfoque de movimento") { camera.setMotionBlur(!camera.motionBlur); flash(camera.motionBlur ? "Desfoque de movimento ligado" : "Desfoque de movimento desligado") }
+        if camera.motionBlur {
+          ForEach(MotionBlur.angles, id: \.self) { a in iconPill(Self.blurIcon(a), camera.blurAngle == a, "Desfoque " + Self.blurName(a)) { camera.setBlurAngle(a); flash("Desfoque " + Self.blurName(a)) } }
+        }
+        Divider().frame(height: 26).padding(.horizontal, 4)
+        ForEach(NativeCamera.zoomSpeeds.indices, id: \.self) { i in
+          iconPill(Self.speedIcon(i), camera.zoomSpeed == i, "Zoom " + NativeCamera.zoomSpeeds[i].label) { camera.setZoomSpeed(i); flash("Zoom " + NativeCamera.zoomSpeeds[i].label.lowercased()) }
+        }
+      }.padding(.horizontal, 10)
     }
-    .frame(height: 40)
+    .frame(height: 50)
+    .contentShape(Rectangle()).onTapGesture {}
   }
   private func pill(_ text: String, _ on: Bool, _ action: @escaping () -> Void) -> some View {
     Button(action: action) {
@@ -393,6 +453,7 @@ struct RecorderView: View {
             .frame(minWidth: current ? 44 : 34, minHeight: current ? 44 : 34)
             .background(Color.black.opacity(0.5), in: Circle())
             .rotationEffect(.degrees(iconAngle))
+            .frame(minWidth: 46, minHeight: 50).contentShape(Rectangle())
         }.buttonStyle(.plain)
       }
     }
@@ -414,9 +475,10 @@ struct RecorderView: View {
     .font(.system(size: 11, weight: .semibold)).foregroundStyle(stream.health == .offline || stream.health == .error ? rec : stream.health == .slow ? .yellow : .white.opacity(0.85))
     .padding(.horizontal, 10).padding(.vertical, 4).background(Color.black.opacity(0.45), in: Capsule())
   }
-  // rodapé SEM fundo: só os três botões sobre a imagem
+  // rodapé SEM fundo: só os três botões sobre a imagem. Área de toque (0.9.2): gravar = 150 pt de largura na faixa inteira,
+  // PARAR (gravando) = 220 pt; galeria e câmera = 84 pt; o resto da faixa engole o toque (nunca vira foco/luz)
   private var bottomRow: some View {
-    HStack {
+    HStack(spacing: 0) {
       Button { open(.library) } label: {
         Group {
           if let thumb = camera.lastThumb {
@@ -427,21 +489,28 @@ struct RecorderView: View {
               .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white)
           }
         }.rotationEffect(.degrees(iconAngle))
-      }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing)
-      Spacer()
+          .frame(width: 84, height: 100).contentShape(Rectangle())
+      }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing).accessibilityLabel("Galeria")
+      Spacer(minLength: 0)
       Button(action: shutter) {
         ZStack {
           Circle().stroke(.white, lineWidth: 4).frame(width: 78, height: 78)
           RoundedRectangle(cornerRadius: camera.recording ? 7 : 31).fill(rec).frame(width: camera.recording ? 30 : 62, height: camera.recording ? 30 : 62)
           if camera.finishing { ProgressView().tint(.white) }
-        }.animation(.spring(response: 0.25, dampingFraction: 0.8), value: camera.recording)
+        }
+        .frame(width: camera.recording ? 220 : 150, height: 100).contentShape(Rectangle())
+        .animation(.spring(response: 0.25, dampingFraction: 0.8), value: camera.recording)
       }.buttonStyle(.plain).disabled(!camera.ready || camera.finishing).accessibilityLabel(camera.recording ? "Parar gravação" : "Gravar")
-      Spacer()
+      Spacer(minLength: 0)
       Button { camera.flip() } label: {
         Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 20, weight: .semibold)).frame(width: 50, height: 50)
           .background(Color.black.opacity(0.45), in: Circle()).foregroundStyle(.white).rotationEffect(.degrees(iconAngle))
-      }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing || !camera.ready)
-    }.padding(.horizontal, 28)
+          .frame(width: 84, height: 100).contentShape(Rectangle())
+      }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing || !camera.ready).accessibilityLabel("Trocar câmera")
+    }
+    .padding(.horizontal, 10)
+    .frame(height: 100)
+    .contentShape(Rectangle()).onTapGesture {}   // a faixa inteira nunca vira foco/luz
   }
 
   // ---------------------------------------------------------------- ajustes
@@ -486,6 +555,11 @@ struct RecorderView: View {
     camera.record(owner: owner, aspect: tools.aspect, look: LookPreset.named(camera.lookID))
   }
   private func open(_ destination: CowboyPortal) { camera.close(); portal = destination }
+  // o quadrado e o sol ficam 3 s depois do último toque/arrasto (como no iPhone) e somem devagar
+  private func holdFocusUI() {
+    focusToken += 1; let tk = focusToken
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if focusToken == tk && sunStart == nil { withAnimation(.easeOut(duration: 0.35)) { focusPoint = nil } } }
+  }
   private func flash(_ text: String) {
     toast = text
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { if toast == text { toast = nil } }
