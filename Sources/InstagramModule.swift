@@ -22,12 +22,12 @@ struct IGAccount: Codable, Identifiable, Hashable {
 }
 struct IGTake: Codable, Identifiable, Hashable {
   struct Posted: Codable, Hashable { var user: String?; var kind: String?; var url: String?; var at: String? }
-  var id: String; var title: String?; var created: String?; var kind: String; var dur: Double; var w: Int; var h: Int; var color: String?; var busy: String?; var thumb: String?; var ig: [Posted]?
+  var id: String; var title: String?; var created: String?; var kind: String; var dur: Double; var w: Int; var h: Int; var color: String?; var busy: String?; var thumb: String?; var url: String?; var ig: [Posted]?
 }
 struct IGEdit: Codable, Identifiable, Hashable {
   struct Post: Codable, Hashable { var status: String?; var permalink: String? }
   var id: String; var title: String?; var created: String?; var from_app: Bool?; var molde: String?; var busy: String?; var stage: String?; var done: Int?; var total: Int?
-  var final: String?; var thumb: String?; var caption: String?; var post: Post?
+  var final: String?; var thumb: String?; var caption: String?; var post: Post?; var whatsapp: String?
 }
 struct IGJob: Codable, Identifiable, Hashable {
   struct Acc: Codable, Hashable { var id: String; var username: String; var state: String; var step: String?; var err: String?; var permalink: String? }
@@ -51,6 +51,8 @@ enum IGSource: Identifiable, Hashable {
   var isPhoto: Bool { if case .take(let t) = self { return t.kind == "photo" }; return false }
   var title: String { switch self { case .take(let t): return t.title ?? t.id; case .edit(let e): return e.title ?? "Editado" } }
   var thumb: String? { switch self { case .take(let t): return t.thumb; case .edit(let e): return e.thumb } }
+  /// vídeo de onde sai o quadro da capa
+  var video: String? { switch self { case .take(let t): return t.kind == "photo" ? nil : t.url; case .edit(let e): return e.final } }
 }
 
 // ---------------------------------------------------------------- envio da live (fila própria, nunca atrasa a gravação)
@@ -149,8 +151,8 @@ final class IGLiveUplink: @unchecked Sendable {
   private var liveTimer: Timer?
   private var jobTimer: Timer?
 
-  static let kinds: [(id: String, label: String, icon: String)] = [("reels", "Reels + Feed", "film.stack"), ("reels_only", "Só Reels", "film"), ("story", "Stories", "circle.dashed"), ("feed", "Foto no feed", "photo")]
-  static let covers: [(id: String, label: String)] = [("frame", "Quadro do vídeo"), ("ai_cowboy", "IA · estilo Cowboy"), ("ai_livre", "IA · estilo livre"), ("studio", "Capa da edição")]
+  static let kinds: [(id: String, label: String, icon: String)] = [("reels", "Reels + Feed", "film.stack"), ("reels_only", "Só Reels", "film"), ("story", "Stories", "circle.dashed"), ("feed", "Foto feed", "photo")]
+  static let covers: [(id: String, label: String)] = [("frame", "Quadro"), ("ai_cowboy", "IA Cowboy"), ("ai_livre", "IA livre"), ("studio", "Da edição")]
   static let moldes: [(id: String, label: String)] = [("ricardo_boreal", "Ricardo (Boreal) — normal"), ("ricardo_premium", "Ricardo Premium"), ("ricardo_mt", "Ricardo (MT)"), ("fernando", "Fernando"), ("teteba", "Teteba"), ("thyayro", "Referências do Thyayrô"), ("livre", "Livre (o agente decide)")]
   var pendingApproval: Int { jobs.filter { $0.state == "aguardando aprovação" }.count }
 
@@ -264,8 +266,8 @@ final class IGLiveUplink: @unchecked Sendable {
     } catch { self.error = error.localizedDescription }
   }
   // ---- edição pelo Studio
-  func sendToEdit(_ takes: [String], molde: String, notes: String) async -> Bool {
-    do { _ = try await call("/api/ig/edit", method: "POST", body: ["takes": takes, "molde": molde, "notes": notes]); edits = (try? await get("/api/ig/edits", "edits", as: [IGEdit].self)) ?? edits; error = nil; return true }
+  func sendToEdit(_ takes: [String], molde: String, notes: String, whatsapp: Bool) async -> Bool {
+    do { _ = try await call("/api/ig/edit", method: "POST", body: ["takes": takes, "molde": molde, "notes": notes, "whatsapp": whatsapp]); edits = (try? await get("/api/ig/edits", "edits", as: [IGEdit].self)) ?? edits; error = nil; return true }
     catch { self.error = error.localizedDescription; return false }
   }
   /// a câmera terminou uma gravação (direto na nuvem): "preparar ao parar" (vai pra aprovação) e fim da live
@@ -476,6 +478,7 @@ struct InstagramPanel: View {
             if let m = e.molde { Text("Molde: " + (IGModule.moldes.first { $0.id == m }?.label ?? m)).font(.caption2).foregroundStyle(.secondary) }
             if let b = e.busy { Text(b + (e.stage.map { " · " + $0 } ?? "") + " (\(e.done ?? 0)/\(e.total ?? 0))").font(.caption2).foregroundStyle(.orange) }
             if e.post?.status == "publicado" { Text("Publicado").font(.caption2).foregroundStyle(.green) }
+            if let w = e.whatsapp { Label(w == "enviado" ? "Enviado no seu WhatsApp" : "Vai pro seu WhatsApp ao terminar", systemImage: "paperplane").font(.caption2).foregroundStyle(w == "enviado" ? .green : .secondary) }
             HStack(spacing: 14) {
               if let f = e.final { Button { video = IGVideoLink(path: f) } label: { Label("Ver", systemImage: "play.fill") } }
               if e.final != nil && e.busy == nil { Button { compose = .edit(e) } label: { Label("Preparar post", systemImage: "paperplane.fill") } }
@@ -565,15 +568,22 @@ struct IGFormatFields: View {
   @ObservedObject var ig: IGModule
   var photo: Bool
   var edit: Bool
+  var video: String? = nil
+  @State private var pickFrame = false
   var body: some View {
     Picker("Onde", selection: $ig.kind) {
-      ForEach(IGModule.kinds.filter { photo ? ($0.id == "feed" || $0.id == "story") : $0.id != "feed" }, id: \.id) { k in Label(k.label, systemImage: k.icon).tag(k.id) }
+      ForEach(IGModule.kinds.filter { photo ? ($0.id == "feed" || $0.id == "story") : $0.id != "feed" }, id: \.id) { k in Text(k.label).tag(k.id) }
     }
-    Picker("Enquadrar", selection: $ig.fit) { Text("Preencher 9:16 (corta as sobras)").tag("cover"); Text("Inteiro (faixas pretas)").tag("contain") }
+    Picker("Enquadrar", selection: $ig.fit) { Text("Preencher 9:16").tag("cover"); Text("Inteiro").tag("contain") }
     if !photo { Toggle("Com áudio", isOn: $ig.audio) }
     if !photo && ig.kind != "story" {
       Picker("Capa", selection: $ig.cover) { ForEach(IGModule.covers.filter { edit || $0.id != "studio" }, id: \.id) { c in Text(c.label).tag(c.id) } }
-      if ig.cover == "frame" { Stepper(String(format: "Quadro em %.1f s", ig.coverSec), value: $ig.coverSec, in: 0...900, step: 0.5) }
+      if ig.cover == "frame" {
+        if let v = video {
+          Button { pickFrame = true } label: { HStack { Text("Quadro da capa"); Spacer(); Text(String(format: "%.2f s", ig.coverSec)).foregroundStyle(.secondary); Image(systemName: "photo.on.rectangle") } }
+            .sheet(isPresented: $pickFrame) { IGFramePickerSheet(path: v, start: ig.coverSec) { ig.coverSec = $0 } }
+        } else { Text("O quadro da capa se escolhe na aprovação, vendo a prévia").font(.caption2).foregroundStyle(.secondary) }
+      }
     }
     if ig.kind != "story" { Toggle("Legenda por IA (se ficar em branco)", isOn: $ig.aiCaption) }
     TextField("Observações pra IA (opcional)", text: $ig.hint, axis: .vertical).lineLimit(1...3)
@@ -603,7 +613,7 @@ struct IGComposeView: View {
             }.buttonStyle(.plain)
           }
         }
-        Section("Formato") { IGFormatFields(ig: ig, photo: source.isPhoto, edit: { if case .edit = source { return true }; return false }()) }
+        Section("Formato") { IGFormatFields(ig: ig, photo: source.isPhoto, edit: { if case .edit = source { return true }; return false }(), video: source.video) }
         if ig.kind != "story" {
           Section {
             TextField("Legenda", text: $ig.caption, axis: .vertical).lineLimit(3...12)
@@ -639,6 +649,7 @@ struct IGApprovalCard: View {
   @State private var caption = ""
   @State private var sec = 0.0
   @State private var sending = false
+  @State private var pickFrame = false
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       HStack(alignment: .top, spacing: 10) {
@@ -655,10 +666,8 @@ struct IGApprovalCard: View {
       }
       if job.kind != "story" { TextField("Legenda", text: $caption, axis: .vertical).lineLimit(3...10).font(.caption) }
       if job.kind != "story" && job.preview?.hasSuffix(".mp4") == true {
-        HStack {
-          Stepper(String(format: "Capa no quadro %.1f s", sec), value: $sec, in: 0...900, step: 0.5).font(.caption)
-          Button("Usar") { Task { await ig.adjust(job, ["cover_ms": Int(sec * 1000)]) } }.font(.caption.weight(.bold)).buttonStyle(.borderless)
-        }
+        Button { pickFrame = true } label: { Label("Escolher o quadro da capa", systemImage: "photo.on.rectangle") }.font(.caption.weight(.semibold)).buttonStyle(.borderless)
+          .sheet(isPresented: $pickFrame) { if let p = job.preview { IGFramePickerSheet(path: p, start: sec) { s in sec = s; Task { await ig.adjust(job, ["cover_ms": Int((s * 1000).rounded())]) } } } }
         HStack(spacing: 14) {
           Button("Capa IA Cowboy") { Task { await ig.adjust(job, ["redo_cover": "cowboy", "caption": caption]) } }
           Button("Capa IA livre") { Task { await ig.adjust(job, ["redo_cover": "livre", "caption": caption]) } }
@@ -687,17 +696,20 @@ struct IGEditOrderView: View {
   @State private var molde = UserDefaults.standard.string(forKey: "igMolde") ?? "ricardo_boreal"
   @State private var notes = ""
   @State private var working = false
+  @State private var whatsapp = UserDefaults.standard.object(forKey: "igEditWA") as? Bool ?? true
   var body: some View {
     NavigationStack {
       Form {
         Section("\(takes.count) tomada(s)") {
           Picker("Molde", selection: $molde) { ForEach(IGModule.moldes, id: \.id) { m in Text(m.label).tag(m.id) } }
           TextField("Observações pro editor (cliente, história, o que destacar, onde estão as referências…)", text: $notes, axis: .vertical).lineLimit(3...8)
+          Toggle("Enviar o resultado pro Thyayrô no WhatsApp (documento original)", isOn: $whatsapp)
         }
         Section {
           Button {
             working = true; UserDefaults.standard.set(molde, forKey: "igMolde")
-            Task { if await ig.sendToEdit(takes, molde: molde, notes: notes) { done(); dismiss() }; working = false }
+            UserDefaults.standard.set(whatsapp, forKey: "igEditWA")
+            Task { if await ig.sendToEdit(takes, molde: molde, notes: notes, whatsapp: whatsapp) { done(); dismiss() }; working = false }
           } label: { HStack { Spacer(); if working { ProgressView() } else { Label("Mandar pra edição", systemImage: "wand.and.stars") }; Spacer() } }.disabled(working)
         } footer: { Text("O agente do Cowboy Studio (Claude Code no PC, skill edicao-shorts-cowboy) edita no molde escolhido. O resultado aparece em Editados e só vai pro Instagram com a sua aprovação.") }
         if let e = ig.error { Text(e).font(.caption).foregroundStyle(.orange) }
@@ -766,6 +778,81 @@ struct IGLiveOverlay: View {
             .padding(.horizontal, 8).padding(.vertical, 3).background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         }
       }.foregroundStyle(.white).allowsHitTesting(false)
+    }
+  }
+}
+
+// ---- capa: escolher o quadro VENDO a imagem, quadro a quadro (o arquivo vem da nuvem, com o login)
+struct IGFramePickerSheet: View {
+  let path: String
+  let start: Double
+  var onPick: (Double) -> Void
+  @Environment(\.dismiss) private var dismiss
+  @State private var seconds = 0.0
+  @State private var duration = 0.0
+  @State private var fps = 30.0
+  @State private var image: UIImage?
+  @State private var loading = true
+  @State private var failed: String?
+  @State private var gen: AVAssetImageGenerator?
+  var body: some View {
+    NavigationStack {
+      VStack(spacing: 14) {
+        ZStack {
+          Rectangle().fill(Color.black)
+          if let image { Image(uiImage: image).resizable().scaledToFit() }
+          if loading { ProgressView() }
+          if let failed { Text(failed).font(.caption).foregroundStyle(.orange).padding() }
+        }.frame(maxWidth: .infinity).frame(height: 420).clipShape(RoundedRectangle(cornerRadius: 10))
+        Text(String(format: "%.3f s  ·  quadro %d de %d", seconds, Int((seconds * fps).rounded()), Int((duration * fps).rounded()))).font(.callout.monospacedDigit())
+        if duration > 0 { Slider(value: $seconds, in: 0...duration) }
+        HStack(spacing: 10) {
+          step("gobackward", -1, "−1 s"); step("chevron.left", -1 / fps, "−1 quadro"); step("chevron.right", 1 / fps, "+1 quadro"); step("goforward", 1, "+1 s")
+        }
+        Spacer()
+      }
+      .padding()
+      .navigationTitle("Quadro da capa").navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) { Button("Cancelar") { dismiss() } }
+        ToolbarItem(placement: .topBarTrailing) { Button("Usar este") { onPick(seconds); dismiss() }.bold().disabled(image == nil) }
+      }
+      .task { await setup() }
+      .onChange(of: seconds) { _, _ in render() }
+    }.preferredColorScheme(.dark)
+  }
+  private func step(_ icon: String, _ d: Double, _ label: String) -> some View {
+    Button { seconds = snap(min(max(0, seconds + d), duration)) } label: {
+      VStack(spacing: 3) { Image(systemName: icon).font(.title3); Text(label).font(.caption2) }.frame(maxWidth: .infinity).padding(.vertical, 8)
+        .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+    }.buttonStyle(.plain).disabled(duration == 0)
+  }
+  private func snap(_ s: Double) -> Double { (s * fps).rounded() / fps }
+  @MainActor private func setup() async {
+    let url = URL(string: path, relativeTo: CowboyCloud.origin)!.absoluteURL
+    let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["Cookie": CowboyCloud.shared.credential ?? ""]])
+    do {
+      duration = try await asset.load(.duration).seconds
+      if let track = try await asset.loadTracks(withMediaType: .video).first { let f = Double(try await track.load(.nominalFrameRate)); if f > 1 { fps = f } }
+    } catch { failed = "Não abri o vídeo: \(error.localizedDescription)"; loading = false; return }
+    let g = AVAssetImageGenerator(asset: asset)
+    g.appliesPreferredTrackTransform = true
+    g.requestedTimeToleranceBefore = .zero; g.requestedTimeToleranceAfter = .zero   // quadro EXATO
+    g.maximumSize = CGSize(width: 1080, height: 1080)
+    gen = g
+    seconds = snap(min(max(0, start), duration))
+    render()
+  }
+  private func render() {
+    guard let g = gen else { return }
+    g.cancelAllCGImageGeneration()
+    loading = true
+    let t = CMTime(seconds: seconds, preferredTimescale: 60000)
+    g.generateCGImageAsynchronously(for: t) { cg, _, err in
+      DispatchQueue.main.async {
+        if let cg { image = UIImage(cgImage: cg); failed = nil; loading = false }
+        else if let e = err as NSError?, e.code != NSUserCancelledError, e.code != -11819 { failed = e.localizedDescription; loading = false }
+      }
     }
   }
 }
