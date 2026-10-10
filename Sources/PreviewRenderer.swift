@@ -318,10 +318,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let vx = bp.mx * W, vy = -bp.my * H
     var dx = Double(t.a) * vx + Double(t.c) * vy, dy = Double(t.b) * vx + Double(t.d) * vy
     if mirror { dx = -dx }
-    let c = CGPoint(x: fit.midX, y: fit.midY)
-    var out = Self.blurred(image, zoom: bp.zoom, dx: dx * scale, dy: dy * scale, roll: bp.roll, n: st.0, center: c, fit: fit)
-    if st.1 > 1 { let k = Double(st.0); out = Self.blurred(out, zoom: bp.zoom / k, dx: dx * scale / k, dy: dy * scale / k, roll: bp.roll / k, n: st.1, center: c, fit: fit) }   // 2ª etapa: o passo da 1ª
-    return out
+    // 0.10.5: o rastro na tela é feito em MEIA resolução (só existe com movimento, que já borra) — em resolução cheia, com a
+    // névoa junto, o zoom e o movimento ficavam lentos. O arquivo continua no shader, em resolução cheia.
+    let hs: CGFloat = 0.5
+    let small = image.transformed(by: CGAffineTransform(scaleX: hs, y: hs))
+    let fs = CGRect(x: fit.minX * hs, y: fit.minY * hs, width: fit.width * hs, height: fit.height * hs)
+    let c = CGPoint(x: fs.midX, y: fs.midY), sh = scale * Double(hs)
+    var out = Self.blurred(small, zoom: bp.zoom, dx: dx * sh, dy: dy * sh, roll: bp.roll, n: st.0, center: c, fit: fs)
+    if st.1 > 1 { let k = Double(st.0); out = Self.blurred(out, zoom: bp.zoom / k, dx: dx * sh / k, dy: dy * sh / k, roll: bp.roll / k, n: st.1, center: c, fit: fs) }   // 2ª etapa: o passo da 1ª
+    return out.transformed(by: CGAffineTransform(scaleX: 1 / hs, y: 1 / hs)).cropped(to: fit)
   }
   static func blurred(_ image: CIImage, zoom: Double, dx: Double, dy: Double, roll: Double = 0, n: Int, center c: CGPoint, fit: CGRect) -> CIImage {
     let src = image.clampedToExtent()
@@ -512,6 +517,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if zoomInstant && tapT == nil, let zN = zNow, zN > 0, let z30 = zDisp30, z30 > 0 { screenSpeed = log(zN / z30) * 30 + dzSpeed }
     if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: scale * k * dz, fit: fit, zoomSpeed: screenSpeed) }
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
+    image = LensShading.apply(image, lens: LensID.name(buffer), zoom: (zFrame ?? zNow ?? 1) * k * dz)   // vinheta da ultra (0.10.5)
     if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
@@ -548,6 +554,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY)).cropped(to: fit)
     if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: sc, fit: fit) }
     image = Self.matched(Self.filtered(image, cube: cube, size: size), match).cropped(to: fit)
+    image = LensShading.apply(image, lens: LensID.name(buffer), zoom: (zoomNow?() ?? 1) * max(1, crop))   // vinheta da ultra (0.10.5)
     if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
     image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target)))
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }

@@ -180,6 +180,11 @@ final class LutBaker: @unchecked Sendable {
         float3 rgb = clamp(float3(y + m.x * cr, y - m.y * cb - m.z * cr, y + m.w * cb), 0.0, 1.0);
         float3 o = lut.sample(s, (rgb * (n - 1.0) + 0.5) / n).rgb;
         o = clamp(prm[4].x * pow(max(o, 0.0), float3(prm[3].w)) * prm[3].rgb, 0.0, 1.0);   // igualar câmeras (lente do quadro)
+        if (prm[9].y > 0.0) {   // vinheta da ultra (0.10.5): ganho 2^(k·r⁴/2,4), r = raio (1 = canto) ÷ zoom dentro da lente
+          float2 dd = (uv - 0.5) * 2.0 * size / length(size);
+          float rr = length(dd) / max(1.0, prm[9].z);
+          o = clamp(o * exp2(prm[9].y * rr * rr * rr * rr / 2.4), 0.0, 1.0);
+        }
         if (prm[9].x > 0.0) { float3 bl = mist.sample(s, uv).rgb; o = mix(o, 1.0 - (1.0 - o) * (1.0 - bl), prm[9].x); }   // névoa: blur em modo Tela (screen)
         float Y = dot(o, float3(0.2126, 0.7152, 0.0722));
         yOut.write(float4((64.0 + 876.0 * Y) / 1023.0), p);
@@ -257,7 +262,7 @@ final class LutBaker: @unchecked Sendable {
   // quadro convertido com o mesmo tempo do original; nil = não deu (quem chama grava o original e conta a falha)
   // stages = (n1, n2): n2 > 1 = rastro em duas etapas; old/blend/oldGeo = dissolve da troca de lente parada
   func convert(_ sample: CMSampleBuffer, match: LensCorrection = .identity, geo: SwitchGeometry = .identity, blur: BlurParams = .none, stages: (Int, Int) = (1, 1),
-               old: CVPixelBuffer? = nil, blend: Float = 0, oldGeo: SwitchGeometry = .identity, mist: (sigma: Float, amount: Float)? = nil) -> CMSampleBuffer? {
+               old: CVPixelBuffer? = nil, blend: Float = 0, oldGeo: SwitchGeometry = .identity, mist: (sigma: Float, amount: Float)? = nil, shading: (k: Float, zoom: Float) = (0, 1)) -> CMSampleBuffer? {
     guard let src = CMSampleBufferGetImageBuffer(sample) else { return fail("sem imagem") }
     let fmt = CVPixelBufferGetPixelFormatType(src)
     let ten = Self.tenBit.contains(fmt), eight = Self.eightBit.contains(fmt)
@@ -330,10 +335,10 @@ final class LutBaker: @unchecked Sendable {
       e1.endEncoding()
       // 2ª etapa: o passo da 1ª com n2 leituras, sem geometria (a textura do meio já está no quadro da saída)
       let k = Float(n1)
-      prm = base + [SIMD4<Float>(1, 0, 0, 1), SIMD4(Float(blur.zoom) / k, Float(blur.mx) / k, Float(blur.my) / k, Float(n2)), SIMD4(Float(blur.roll) / k, useBlend, 0, 0), oldV, SIMD4(mistAmt, 0, 0, 0)]
+      prm = base + [SIMD4<Float>(1, 0, 0, 1), SIMD4(Float(blur.zoom) / k, Float(blur.mx) / k, Float(blur.my) / k, Float(n2)), SIMD4(Float(blur.roll) / k, useBlend, 0, 0), oldV, SIMD4(mistAmt, shading.k, shading.zoom, 0)]
       bakeY = t.y; bakeC = t.c
     } else {
-      prm = base + [geoV, SIMD4(Float(blur.zoom), Float(blur.mx), Float(blur.my), Float(n1)), SIMD4(Float(blur.roll), useBlend, 1, 0), oldV, SIMD4(mistAmt, 0, 0, 0)]
+      prm = base + [geoV, SIMD4(Float(blur.zoom), Float(blur.mx), Float(blur.my), Float(n1)), SIMD4(Float(blur.roll), useBlend, 1, 0), oldV, SIMD4(mistAmt, shading.k, shading.zoom, 0)]
     }
     guard let enc = cb.makeComputeCommandEncoder() else { return fail("comando") }
     enc.setComputePipelineState(pipeline)

@@ -18,7 +18,11 @@ enum Mist {
     guard let m = level(id) else { return image }
     let e = image.extent
     guard e.width > 1, e.height > 1, e.width.isFinite, e.height.isFinite else { return image }
-    let blurred = image.clampedToExtent().applyingGaussianBlur(sigma: m.sigma * Double(max(e.width, e.height))).cropped(to: e)
+    // 0.10.5: o gaussiano roda numa cópia de 1/4 (desfoque grande = igual no olho) — em resolução cheia travava o zoom
+    let q: CGFloat = 0.25
+    let small = image.clampedToExtent().transformed(by: CGAffineTransform(scaleX: q, y: q))
+    let blurred = small.applyingGaussianBlur(sigma: m.sigma * Double(max(e.width, e.height)) * Double(q))
+      .transformed(by: CGAffineTransform(scaleX: 1 / q, y: 1 / q)).cropped(to: e)
     let screen = blurred.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: image])
     return image.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: screen, kCIInputTimeKey: m.amount]).cropped(to: e)
   }

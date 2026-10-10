@@ -1455,7 +1455,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     var baked: CMSampleBuffer?
     if let recBaker {
       baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds, lens: pixel.flatMap { LensID.name($0) }) ?? .identity, geo: geoNow,
-        blur: fileBlur ? blur : .none, stages: stages, old: xfOld, blend: xfBlend, oldGeo: xfGeo, mist: recMist)
+        blur: fileBlur ? blur : .none, stages: stages, old: xfOld, blend: xfBlend, oldGeo: xfGeo, mist: recMist,
+        shading: (Float(LensShading.k(lens: pixel.flatMap { LensID.name($0) })), Float(renderer.frameZoom?(pts.seconds) ?? zoomDriver.lastSet?.1 ?? 1)))
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)
