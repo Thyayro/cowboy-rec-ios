@@ -888,7 +888,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private var pinchTarget: Double?
   static let ultraEdge = 0.99   // logo abaixo do 1× (onde a principal entraria)
   // digital só se o arquivo for convertido no iPhone (o shader amplia o quadro); senão a tela mostraria o que o arquivo não tem
-  var maxDigital: Double { bake709 ? 2.0 : 1.0 }
+  // 0.9.3: pinça partindo do 0,5× vai pela ultra até o MÁXIMO da câmera (o mesmo teto da pinça nas outras lentes, até 25×).
+  // O teto fixo 2,0 parava a pinça em 0,99 × 2 ≈ 2× (reclamação do filmmaker 10/10).
+  var maxDigital: Double { bake709 ? max(1, maximumZoom / Self.ultraEdge) : 1.0 }
   // PINÇA (0.9.1): APROXIMANDO = tela "na hora" (amplia o quadro atrasado pelo zoom medido); AFASTANDO = a tela mostra o
   // quadro como ele é (contínuo, igual ao arquivo). Afastar "na hora" só ia até a borda do quadro atrasado e o resto chegava
   // 0,55 s depois — medido nos trechos da 0.9.0: 0,60 -> pausa -> 0,41 = o pulo no arrasto. O modo é escolhido no começo do
@@ -902,7 +904,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if gestureMode == 2 { renderer.tapStart(z: zoomFactorRaw, dz: zoomDriver.digital) } else { renderer.tapEnd() }
     }
     pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3)
-    if ultraLock {
+    // sem conversão no iPhone não há digital: a pinça cruza as lentes (antes parava em 0,99×)
+    if ultraLock && maxDigital > 1 {
       let want = min(display, Self.ultraEdge * maxDigital)
       zoomDriver.setDigital(max(1, want / Self.ultraEdge))
       zoomDriver.follow(CGFloat(min(want, Self.ultraEdge)) * base)
