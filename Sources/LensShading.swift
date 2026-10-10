@@ -5,11 +5,11 @@ import Foundation
 // tela (trechos 08–10/10, zoom de base, cenas variadas): a ultra perde ~0,8–1,5 stop nas pontas COMPRIDAS do sensor (em pé =
 // topo e rodapé), canto ≈ meio da borda (vinheta radial de sensor 4:3 recortado em 16:9); principal e tele ≈ 0 na metade de
 // cima (o escuro de baixo nelas é cena: teclado/mesa). O Apple Log entrega sem a correção que a câmera original aplica.
-// Correção = ganho radial 2^(k·r⁴) (k um pouco ABAIXO do medido: nunca clarear borda demais), r = raio do quadro mostrado
+// Correção = ganho radial 2^(k·r⁴), k = 1,3 (canto +1,3 stop, meio da borda de cima +0,75 = o medido; nunca clarear além), r = raio do quadro mostrado
 // (1 = canto) ÷ zoom dentro da lente (no 0,7× aparece menos borda do sensor). Aplicado na cor de tela (gama), como o
 // ganho linear numa curva ~2,4: m = 2^(k·r⁴/2,4). Mesma conta na tela (Core Image) e no arquivo (shader do LutBaker).
 enum LensShading {
-  static func k(lens: String?) -> Double { lens == "ultra" ? 2.0 : 0 }
+  static func k(lens: String?) -> Double { lens == "ultra" ? 1.3 : 0 }   // 1,3 = o medido no canto (2,0 clareava demais o teto perto das lâmpadas)
   private static let lock = NSLock()
   private static var cache: (key: String, image: CIImage)?
   /// mapa de ganho pequeno (48 colunas), esticado no tamanho da imagem
