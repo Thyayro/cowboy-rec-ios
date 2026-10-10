@@ -180,7 +180,7 @@ final class LutBaker: @unchecked Sendable {
         float3 rgb = clamp(float3(y + m.x * cr, y - m.y * cb - m.z * cr, y + m.w * cb), 0.0, 1.0);
         float3 o = lut.sample(s, (rgb * (n - 1.0) + 0.5) / n).rgb;
         o = clamp(prm[4].x * pow(max(o, 0.0), float3(prm[3].w)) * prm[3].rgb, 0.0, 1.0);   // igualar câmeras (lente do quadro)
-        if (prm[9].x > 0.0) { float3 bl = mist.sample(s, uv).rgb; o = mix(o, min(o, bl), prm[9].x); }   // névoa: blur em Escurecer
+        if (prm[9].x > 0.0) { float3 bl = mist.sample(s, uv).rgb; o = mix(o, 1.0 - (1.0 - o) * (1.0 - bl), prm[9].x); }   // névoa: blur em modo Tela (screen)
         float Y = dot(o, float3(0.2126, 0.7152, 0.0722));
         yOut.write(float4((64.0 + 876.0 * Y) / 1023.0), p);
         sumCb += (o.b - Y) / 1.8556; sumCr += (o.r - Y) / 1.5748;
@@ -297,7 +297,7 @@ final class LutBaker: @unchecked Sendable {
     let tg = MTLSize(width: 16, height: 16, depth: 1), grid = MTLSize(width: cOut.width, height: cOut.height, depth: 1)
     var bakeY = yIn, bakeC = cIn
     var prm: [SIMD4<Float>]
-    // névoa: cópia 1/8 na cor final -> gaussiano horizontal e vertical -> o bake mistura em Escurecer
+    // névoa: cópia 1/8 na cor final -> gaussiano horizontal e vertical -> o bake mistura em modo Tela
     var mistIn: MTLTexture = dummy, mistAmt: Float = 0
     if let mist, mist.amount > 0, let mt = mistTextures(w, h) {
       var pm = base + [geoV, SIMD4<Float>(0, 0, 0, 1), SIMD4<Float>(0, 0, 0, 0), oldV, SIMD4<Float>(0, 0, 0, 0)]

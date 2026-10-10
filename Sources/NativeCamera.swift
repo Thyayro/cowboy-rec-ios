@@ -235,7 +235,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private var writerStall = 0
   func setZoomSpeed(_ v: Int) { zoomSpeed = max(0, min(2, v)); UserDefaults.standard.set(zoomSpeed, forKey: "zoomSpeed"); Diag.step("fx", ["zoom": Self.zoomSpeeds[zoomSpeed].label], send: false) }
   func setMotionBlur(_ on: Bool) { motionBlur = on; UserDefaults.standard.set(on, forKey: "motionBlur"); syncEffects() }
-  // NÉVOA (0.10.3): blur em modo Escurecer, leve/média/pesada, desligada por padrão (Mist.swift)
+  // NÉVOA (0.10.3): blur em modo Tela (screen), leve/média/pesada, desligada por padrão (Mist.swift)
   @Published var mistLevel = Mist.level(UserDefaults.standard.integer(forKey: "mist")) == nil ? 0 : UserDefaults.standard.integer(forKey: "mist")
   private var recMist: (sigma: Float, amount: Float)?
   func setMist(_ l: Int) { mistLevel = Mist.level(l) == nil ? 0 : l; UserDefaults.standard.set(mistLevel, forKey: "mist"); if mistLevel > 0 { UserDefaults.standard.set(mistLevel, forKey: "mistLast") }; syncEffects() }
