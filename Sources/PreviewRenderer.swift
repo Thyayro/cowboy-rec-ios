@@ -71,7 +71,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // ("volta" ao estacionar). A pinça continua "na hora" (amplia o quadro atrasado pelo zoom medido).
   private var tapRef: Double?
   private var tapDZ = 1.0
-  func tapStart(dz: Double) { lock.lock(); tapRef = CACurrentMediaTime(); tapDZ = max(1, dz); lock.unlock() }
+  private var tapZ: Double?
+  // 0.9.1: o zoom do aparelho no instante do toque fica CONGELADO. Os quadros que já estavam a caminho da tela (de antes do
+  // toque) eram ampliados pelo zoom medido na saída rápida — num zoom de milissegundos a medida erra feio (medido nos trechos
+  // da 0.9.0: 5×→1× pôs a tela em 1,52→2,11→1,96× por 0,5 s; 1×→2× e 2×→5× com 2–4%) = o "pulo no clique".
+  func tapStart(z: Double, dz: Double) { lock.lock(); tapRef = CACurrentMediaTime(); tapDZ = max(1, dz); tapZ = z > 0 ? z : nil; lock.unlock() }
   func tapEnd() { lock.lock(); if tapRef != nil { tapRef = nil }; lock.unlock() }
   // troca de lente com o zoom parado (0.9.0): dissolve curto do último quadro da lente velha, sem ampliar/desampliar
   private var prevShown: (image: CIImage, sid: Int)?
@@ -439,7 +443,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let buffer = pending, pts = pendingPTS, sid = pendingSID; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0 + Self.contentLead) }
     let zNewest = newestFast.flatMap { zoomAt($0 + Self.contentLead) }   // conteúdo adiantado ~25 ms em relação ao zoom lido
-    let tapT = tapRef, tapDz = tapDZ, zTap = tapRef.flatMap { zoomAt($0) }, zDisp30 = zoomAt(now - 1.0 / 30)
+    let tapT = tapRef, tapDz = tapDZ, zTap = tapRef == nil ? nil : (tapZ ?? tapRef.flatMap { zoomAt($0) }), zDisp30 = zoomAt(now - 1.0 / 30)
     if shownCrop == 0 { shownCrop = crop } else { let dt = min(0.1, max(0, now - shownCropAt)); shownCrop += (crop - shownCrop) * (1 - exp(-dt / 1.5)) }
     shownCropAt = now
     let fast = fastBuffer, zFast = fastPTS.flatMap { zoomAt($0) }, cropNow = shownCrop
@@ -480,14 +484,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     var kOld = 1.0
     if zoomInstant, let zN0 = zRef, let zFrame, zFrame > 0 { kOld = max(1, min(6, zN0 / zFrame)); if abs(kOld - 1) < 0.004 { kOld = 1 } }
     var k = kOld
-    if zoomInstant, let p = pts, let rr = zoomTrack.ratio(newestOver: p) {
+    // toque/afastar: nada de medida da saída rápida (quadros de antes do toque: zoom congelado ÷ zoom registrado do quadro)
+    if tapT == nil, zoomInstant, let p = pts, let rr = zoomTrack.ratio(newestOver: p) {
       // 0.8.8: o quadro rápido mais novo medido é de ~50 ms atrás — o zoom que ainda andou até agora (pelo zoom pedido, liso
       // e conhecido) entra junto; sem isso a tela POUSAVA curta (~3,6% no 0,5→1 de dia) e completava depois de parar
       var r = rr
       if let zN = zRef, zN > 0, let zH = zNewest, zH > 0 { r *= zN / zH }
       k = max(1, min(6, r)); if abs(k - 1) < 0.0005 { k = 1 }
     }   // zoom REAL medido
-    else if zoomInstant, let zN0 = zRef, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zN0 / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
+    else if tapT == nil, zoomInstant, let zN0 = zRef, let p = pts, let zk = frameZoom?(p), zk > 0 { k = max(1, min(6, zN0 / zk)); if abs(k - 1) < 0.0005 { k = 1 } }
     if tapContent { k = 1; kOld = 1 }
     if let pts { lock.lock(); shownK.append((pts, k, kOld, now)); if shownK.count > 600 { shownK.removeFirst(shownK.count - 600) }; lock.unlock() }
     // scale first: the LUT runs on screen pixels, not on 4K

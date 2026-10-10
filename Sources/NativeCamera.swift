@@ -889,8 +889,18 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   static let ultraEdge = 0.99   // logo abaixo do 1× (onde a principal entraria)
   // digital só se o arquivo for convertido no iPhone (o shader amplia o quadro); senão a tela mostraria o que o arquivo não tem
   var maxDigital: Double { bake709 ? 2.0 : 1.0 }
+  // PINÇA (0.9.1): APROXIMANDO = tela "na hora" (amplia o quadro atrasado pelo zoom medido); AFASTANDO = a tela mostra o
+  // quadro como ele é (contínuo, igual ao arquivo). Afastar "na hora" só ia até a borda do quadro atrasado e o resto chegava
+  // 0,55 s depois — medido nos trechos da 0.9.0: 0,60 -> pausa -> 0,41 = o pulo no arrasto. O modo é escolhido no começo do
+  // gesto e não muda no meio; gesto logo depois de outro "quadro como é" (o atrasado ainda chegando) continua assim.
+  private var gestureMode = 0   // 0 = sem gesto, 1 = na hora, 2 = quadro como é
+  private var contentModeUntil = 0.0
   func followZoom(_ display: Double) {
-    renderer.tapEnd()   // pinça: a tela volta pro zoom "na hora"
+    if gestureMode == 0 {
+      let out = display < zoom * 0.999
+      gestureMode = (out || CACurrentMediaTime() < contentModeUntil) ? 2 : 1
+      if gestureMode == 2 { renderer.tapStart(z: zoomFactorRaw, dz: zoomDriver.digital) } else { renderer.tapEnd() }
+    }
     pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3)
     if ultraLock {
       let want = min(display, Self.ultraEdge * maxDigital)
@@ -921,6 +931,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   func endZoomGesture() {
+    if gestureMode == 2 { contentModeUntil = CACurrentMediaTime() + 0.7 }
+    gestureMode = 0
     holdFocus(0.3); zoomDriver.endFollow()
     // pinça que terminou no 0,5× = "está no 0,5": trava a ultra de novo (a próxima pinça vai pela 0,5)
     if let t = pinchTarget, t <= 0.51, !ultraLock {
@@ -933,7 +945,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if !recording && !calibrating && !selfTestMode.isEmpty { aligner?.startSettle(CACurrentMediaTime(), tag: user ? "pinça \(userPinches)" : selfTestMode) }
   }
   func selectZoom(_ value: Double) {
-    renderer.tapStart(dz: zoomDriver.digital)   // toque: a tela mostra o quadro como ele é (zoom de edição, sem adivinhação)
+    renderer.tapStart(z: zoomFactorRaw, dz: zoomDriver.digital)   // toque: a tela mostra o quadro como ele é (zoom de edição, sem adivinhação)
+    gestureMode = 0
     recenterFocus("zoom")
     let toUltra = value <= 0.51
     ultraLock = toUltra; UserDefaults.standard.set(toUltra, forKey: "ultraLock")
@@ -945,6 +958,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       DispatchQueue.main.async {
         let sp = Self.zoomSpeeds[max(0, min(2, self.zoomSpeed))]
         let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base, seconds: sp.seconds, floor: sp.floor)
+        self.contentModeUntil = CACurrentMediaTime() + dur + 0.7   // pinça logo depois do toque: continua "quadro como é"
         self.zoomDriver.leaveDigital(toRaw: value * Double(self.base), dur: dur)
         self.holdFocus(dur + 0.15)
         let tag = self.selfTestMode
