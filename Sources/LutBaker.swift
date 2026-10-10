@@ -15,6 +15,10 @@ final class LutBaker: @unchecked Sendable {
   private let queue: MTLCommandQueue
   private let pipeline: MTLComputePipelineState
   private let streakPipeline: MTLComputePipelineState
+  private let mistDownPipeline: MTLComputePipelineState
+  private let mistBlurPipeline: MTLComputePipelineState
+  private let dummy: MTLTexture
+  private var mistTex: (a: MTLTexture, b: MTLTexture)?
   private let lut: MTLTexture
   private let lutN: Int
   private var cache: CVMetalTextureCache?
@@ -74,6 +78,55 @@ final class LutBaker: @unchecked Sendable {
     }
     cT.write(float4(accC / float(n), 0.0, 0.0), gid);
   }
+  // cor final de um ponto da fonte (a mesma conta do bake): matriz da fonte -> cubo -> igualar câmeras
+  static float3 finalColor(float yv, float2 cc, constant float4 *prm, texture3d<float, access::sample> lut, sampler s) {
+    float4 a = prm[0]; float4 m = prm[1]; float n = prm[2].x;
+    float cb = (cc.r - a.w) * a.z, cr = (cc.g - a.w) * a.z;
+    float y = (yv - a.y) * a.x;
+    float3 rgb = clamp(float3(y + m.x * cr, y - m.y * cb - m.z * cr, y + m.w * cb), 0.0, 1.0);
+    float3 o = lut.sample(s, (rgb * (n - 1.0) + 0.5) / n).rgb;
+    return clamp(prm[4].x * pow(max(o, 0.0), float3(prm[3].w)) * prm[3].rgb, 0.0, 1.0);
+  }
+  // NÉVOA 1/2: cópia pequena (1/8) da imagem já na cor final, na geometria da saída (média de 4 leituras por ponto)
+  kernel void mistDown(texture2d<float, access::sample> yIn [[texture(0)]],
+                       texture2d<float, access::sample> cIn [[texture(1)]],
+                       texture3d<float, access::sample> lut [[texture(2)]],
+                       texture2d<float, access::write> lo [[texture(3)]],
+                       constant float4 *prm [[buffer(0)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= lo.get_width() || gid.y >= lo.get_height()) return;
+    constexpr sampler s(filter::linear, address::clamp_to_edge, coord::normalized);
+    float4 g = prm[5];
+    float2 lsz = float2(lo.get_width(), lo.get_height());
+    float3 acc = float3(0.0);
+    for (int k = 0; k < 4; k++) {
+      float2 off = float2((k & 1) ? 0.25 : -0.25, (k & 2) ? 0.25 : -0.25);
+      float2 uv = (float2(gid) + 0.5 + off) / lsz;
+      float2 src = (uv - 0.5 - g.yz) / (g.x * g.w) + 0.5;
+      acc += finalColor(yIn.sample(s, src).r, cIn.sample(s, src).rg, prm, lut, s);
+    }
+    lo.write(float4(acc * 0.25, 1.0), gid);
+  }
+  // NÉVOA 2/2: gaussiano separável na cópia pequena (p.xy = direção, p.z = sigma em pontos da cópia)
+  kernel void mistBlur(texture2d<float, access::sample> src [[texture(0)]],
+                       texture2d<float, access::write> dst [[texture(1)]],
+                       constant float4 &p [[buffer(0)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    constexpr sampler s(filter::linear, address::clamp_to_edge, coord::normalized);
+    float2 sz = float2(dst.get_width(), dst.get_height());
+    float2 uv = (float2(gid) + 0.5) / sz;
+    float sigma = max(0.5, p.z);
+    int r = min(24, int(ceil(sigma * 3.0)));
+    float3 acc = float3(0.0);
+    float wsum = 0.0;
+    for (int i = -r; i <= r; i++) {
+      float w = exp(-0.5 * float(i * i) / (sigma * sigma));
+      acc += w * src.sample(s, uv + p.xy * float(i) / sz).rgb;
+      wsum += w;
+    }
+    dst.write(float4(acc / wsum, 1.0), gid);
+  }
   kernel void bake(texture2d<float, access::sample> yIn [[texture(0)]],
                    texture2d<float, access::sample> cIn [[texture(1)]],
                    texture3d<float, access::sample> lut [[texture(2)]],
@@ -81,6 +134,7 @@ final class LutBaker: @unchecked Sendable {
                    texture2d<float, access::write> cOut [[texture(4)]],
                    texture2d<float, access::sample> yOld [[texture(5)]],
                    texture2d<float, access::sample> cOld [[texture(6)]],
+                   texture2d<float, access::sample> mist [[texture(7)]],
                    constant float4 *prm [[buffer(0)]],
                    uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= cOut.get_width() || gid.y >= cOut.get_height()) return;
@@ -126,6 +180,7 @@ final class LutBaker: @unchecked Sendable {
         float3 rgb = clamp(float3(y + m.x * cr, y - m.y * cb - m.z * cr, y + m.w * cb), 0.0, 1.0);
         float3 o = lut.sample(s, (rgb * (n - 1.0) + 0.5) / n).rgb;
         o = clamp(prm[4].x * pow(max(o, 0.0), float3(prm[3].w)) * prm[3].rgb, 0.0, 1.0);   // igualar câmeras (lente do quadro)
+        if (prm[9].x > 0.0) { float3 bl = mist.sample(s, uv).rgb; o = mix(o, min(o, bl), prm[9].x); }   // névoa: blur em Escurecer
         float Y = dot(o, float3(0.2126, 0.7152, 0.0722));
         yOut.write(float4((64.0 + 876.0 * Y) / 1023.0), p);
         sumCb += (o.b - Y) / 1.8556; sumCr += (o.r - Y) / 1.5748;
@@ -139,8 +194,13 @@ final class LutBaker: @unchecked Sendable {
     guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
       let library = try? device.makeLibrary(source: Self.shader, options: nil), let fn = library.makeFunction(name: "bake"),
       let pipeline = try? device.makeComputePipelineState(function: fn), let sf = library.makeFunction(name: "streak"),
-      let streakPipeline = try? device.makeComputePipelineState(function: sf) else { return nil }
+      let streakPipeline = try? device.makeComputePipelineState(function: sf),
+      let md = library.makeFunction(name: "mistDown"), let mistDownPipeline = try? device.makeComputePipelineState(function: md),
+      let mb = library.makeFunction(name: "mistBlur"), let mistBlurPipeline = try? device.makeComputePipelineState(function: mb) else { return nil }
+    let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false); dd.usage = .shaderRead
+    guard let dummy = device.makeTexture(descriptor: dd) else { return nil }
     self.device = device; self.queue = queue; self.pipeline = pipeline; self.streakPipeline = streakPipeline; self.lutN = size
+    self.mistDownPipeline = mistDownPipeline; self.mistBlurPipeline = mistBlurPipeline; self.dummy = dummy
     let d = MTLTextureDescriptor()
     d.textureType = .type3D; d.pixelFormat = .rgba16Float; d.width = size; d.height = size; d.depth = size; d.usage = .shaderRead
     guard let tex = device.makeTexture(descriptor: d) else { return nil }
@@ -158,7 +218,7 @@ final class LutBaker: @unchecked Sendable {
       kCVPixelBufferIOSurfacePropertiesKey as String: [:], kCVPixelBufferMetalCompatibilityKey as String: true]
     var p: CVPixelBufferPool?
     CVPixelBufferPoolCreate(nil, [kCVPixelBufferPoolMinimumBufferCountKey as String: 8] as CFDictionary, attrs as CFDictionary, &p)
-    pool = p; dims = (w, h); format = nil; tmp = nil
+    pool = p; dims = (w, h); format = nil; tmp = nil; mistTex = nil
   }
   // texturas do meio do rastro em duas etapas (só criadas no 1º movimento rápido; mesmo tamanho da saída)
   private func streakTextures(_ w: Int, _ h: Int) -> (y: MTLTexture, c: MTLTexture)? {
@@ -169,6 +229,14 @@ final class LutBaker: @unchecked Sendable {
     dc.usage = [.shaderRead, .shaderWrite]; dc.storageMode = .private
     guard let ty = device.makeTexture(descriptor: dy), let tc = device.makeTexture(descriptor: dc) else { return nil }
     tmp = (ty, tc); return tmp
+  }
+  // cópia pequena da névoa (1/8 do quadro; criada no 1º quadro com névoa)
+  private func mistTextures(_ w: Int, _ h: Int) -> (a: MTLTexture, b: MTLTexture)? {
+    if let mistTex { return mistTex }
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: max(2, w / 8), height: max(2, h / 8), mipmapped: false)
+    d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+    guard let a = device.makeTexture(descriptor: d), let b = device.makeTexture(descriptor: d) else { return nil }
+    mistTex = (a, b); return mistTex
   }
   private func texture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat, write: Bool) -> CVMetalTexture? {
     guard let cache else { return nil }
@@ -189,7 +257,7 @@ final class LutBaker: @unchecked Sendable {
   // quadro convertido com o mesmo tempo do original; nil = não deu (quem chama grava o original e conta a falha)
   // stages = (n1, n2): n2 > 1 = rastro em duas etapas; old/blend/oldGeo = dissolve da troca de lente parada
   func convert(_ sample: CMSampleBuffer, match: LensCorrection = .identity, geo: SwitchGeometry = .identity, blur: BlurParams = .none, stages: (Int, Int) = (1, 1),
-               old: CVPixelBuffer? = nil, blend: Float = 0, oldGeo: SwitchGeometry = .identity) -> CMSampleBuffer? {
+               old: CVPixelBuffer? = nil, blend: Float = 0, oldGeo: SwitchGeometry = .identity, mist: (sigma: Float, amount: Float)? = nil) -> CMSampleBuffer? {
     guard let src = CMSampleBufferGetImageBuffer(sample) else { return fail("sem imagem") }
     let fmt = CVPixelBufferGetPixelFormatType(src)
     let ten = Self.tenBit.contains(fmt), eight = Self.eightBit.contains(fmt)
@@ -229,6 +297,28 @@ final class LutBaker: @unchecked Sendable {
     let tg = MTLSize(width: 16, height: 16, depth: 1), grid = MTLSize(width: cOut.width, height: cOut.height, depth: 1)
     var bakeY = yIn, bakeC = cIn
     var prm: [SIMD4<Float>]
+    // névoa: cópia 1/8 na cor final -> gaussiano horizontal e vertical -> o bake mistura em Escurecer
+    var mistIn: MTLTexture = dummy, mistAmt: Float = 0
+    if let mist, mist.amount > 0, let mt = mistTextures(w, h) {
+      var pm = base + [geoV, SIMD4<Float>(0, 0, 0, 1), SIMD4<Float>(0, 0, 0, 0), oldV, SIMD4<Float>(0, 0, 0, 0)]
+      let lg = MTLSize(width: mt.a.width, height: mt.a.height, depth: 1)
+      if let e0 = cb.makeComputeCommandEncoder() {
+        e0.setComputePipelineState(mistDownPipeline)
+        e0.setTexture(yIn, index: 0); e0.setTexture(cIn, index: 1); e0.setTexture(lut, index: 2); e0.setTexture(mt.a, index: 3)
+        e0.setBytes(&pm, length: MemoryLayout<SIMD4<Float>>.stride * pm.count, index: 0)
+        e0.dispatchThreads(lg, threadsPerThreadgroup: tg); e0.endEncoding()
+        let sigLow = mist.sigma * Float(max(w, h)) / 8
+        for (from, to, dir) in [(mt.a, mt.b, SIMD2<Float>(1, 0)), (mt.b, mt.a, SIMD2<Float>(0, 1))] {
+          guard let eb = cb.makeComputeCommandEncoder() else { break }
+          var pb = SIMD4<Float>(dir.x, dir.y, sigLow, 0)
+          eb.setComputePipelineState(mistBlurPipeline)
+          eb.setTexture(from, index: 0); eb.setTexture(to, index: 1)
+          eb.setBytes(&pb, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+          eb.dispatchThreads(lg, threadsPerThreadgroup: tg); eb.endEncoding()
+        }
+        mistIn = mt.a; mistAmt = max(0, min(1, mist.amount))
+      }
+    }
     if n2 > 1, let t = streakTextures(w, h) {
       // 1ª etapa: caminho inteiro com n1 leituras (com ruído) -> textura do meio, já na geometria da saída
       var p1 = base + [geoV, SIMD4(Float(blur.zoom), Float(blur.mx), Float(blur.my), Float(n1)), SIMD4(Float(blur.roll), 0, 1, 0), oldV]
@@ -240,15 +330,15 @@ final class LutBaker: @unchecked Sendable {
       e1.endEncoding()
       // 2ª etapa: o passo da 1ª com n2 leituras, sem geometria (a textura do meio já está no quadro da saída)
       let k = Float(n1)
-      prm = base + [SIMD4<Float>(1, 0, 0, 1), SIMD4(Float(blur.zoom) / k, Float(blur.mx) / k, Float(blur.my) / k, Float(n2)), SIMD4(Float(blur.roll) / k, useBlend, 0, 0), oldV]
+      prm = base + [SIMD4<Float>(1, 0, 0, 1), SIMD4(Float(blur.zoom) / k, Float(blur.mx) / k, Float(blur.my) / k, Float(n2)), SIMD4(Float(blur.roll) / k, useBlend, 0, 0), oldV, SIMD4(mistAmt, 0, 0, 0)]
       bakeY = t.y; bakeC = t.c
     } else {
-      prm = base + [geoV, SIMD4(Float(blur.zoom), Float(blur.mx), Float(blur.my), Float(n1)), SIMD4(Float(blur.roll), useBlend, 1, 0), oldV]
+      prm = base + [geoV, SIMD4(Float(blur.zoom), Float(blur.mx), Float(blur.my), Float(n1)), SIMD4(Float(blur.roll), useBlend, 1, 0), oldV, SIMD4(mistAmt, 0, 0, 0)]
     }
     guard let enc = cb.makeComputeCommandEncoder() else { return fail("comando") }
     enc.setComputePipelineState(pipeline)
     enc.setTexture(bakeY, index: 0); enc.setTexture(bakeC, index: 1); enc.setTexture(lut, index: 2); enc.setTexture(yOut, index: 3); enc.setTexture(cOut, index: 4)
-    enc.setTexture(yOld, index: 5); enc.setTexture(cOld, index: 6)
+    enc.setTexture(yOld, index: 5); enc.setTexture(cOld, index: 6); enc.setTexture(mistIn, index: 7)
     enc.setBytes(&prm, length: MemoryLayout<SIMD4<Float>>.stride * prm.count, index: 0)
     enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
     enc.endEncoding()

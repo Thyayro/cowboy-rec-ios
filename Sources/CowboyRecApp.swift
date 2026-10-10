@@ -392,6 +392,7 @@ struct RecorderView: View {
       HStack(spacing: 10) {
         Image(systemName: camera.fxRender ? "cloud.fill" : "bolt.fill")
         Image(systemName: "wind").opacity(camera.motionBlur ? 1 : 0.35)
+        if camera.mistLevel > 0 { Image(systemName: Mist.level(camera.mistLevel)?.icon ?? "cloud.fog") }
         Image(systemName: Self.speedIcon(camera.zoomSpeed))
       }
       .font(.system(size: 13, weight: .bold))
@@ -424,6 +425,11 @@ struct RecorderView: View {
           ForEach(MotionBlur.angles, id: \.self) { a in iconPill(Self.blurIcon(a), camera.blurAngle == a, "Desfoque " + Self.blurName(a)) { camera.setBlurAngle(a); flash("Desfoque " + Self.blurName(a)) } }
         }
         Divider().frame(height: 26).padding(.horizontal, 4)
+        iconPill("cloud.fog", camera.mistLevel > 0, "Névoa") { camera.setMist(camera.mistLevel > 0 ? 0 : (UserDefaults.standard.object(forKey: "mistLast") as? Int ?? 1)); flash(camera.mistLevel > 0 ? "Névoa " + (Mist.level(camera.mistLevel)?.label.lowercased() ?? "") : "Névoa desligada") }
+        if camera.mistLevel > 0 {
+          ForEach(Mist.levels, id: \.id) { m in iconPill(m.icon, camera.mistLevel == m.id, "Névoa " + m.label) { camera.setMist(m.id); flash("Névoa " + m.label.lowercased()) } }
+        }
+        Divider().frame(height: 26).padding(.horizontal, 4)
         ForEach(NativeCamera.zoomSpeeds.indices, id: \.self) { i in
           iconPill(Self.speedIcon(i), camera.zoomSpeed == i, "Zoom " + NativeCamera.zoomSpeeds[i].label) { camera.setZoomSpeed(i); flash("Zoom " + NativeCamera.zoomSpeeds[i].label.lowercased()) }
         }
@@ -450,8 +456,9 @@ struct RecorderView: View {
   // ---------------------------------------------------------------- zoom: lentes (rampa contínua) + roda (arrastar) + pinça
   private func clampZoom(_ z: Double) -> Double { max(camera.minimumZoom, min(camera.maximumZoom, z)) }
   private var activePreset: Double? {
-    if camera.ultraLock, let first = camera.zoomPresets.first, first < 0.99 { return first }
-    return camera.zoomPresets.min { abs(log($0 / max(0.01, camera.zoom))) < abs(log($1 / max(0.01, camera.zoom))) }
+    // 0.10.3: como a câmera original — a casa ativa é a MAIOR lente que o zoom já alcançou e mostra o valor atual
+    // (1,4 na casa do 1; 3 na do 2; 6 na do 5). Antes a "trava do 0,5" segurava a casa do 0,5 a pinça inteira.
+    return camera.zoomPresets.last { $0 <= camera.zoom * 1.01 } ?? camera.zoomPresets.first
   }
   private var lensBar: some View {
     HStack(spacing: 6) {

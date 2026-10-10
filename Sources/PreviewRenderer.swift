@@ -63,6 +63,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var lastDZ = 1.0
   // DESFOQUE DE MOVIMENTO (0.8.9, ver MotionBlur): tela com rastro no Live (ou no Render com "ver como render")
   var blurPreview = false
+  var mistLevel = 0   // névoa (0.10.3): 0 = desligada; mesma conta do arquivo (Mist.swift)
   var blurShutter: (() -> Double)?   // obturador sintético agora (s), já sem a exposição real
   var blurFOV = 106.0                // campo horizontal do formato no zoom 1 do aparelho (graus)
   var blurHot = false                // aparelho quente: menos cópias na tela (o arquivo não muda)
@@ -511,6 +512,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if zoomInstant && tapT == nil, let zN = zNow, zN > 0, let z30 = zDisp30, z30 > 0 { screenSpeed = log(zN / z30) * 30 + dzSpeed }
     if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: scale * k * dz, fit: fit, zoomSpeed: screenSpeed) }
     image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
+    if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
     // troca de lente com o zoom parado: dissolve curto do último quadro da lente velha (0.9.0) — no meio do zoom o movimento esconde
@@ -546,6 +548,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY)).cropped(to: fit)
     if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: sc, fit: fit) }
     image = Self.matched(Self.filtered(image, cube: cube, size: size), match).cropped(to: fit)
+    if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
     image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target)))
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true

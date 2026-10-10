@@ -27,10 +27,10 @@ import Foundation
       NativeFormatDescriptor(index:8,width:3840,height:2160,ranges:[NativeFrameRange(min:1,max:60)],hdr:false,stabilized:true,log:false,tenBit:false)]
     assert(NativeCapturePolicy.select(.main,hdr:false,formats:bits)==8)
     assert(NativeCapturePolicy.select(.main,hdr:false,formats:bits,log:true)==7)
-    // color math agrees with the VPS LUT (VER 2): 18% grey in Apple Log -> ~0.53 Rec.709 code (0.10.2: +0,5 stop, como a câmera original)
+    // color math agrees with the VPS LUT (VER 1): 18% grey in Apple Log -> ~0.44 Rec.709 code (natural; o +0,5 stop da 0.10.2 foi reprovado)
     let grey=0.0855047*log2(0.18+0.00964052)+0.69336945
     let out=ColorMath.appleLogTo709(SIMD3(grey,grey,grey))
-    assert(abs(out.x-0.533)<0.01 && abs(out.x-out.z)<0.001,"Apple Log grey -> \(out)")
+    assert(abs(out.x-0.441)<0.01 && abs(out.x-out.z)<0.001,"Apple Log grey -> \(out)")
     assert(ColorMath.cubeFloats(size:5) { $0 }.count==5*5*5*4)
     let identity=ColorMath.cubeFloats(size:3) { $0 }
     assert(identity[4]==0.5 && identity[0]==0,"red varies fastest")

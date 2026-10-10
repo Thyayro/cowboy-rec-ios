@@ -235,11 +235,16 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private var writerStall = 0
   func setZoomSpeed(_ v: Int) { zoomSpeed = max(0, min(2, v)); UserDefaults.standard.set(zoomSpeed, forKey: "zoomSpeed"); Diag.step("fx", ["zoom": Self.zoomSpeeds[zoomSpeed].label], send: false) }
   func setMotionBlur(_ on: Bool) { motionBlur = on; UserDefaults.standard.set(on, forKey: "motionBlur"); syncEffects() }
+  // NÉVOA (0.10.3): blur em modo Escurecer, leve/média/pesada, desligada por padrão (Mist.swift)
+  @Published var mistLevel = Mist.level(UserDefaults.standard.integer(forKey: "mist")) == nil ? 0 : UserDefaults.standard.integer(forKey: "mist")
+  private var recMist: (sigma: Float, amount: Float)?
+  func setMist(_ l: Int) { mistLevel = Mist.level(l) == nil ? 0 : l; UserDefaults.standard.set(mistLevel, forKey: "mist"); if mistLevel > 0 { UserDefaults.standard.set(mistLevel, forKey: "mistLast") }; syncEffects() }
   func setBlurAngle(_ a: Int) { blurAngle = MotionBlur.angles.contains(a) ? a : 720; UserDefaults.standard.set(blurAngle, forKey: "blurAngle"); syncEffects() }
   func setFXRender(_ on: Bool) { fxRender = on; UserDefaults.standard.set(on, forKey: "fxRender"); syncEffects() }
   func setPreviewAsRender(_ on: Bool) { previewAsRender = on; UserDefaults.standard.set(on, forKey: "previewAsRender"); syncEffects() }
   func syncEffects() {
     renderer.blurPreview = motionBlur && (!fxRender || previewAsRender)
+    renderer.mistLevel = mistLevel
     fxAngle = Double(blurAngle)
     Diag.step("fx", ["desfoque": motionBlur ? "\(blurAngle)" : "off", "modo": fxRender ? "render" : "live", "tela": renderer.blurPreview ? "com rastro" : "limpa", "zoom": Self.zoomSpeeds[zoomSpeed].label], send: false)
   }
@@ -1167,6 +1172,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   func record(owner: String, aspect: String, look: LookPreset) {
     let convert = convertRec709, bitrate = Self.bitrates[max(0, min(Self.bitrates.count - 1, bitrateChoice))].bps
     let fxLive = motionBlur && !fxRender, fxRend = motionBlur && fxRender, fxDeg = blurAngle
+    let mistL = Mist.level(mistLevel)
     let horizon: Double? = rotation.map { Double($0.videoRotationAngleForHorizonLevelCapture) }   // lido na thread principal
     queue.async {
       guard self.configured, self.session.isRunning, !self.isRecording, let cam = self.device else { return }
@@ -1180,7 +1186,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           Diag.step("idle-rate", ["qps": fps, "por": "gravar"])
         }
         let source: SourceColor = self.requestedLog ? .appleLog : self.requestedHDR ? .hlg : .sdr
-        let bakeFn = self.bake709 ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
+        var bakeFn = self.bake709 ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
+        if bakeFn == nil && self.bake709 && mistL != nil { bakeFn = { $0 } }   // SDR natural com névoa: o shader passa a cor igual e aplica a névoa
         let incoming = (self.videoOut.videoSettings?[kCVPixelBufferPixelFormatTypeKey as String] as? NSNumber)?.uint32Value ?? CMFormatDescriptionGetMediaSubType(cam.activeFormat.formatDescription)
         if bakeFn != nil && !LutBaker.supports(incoming) { Diag.step("bake-unsupported", ["fmt": incoming]) }
         let baker = LutBaker.supports(incoming) ? bakeFn.flatMap { LutBaker(transform: $0) } : nil
@@ -1225,6 +1232,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         // efeitos (0.8.9): live = já no arquivo; render = a VPS aplica pelo arquivo .fx; live sem conversão no iPhone = só na tela
         meta["efeitos"] = fxRend ? "render" : fxLive ? (baker != nil ? "live" : "live-so-tela") : "off"
         if fxLive || fxRend { meta["desfoque"] = "\(fxDeg)°" }
+        if let mistL { meta["nevoa"] = baker != nil ? mistL.label : mistL.label + " (só na tela: arquivo em Log)" }
+        let mistFile: (sigma: Float, amount: Float)? = baker != nil ? mistL.map { (Float($0.sigma), Float($0.amount)) } : nil
         let lookBody: Any = look.neutral ? NSNull() : ["id": look.id, "p": look.p]
         let body: [String: Any] = ["label": self.name(cam), "mime": "video/mp4", "settings": meta, "stabilization": ["enabled": false], "facing": isFront ? "user" : "environment",
           "convert": (colorProfile != "rec709" && convert) ? "keep" : "none", "aspect": aspect, "look": lookBody, "recorded_at": ISO8601DateFormatter().string(from: Date())]
@@ -1235,7 +1244,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           try JSONEncoder().encode(m).write(to: localFile.appendingPathExtension("capture"), options: .atomic)
           self.dataQueue.async {
             self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
-            self.recBaker = baker
+            self.recBaker = baker; self.recMist = mistFile
             self.fileBlur = fxLive && baker != nil; self.fxLogOn = false; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
             self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = nil; self.elapsedMs = 0
             self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
@@ -1273,7 +1282,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           self.liveWriter = liveW; self.liveUplink = liveW == nil ? nil : uplink; self.liveLastPTS = 0
           if liveW != nil { self.publish { self.onLiveStarted?() } }
           self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
-          self.recBaker = baker
+          self.recBaker = baker; self.recMist = mistFile
           self.fileBlur = fxLive && baker != nil; self.fxLogOn = fxRend; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
           self.writer = writer; self.recCid = cid; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = gyro; self.elapsedMs = 0
           MotionHub.shared.attach(gyro)
@@ -1446,7 +1455,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     var baked: CMSampleBuffer?
     if let recBaker {
       baked = recBaker.convert(sampleBuffer, match: lensMatch?.correction(at: pts.seconds, lens: pixel.flatMap { LensID.name($0) }) ?? .identity, geo: geoNow,
-        blur: fileBlur ? blur : .none, stages: stages, old: xfOld, blend: xfBlend, oldGeo: xfGeo)
+        blur: fileBlur ? blur : .none, stages: stages, old: xfOld, blend: xfBlend, oldGeo: xfGeo, mist: recMist)
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)
