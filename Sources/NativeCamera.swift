@@ -138,6 +138,13 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // gravação (somente dataQueue)
   private var writer: SegmentWriter?
   private var recCid: String?
+  // INSTAGRAM AO VIVO (0.10.0): 2º gravador leve (H.264 720p, 30 qps) com os MESMOS quadros do arquivo (cor, look, desfoque,
+  // dissolve da troca) — só existe com a live armada no módulo Instagram; erro nele nunca mexe na gravação principal
+  private var liveWriter: SegmentWriter?
+  private var liveUplink: IGLiveUplink?
+  private var liveLastPTS = 0.0
+  var onStreamTake: ((String) -> Void)?   // gravação direto na nuvem terminou (cid): "preparar ao parar" do Instagram
+  var onLiveStarted: (() -> Void)?
   private var recOwner: String?
   private var recStart: CMTime?
   private var recAngle: Double = 90
@@ -1243,7 +1250,26 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           guard let self else { return }
           CloudStream.shared.push(cid, data, durationMs: self.elapsedMs)
         }
+        var liveW: SegmentWriter?
+        let uplink = IGLiveUplink.take()
+        if let uplink {
+          let w0 = max(2, profile.width), h0 = max(2, profile.height)
+          let short = max(2, Int((1280.0 * Double(min(w0, h0)) / Double(max(w0, h0)) / 2).rounded()) * 2)
+          let (lw, lh) = w0 >= h0 ? (1280, short) : (short, 1280)
+          let lv: [String: Any] = [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: lw, AVVideoHeightKey: lh, AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
+            AVVideoColorPropertiesKey: [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2, AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2],
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 3_500_000, AVVideoMaxKeyFrameIntervalDurationKey: 1.0, AVVideoExpectedSourceFrameRateKey: 30, AVVideoAllowFrameReorderingKey: false, AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel] as [String: Any]]
+          let la: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128000]
+          do {
+            let w = try SegmentWriter.make(video: lv, audio: la, transform: transform, file: nil)
+            w.onSegment = { uplink.push($0) }
+            liveW = w
+            Diag.step("ig-live-writer", ["w": lw, "h": lh, "bake": baker != nil])
+          } catch { Diag.step("ig-live-writer-fail", ["err": error.localizedDescription]); uplink.close() }
+        }
         self.dataQueue.async {
+          self.liveWriter = liveW; self.liveUplink = liveW == nil ? nil : uplink; self.liveLastPTS = 0
+          if liveW != nil { self.publish { self.onLiveStarted?() } }
           self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
           self.recBaker = baker
           self.fileBlur = fxLive && baker != nil; self.fxLogOn = fxRend; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
@@ -1313,6 +1339,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
       guard let cid = self.recCid else { return }
       self.recCid = nil
+      if let lw = self.liveWriter { let up = self.liveUplink; self.liveWriter = nil; self.liveUplink = nil; lw.finish { _ in up?.close() } }
+      self.publish { self.onStreamTake?(cid) }
       let gyro = self.gyro; self.gyro = nil; MotionHub.shared.attach(nil)
       let duration = self.elapsedMs, dropped = writer.dropped
       if !fx.isEmpty { CloudStream.shared.side(cid, kind: "fx", data: Data(fx.utf8)); Diag.step("fx-file", ["linhas": fxN]) }
@@ -1383,7 +1411,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if output === audioOut {
       meter(sampleBuffer)
       let clean = noise.process(sampleBuffer)   // roda sempre (a estimativa do ruído fica pronta antes de gravar)
-      if !stopping { writer?.appendAudio(clean ?? sampleBuffer) }
+      if !stopping { writer?.appendAudio(clean ?? sampleBuffer); liveWriter?.appendAudio(clean ?? sampleBuffer) }
       return
     }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
@@ -1420,6 +1448,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
     writer.appendVideo(baked ?? sampleBuffer)
+    if let lw = liveWriter, pts.seconds - liveLastPTS >= 1.0 / 30 - 0.004 { liveLastPTS = pts.seconds; lw.appendVideo(baked ?? sampleBuffer) }   // live: 30 qps
     if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds) }
     if fxLogOn, blur.active, let s = recStart { fxBuffer += MotionBlur.line(t: (pts - s).seconds, blur, stages: stages); fxLines += 1 }
     // gravador sem soltar pedaço nenhum (0.9.0): diagnóstico e, se o áudio não entra, fecha a faixa de áudio pro vídeo seguir

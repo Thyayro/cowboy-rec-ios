@@ -48,6 +48,8 @@ struct RecorderView: View {
   @StateObject private var camera = NativeCamera()
   @StateObject private var tools = OverlayState()
   @ObservedObject private var stream = CloudStream.shared
+  @ObservedObject private var ig = IGModule.shared   // módulo Instagram (desligado por padrão)
+  @State private var igOpen = false
   @State private var portal: CowboyPortal?
   @State private var portalControl = CowboyPortalControl()
   @State private var captureWarning = false
@@ -122,6 +124,7 @@ struct RecorderView: View {
       }
       .ignoresSafeArea()
       controls
+      if ig.enabled { IGLiveOverlay(ig: ig).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(.top, 96).padding(.leading, 76) }
       if !camera.selfTest.isEmpty {
         Text(camera.selfTest).font(.system(size: 14, weight: .semibold)).multilineTextAlignment(.center).padding(14)
           .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 12)).padding(.horizontal, 30)
@@ -150,6 +153,7 @@ struct RecorderView: View {
       .preferredColorScheme(.dark)
     }
     .sheet(isPresented: $settings) { settingsSheet }
+    .sheet(isPresented: $igOpen) { InstagramPanel(ig: ig, logWithoutBake: camera.logEnabled && !camera.bake709, recording: camera.recording) }
     .alert("Calibrar o zoom (45 s)", isPresented: $askSelfTest) {
       Button("Calibrar agora") { camera.runZoomCalibration() }
       Button("Depois", role: .cancel) {}
@@ -164,6 +168,8 @@ struct RecorderView: View {
       UIApplication.shared.isIdleTimerDisabled = true
       CloudStream.shared.cookieProvider = { await MainActor.run { CowboyCloud.shared.credential } }
       camera.spaceMeta = { [tools, camera] in tools.meta(zoom: camera.zoom, fov: camera.fieldOfView) }
+      camera.onStreamTake = { cid in Task { @MainActor in IGModule.shared.recordingFinished(cid: cid) } }
+      camera.onLiveStarted = { Task { @MainActor in IGModule.shared.liveStarted() } }
       camera.onSaved = { file, owner in
         do {
           try cloud.enqueue(file, owner: owner)
@@ -242,6 +248,14 @@ struct RecorderView: View {
         Spacer()
         if camera.torchAvailable {
           Button { camera.setTorch(!camera.torchEnabled) } label: { Image(systemName: camera.torchEnabled ? "bolt.fill" : "bolt.slash").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(camera.torchEnabled ? gold : .white.opacity(0.12), in: Circle()).foregroundStyle(camera.torchEnabled ? .black : .white).frame(width: 46, height: 46).contentShape(Rectangle()) }.buttonStyle(.plain).accessibilityLabel("Lanterna")
+        }
+        if ig.enabled {
+          Button { igOpen = true } label: {
+            Image(systemName: "camera.aperture").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34)
+              .background(ig.liveArmed || ig.liveRunning ? rec : ig.autoPost ? gold : .white.opacity(0.12), in: Circle()).foregroundStyle(ig.autoPost && !(ig.liveArmed || ig.liveRunning) ? .black : .white)
+              .overlay(alignment: .topTrailing) { if ig.pendingApproval > 0 { Text("\(ig.pendingApproval)").font(.system(size: 9, weight: .heavy)).padding(3).background(rec, in: Circle()).foregroundStyle(.white).offset(x: 4, y: -4) } }
+              .frame(width: 46, height: 46).contentShape(Rectangle())
+          }.buttonStyle(.plain).disabled(camera.recording).accessibilityLabel("Instagram")
         }
         Button { settings = true } label: { Image(systemName: "slider.horizontal.3").font(.system(size: 15, weight: .semibold)).frame(width: 34, height: 34).background(.white.opacity(0.12), in: Circle()).foregroundStyle(.white).frame(width: 46, height: 46).contentShape(Rectangle()) }.buttonStyle(.plain).disabled(camera.recording).accessibilityLabel("Ajustes")
       }
@@ -535,6 +549,10 @@ struct RecorderView: View {
           Button("Rec completo (web: ao vivo, chroma, galeria)") { settings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { open(.rec) } }.disabled(camera.recording || camera.finishing)
           if let file = camera.recoverableFile { ShareLink("Exportar captura preservada", item: file) }
         }
+        Section {
+          Toggle("Módulo Instagram", isOn: $ig.enabled)
+          Text(ig.enabled ? "Ligado: botão de abertura no topo. Publicar (sempre com aprovação), Editados, Perfil real e Ao vivo nos 2 Instagrams do Cowboy, usando tudo que a câmera grava." : "Desligado: nada do Instagram aparece nem roda.").font(.caption2)
+        } header: { Text("Instagram (teste)") }
         Section("Espaço 3D com posição (ARKit)") {
           Button("Chão 3D / rastreamento 6DoF") {
             settings = false
