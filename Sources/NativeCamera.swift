@@ -894,6 +894,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   }
   private var pinchTarget: Double?
   static let ultraEdge = 0.99   // logo abaixo do 1× (onde a principal entraria)
+  static let pinchDigitalOnUltra = false   // true = regra antiga (pinça do 0,5× fica na ultra com zoom digital)
   // digital só se o arquivo for convertido no iPhone (o shader amplia o quadro); senão a tela mostraria o que o arquivo não tem
   // 0.9.3: pinça partindo do 0,5× vai pela ultra até o MÁXIMO da câmera (o mesmo teto da pinça nas outras lentes, até 25×).
   // O teto fixo 2,0 parava a pinça em 0,99 × 2 ≈ 2× (reclamação do filmmaker 10/10).
@@ -911,8 +912,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       if gestureMode == 2 { renderer.tapStart(z: zoomFactorRaw, dz: zoomDriver.digital) } else { renderer.tapEnd() }
     }
     pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3)
-    // sem conversão no iPhone não há digital: a pinça cruza as lentes (antes parava em 0,99×)
-    if ultraLock && maxDigital > 1 {
+    // 0.10.2: pinça partindo do 0,5× = IGUAL À CÂMERA ORIGINAL — ao entrar na faixa de outra lente o iPhone troca pra ela
+    // (pedido do filmmaker 10/10: "em vez de manter o zoom inteiro na 0,5"). O zoom digital na ultra (0.8.7–0.9.3) fica desligado.
+    if Self.pinchDigitalOnUltra && ultraLock && maxDigital > 1 {
       let want = min(display, Self.ultraEdge * maxDigital)
       zoomDriver.setDigital(max(1, want / Self.ultraEdge))
       zoomDriver.follow(CGFloat(min(want, Self.ultraEdge)) * base)

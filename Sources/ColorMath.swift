@@ -39,14 +39,18 @@ enum ColorMath {
     let e = o.map { min(1, pow(min(1, tone(max(0, $0) * exposure)), 1 / 2.4)) }
     return SIMD3(e[0], e[1], e[2])
   }
+  // 0.10.2: +0,5 stop (0,6 -> 0,85; HLG 2,6 -> 3,7). Com 0,6 o cinza 18% saía em ~44% de código — o filmmaker achou "meio
+  // escuro" ao lado da câmera original, que puxa os meios-tons pra ~52–55%. Agora ~53%; branco 90% em ~88% (a curva segura).
+  // MESMA conta da VPS (server/colorluts.js, EXPOSURE/HLG_EXPOSURE, VER 2).
+  static let logExposure = 0.85, hlgExposure = 3.7
   static func appleLogTo709(_ c: SIMD3<Double>) -> SIMD3<Double> {
-    to709(SIMD3(appleLogDecode(c.x), appleLogDecode(c.y), appleLogDecode(c.z)), exposure: 0.6)
+    to709(SIMD3(appleLogDecode(c.x), appleLogDecode(c.y), appleLogDecode(c.z)), exposure: logExposure)
   }
   static func hlgDecode(_ v: Double) -> Double {
     let a = 0.17883277, b = 0.28466892, c = 0.55991073
     return v <= 0.5 ? v * v / 3 : (exp((v - c) / a) + b) / 12
   }
-  static func hlgTo709(_ c: SIMD3<Double>) -> SIMD3<Double> { to709(SIMD3(hlgDecode(c.x), hlgDecode(c.y), hlgDecode(c.z)), exposure: 2.6) }
+  static func hlgTo709(_ c: SIMD3<Double>) -> SIMD3<Double> { to709(SIMD3(hlgDecode(c.x), hlgDecode(c.y), hlgDecode(c.z)), exposure: hlgExposure) }
 
   static func grade(_ input: SIMD3<Double>, _ p: [String: Double]) -> SIMD3<Double> {
     func v(_ k: String) -> Double { p[k] ?? 0 }
