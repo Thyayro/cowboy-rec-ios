@@ -13,8 +13,8 @@ struct ControlsTopKey: PreferenceKey {
   static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = min(value, nextValue()) }
 }
 struct ToolsFrameKey: PreferenceKey {
-  static var defaultValue: CGRect = .zero
-  static func reduce(value: inout CGRect, nextValue: () -> CGRect) { let n = nextValue(); if n != .zero { value = n } }
+  static var defaultValue: [CGRect] = []
+  static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) { value.append(contentsOf: nextValue()) }
 }
 
 enum CameraTool: String, CaseIterable, Identifiable {
@@ -68,7 +68,7 @@ struct RecorderView: View {
   @State private var askSelfTest = false
   @State private var fxOpen = false
   @State private var controlsTop: CGFloat = .infinity   // topo dos controles de baixo (coordenada da tela)
-  @State private var toolsFrame: CGRect = .zero          // coluna de ferramentas (coordenada da tela)
+  @State private var toolsFrames: [CGRect] = []          // ferramentas e trilho lateral (coordenadas da tela)
   @Environment(\.scenePhase) private var phase
   private var cloud: CowboyCloud { .shared }
   private let gold = Color(red: 1, green: 0.8, blue: 0)
@@ -89,7 +89,7 @@ struct RecorderView: View {
               guard video.contains(p) else { return }
               // perto dos controles (gravar/parar, lentes, pílula, ferramentas) nunca vira foco/luz
               let g = geo.frame(in: .global), pg = CGPoint(x: p.x + g.minX, y: p.y + g.minY)
-              if pg.y > controlsTop - 14 || (toolsFrame != .zero && toolsFrame.insetBy(dx: -14, dy: -14).contains(pg)) { return }
+              if pg.y > controlsTop - 14 || toolsFrames.contains(where: { $0.insetBy(dx: -14, dy: -14).contains(pg) }) { return }
               camera.focusAt(normalized: CGPoint(x: (p.x - video.minX) / video.width, y: (p.y - video.minY) / video.height))
               focusPoint = p; sunStart = nil; holdFocusUI()
             }
@@ -183,10 +183,8 @@ struct RecorderView: View {
       if let owner = cloud.email { camera.recoverSaved(owner: owner); CloudStream.shared.resume(owner: owner); camera.start() } else { open(.account) }
     }
     .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
-      // tela travada em pé: só os ícones giram pra dar leitura (o vídeo usa o horizonte do aparelho)
-      let o = UIDevice.current.orientation
-      let a: Double? = o == .portrait ? 0 : o == .landscapeLeft ? 90 : o == .landscapeRight ? -90 : o == .portraitUpsideDown ? 180 : nil
-      if let a, a != iconAngle { withAnimation(.easeInOut(duration: 0.25)) { iconAngle = a } }
+      // O sistema gira a interface inteira; não aplicar uma segunda rotação nos ícones.
+      updateAngle()
     }
     .onChange(of: phase) { _, value in
       if value == .background { camera.close(); CloudStream.shared.enterBackground(); MotionHub.shared.stop() }
@@ -206,7 +204,43 @@ struct RecorderView: View {
   }
 
   // ---------------------------------------------------------------- controles (respeitam a área segura)
+  private var isLandscape: Bool { interfaceAngle == 0 || interfaceAngle == 180 }
   private var controls: some View {
+    Group {
+      if isLandscape { landscapeControls } else { portraitControls }
+    }
+    .onPreferenceChange(ControlsTopKey.self) { controlsTop = $0 }
+    .onPreferenceChange(ToolsFrameKey.self) { toolsFrames = $0 }
+    .animation(.easeOut(duration: 0.18), value: camera.recording)
+    .animation(.easeOut(duration: 0.18), value: panel)
+    .animation(.easeOut(duration: 0.18), value: fxOpen)
+  }
+  private var landscapeControls: some View {
+    VStack(spacing: 0) {
+      topBar
+      HStack(spacing: 8) {
+        if !camera.recording {
+          ScrollView(.vertical, showsIndicators: false) { toolColumn }
+            .frame(width: 68)
+        }
+        VStack(spacing: 0) {
+          Spacer(minLength: 0)
+          VStack(spacing: 0) {
+            if let panel, !camera.recording { panelView(panel).padding(.bottom, 4) }
+            if fxOpen { fxPanel.padding(.bottom, 4) }
+            fxPill
+            lensBar
+            if (!camera.recording && stream.pendingMB > 1) || (camera.recording && (stream.health == .offline || stream.health == .slow || stream.health == .error)) { uploadLine }
+          }
+          .background(GeometryReader { g in Color.clear.preference(key: ControlsTopKey.self, value: g.frame(in: .global).minY) })
+        }
+        bottomRow.frame(width: 100)
+          .background(GeometryReader { g in Color.clear.preference(key: ToolsFrameKey.self, value: [g.frame(in: .global)]) })
+      }
+      .padding(.horizontal, 8)
+    }
+  }
+  private var portraitControls: some View {
     VStack(spacing: 0) {
       topBar
       HStack(alignment: .top) {
@@ -224,11 +258,6 @@ struct RecorderView: View {
       }
       .background(GeometryReader { g in Color.clear.preference(key: ControlsTopKey.self, value: g.frame(in: .global).minY) })
     }
-    .onPreferenceChange(ControlsTopKey.self) { controlsTop = $0 }
-    .onPreferenceChange(ToolsFrameKey.self) { toolsFrame = $0 }
-    .animation(.easeOut(duration: 0.18), value: camera.recording)
-    .animation(.easeOut(duration: 0.18), value: panel)
-    .animation(.easeOut(duration: 0.18), value: fxOpen)
   }
   private var topBar: some View {
     VStack(spacing: 4) {
@@ -342,7 +371,7 @@ struct RecorderView: View {
       }
     }
     .contentShape(Rectangle()).onTapGesture {}   // vão entre os ícones não vira foco
-    .background(GeometryReader { g in Color.clear.preference(key: ToolsFrameKey.self, value: g.frame(in: .global)) })
+    .background(GeometryReader { g in Color.clear.preference(key: ToolsFrameKey.self, value: [g.frame(in: .global)]) })
   }
   @ViewBuilder private func panelView(_ t: CameraTool) -> some View {
     ScrollView(.horizontal, showsIndicators: false) {
@@ -390,10 +419,10 @@ struct RecorderView: View {
   private var fxPill: some View {
     Button { fxOpen.toggle() } label: {
       HStack(spacing: 10) {
-        Image(systemName: camera.fxRender ? "cloud.fill" : "bolt.fill")
-        Image(systemName: "wind").opacity(camera.motionBlur ? 1 : 0.35)
-        if camera.mistLevel > 0 { Image(systemName: Mist.level(camera.mistLevel)?.icon ?? "cloud.fog") }
-        Image(systemName: Self.speedIcon(camera.zoomSpeed))
+        Image(systemName: camera.fxRender ? "cloud.fill" : "bolt.fill").rotationEffect(.degrees(iconAngle))
+        Image(systemName: "wind").rotationEffect(.degrees(iconAngle)).opacity(camera.motionBlur ? 1 : 0.35)
+        if camera.mistLevel > 0 { Image(systemName: Mist.level(camera.mistLevel)?.icon ?? "cloud.fog").rotationEffect(.degrees(iconAngle)) }
+        Image(systemName: Self.speedIcon(camera.zoomSpeed)).rotationEffect(.degrees(iconAngle))
       }
       .font(.system(size: 13, weight: .bold))
       .padding(.horizontal, 12).padding(.vertical, 7)
@@ -499,7 +528,8 @@ struct RecorderView: View {
   // rodapé SEM fundo: só os três botões sobre a imagem. Área de toque (0.9.2): gravar = 150 pt de largura na faixa inteira,
   // PARAR (gravando) = 220 pt; galeria e câmera = 84 pt; o resto da faixa engole o toque (nunca vira foco/luz)
   private var bottomRow: some View {
-    HStack(spacing: 0) {
+    let layout = isLandscape ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
+    return layout {
       Button { open(.library) } label: {
         Group {
           if let thumb = camera.lastThumb {
@@ -510,7 +540,7 @@ struct RecorderView: View {
               .background(Color.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white)
           }
         }.rotationEffect(.degrees(iconAngle))
-          .frame(width: 84, height: 100).contentShape(Rectangle())
+          .frame(width: 84, height: isLandscape ? 64 : 100).contentShape(Rectangle())
       }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing).accessibilityLabel("Galeria")
       Spacer(minLength: 0)
       Button(action: shutter) {
@@ -519,18 +549,18 @@ struct RecorderView: View {
           RoundedRectangle(cornerRadius: camera.recording ? 7 : 31).fill(rec).frame(width: camera.recording ? 30 : 62, height: camera.recording ? 30 : 62)
           if camera.finishing { ProgressView().tint(.white) }
         }
-        .frame(width: camera.recording ? 220 : 150, height: 100).contentShape(Rectangle())
+        .frame(width: isLandscape ? 100 : camera.recording ? 220 : 150, height: 100).contentShape(Rectangle())
         .animation(.spring(response: 0.25, dampingFraction: 0.8), value: camera.recording)
       }.buttonStyle(.plain).disabled(!camera.ready || camera.finishing).accessibilityLabel(camera.recording ? "Parar gravação" : "Gravar")
       Spacer(minLength: 0)
       Button { camera.flip() } label: {
         Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 20, weight: .semibold)).frame(width: 50, height: 50)
           .background(Color.black.opacity(0.45), in: Circle()).foregroundStyle(.white).rotationEffect(.degrees(iconAngle))
-          .frame(width: 84, height: 100).contentShape(Rectangle())
+          .frame(width: 84, height: isLandscape ? 64 : 100).contentShape(Rectangle())
       }.buttonStyle(.plain).opacity(camera.recording ? 0 : 1).disabled(camera.recording || camera.finishing || !camera.ready).accessibilityLabel("Trocar câmera")
     }
     .padding(.horizontal, 10)
-    .frame(height: 100)
+    .frame(height: isLandscape ? nil : 100)
     .contentShape(Rectangle()).onTapGesture {}   // a faixa inteira nunca vira foco/luz
   }
 
@@ -593,6 +623,7 @@ struct RecorderView: View {
     let o = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.interfaceOrientation ?? .portrait
     let angle: Double = o == .landscapeLeft ? 180 : o == .landscapeRight ? 0 : o == .portraitUpsideDown ? 270 : 90
     if angle != interfaceAngle { interfaceAngle = angle }
+    iconAngle = 0
     camera.setPreviewAngle(angle)
   }
 }
