@@ -116,8 +116,8 @@ final class ZoomDriver: @unchecked Sendable {
     // Atribuir videoZoomFactor por quadro são degraus imediatos; na passagem para
     // 0,5× eles podem reconfigurar o sensor direto no alvo, pulando a regressão real.
     if d.isVirtualDevice,
-       let ultraBoundary = d.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue,
-       Double(from) >= ultraBoundary, Double(to) < ultraBoundary,
+       d.constituentDevices.contains(where: { $0.deviceType == .builtInUltraWideCamera }),
+       from > to,
        abs(to - d.minAvailableVideoZoomFactor) < 0.001 {
       configure(d) {
         d.ramp(toVideoZoomFactor: to, withRate: Float(stops / dur))
