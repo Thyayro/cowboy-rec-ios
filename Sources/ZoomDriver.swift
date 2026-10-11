@@ -112,6 +112,18 @@ final class ZoomDriver: @unchecked Sendable {
     let stops = abs(log2(Double(to / from)))
     guard stops > 0.003 else { return 0 }
     let dur = max(minDur, seconds * (0.7 + 0.3 * min(1, stops / 3.3)))
+    // Descendo para a ultra, deixe o dispositivo virtual preparar e cruzar as lentes.
+    // Atribuir videoZoomFactor por quadro são degraus imediatos; na passagem para
+    // 0,5× eles podem reconfigurar o sensor direto no alvo, pulando a regressão real.
+    if d.isVirtualDevice,
+       let ultraBoundary = d.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue,
+       Double(from) >= ultraBoundary, Double(to) < ultraBoundary,
+       abs(to - d.minAvailableVideoZoomFactor) < 0.001 {
+      configure(d) {
+        d.ramp(toVideoZoomFactor: to, withRate: Float(stops / dur))
+      }
+      return dur
+    }
     configure(d) { if d.isRampingVideoZoom { d.cancelVideoZoomRamp() } }
     lock.lock(); glidePlan = (from, to, dur, nil); let direct = CACurrentMediaTime() - lastTickWall > 0.25; lock.unlock()
     if direct { put(d, to) }   // sem quadros chegando: direto
