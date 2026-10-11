@@ -21,7 +21,6 @@ final class ZoomDriver: @unchecked Sendable {
   private var gestureRef: CGFloat = 0
   // deslizamento do toque (por quadro)
   private var glidePlan: (from: CGFloat, to: CGFloat, dur: Double, t0: Double?)?
-  private var nativeOut: (from: CGFloat, to: CGFloat, dur: Double, t0: Double)?
   // REGISTRO DE CADA VALOR POSTO (hora exata, valor) — o zoom que um quadro carrega é o último valor posto até a hora de
   // captura dele menos a "trava" do aparelho (calibrada; ver ZoomCalibration)
   private var setLog: [(Double, Double)] = []
@@ -56,7 +55,7 @@ final class ZoomDriver: @unchecked Sendable {
     digitalGlide = (dev * digitalNow, toRaw, dev, toRaw, nil, max(0.25, dur))
   }
 
-  func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; glidePlan = nil; nativeOut = nil; setLog = []; digitalTarget = 1; digitalNow = 1; digitalLog = []; digitalGlide = nil; lock.unlock() }
+  func attach(_ d: AVCaptureDevice) { lock.lock(); device = d; target = nil; glidePlan = nil; setLog = []; digitalTarget = 1; digitalNow = 1; digitalLog = []; digitalGlide = nil; lock.unlock() }
   private func clamp(_ d: AVCaptureDevice, _ z: CGFloat) -> CGFloat { max(d.minAvailableVideoZoomFactor, min(d.maxAvailableVideoZoomFactor, z)) }
   private func configure(_ d: AVCaptureDevice, _ body: () -> Void) {
     _ = CowboyObjC.catching { if (try? d.lockForConfiguration()) != nil { body(); d.unlockForConfiguration() } }
@@ -81,7 +80,7 @@ final class ZoomDriver: @unchecked Sendable {
   func follow(_ factor: CGFloat) {
     lock.lock(); glideGen += 1
     guard let d = device else { lock.unlock(); return }
-    glidePlan = nil; nativeOut = nil
+    glidePlan = nil
     var z = clamp(d, factor)
     if let cur = target, gestureRef > 0 {
       let step = log(Double(z / gestureRef))
@@ -107,34 +106,25 @@ final class ZoomDriver: @unchecked Sendable {
   // por dentro, e a chegada em 3 etapas (0.8.8) pegava o zoom no meio do caminho — medido nos trechos da 0.8.9: 0,5→1 levava
   // 1,1 s em vez de 0,3, e o "rápido" ficava MAIS lento que o lento. Aqui cada valor tem hora exata (registro `setLog`).
   @discardableResult func glide(to factor: CGFloat, seconds: Double = 0.32, floor minDur: Double = 0.15) -> Double {
-    lock.lock(); target = nil; glidePlan = nil; nativeOut = nil; gestureDir = 0; gestureRef = 0; glideGen += 1; let d = device; lock.unlock()
+    lock.lock(); target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; glideGen += 1; let d = device; lock.unlock()
     guard let d else { return 0 }
     let to = clamp(d, factor), from = d.videoZoomFactor
     let stops = abs(log2(Double(to / from)))
     guard stops > 0.003 else { return 0 }
     let dur = max(minDur, seconds * (0.7 + 0.3 * min(1, stops / 3.3)))
-    // O IN mantém a curva original por quadro. Só o OUT para a ultra usa
-    // rampa nativa, com velocidade corrigida pelo zoom REAL a cada quadro
-    // para recuperar o atraso da aceleração interna, sem desacelerar o IN.
-    // Atribuir videoZoomFactor por quadro são degraus imediatos; na passagem para
-    // 0,5× eles podem reconfigurar o sensor direto no alvo, pulando a regressão real.
-    if d.isVirtualDevice,
-       d.constituentDevices.contains(where: { $0.deviceType == .builtInUltraWideCamera }),
-       from > to, abs(to - d.minAvailableVideoZoomFactor) < 0.001 {
-      lock.lock(); nativeOut = (from, to, dur, CACurrentMediaTime()); lock.unlock()
-      configure(d) {
-        d.ramp(toVideoZoomFactor: to, withRate: Float(1.5 * stops / dur))
-      }
-      return dur
-    }
+    // IN e OUT usam a MESMA curva por quadro e a MESMA duração do modo.
+    // A rampa nativa do OUT impunha ~0,6 s mesmo com alvo rápido (~0,15 s).
+    // Nenhum recorte da prévia simula o avanço: cada passo vai à câmera real.
     configure(d) { if d.isRampingVideoZoom { d.cancelVideoZoomRamp() } }
     lock.lock(); glidePlan = (from, to, dur, nil); let direct = CACurrentMediaTime() - lastTickWall > 0.25; lock.unlock()
-    if direct { put(d, to) }   // sem quadros chegando: direto
+    // OUT não salta ao alvo se a saída estiver temporariamente sem quadros.
+    // O plano começa no primeiro quadro disponível; o IN conserva seu caminho.
+    if direct && to >= from { put(d, to) }
     return dur
   }
   // degrau direto (calibração)
   func jump(to factor: CGFloat) {
-    lock.lock(); glideGen += 1; target = nil; glidePlan = nil; nativeOut = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
+    lock.lock(); glideGen += 1; target = nil; glidePlan = nil; gestureDir = 0; gestureRef = 0; let d = device; lock.unlock()
     guard let d else { return }
     put(d, clamp(d, factor))
   }
@@ -156,26 +146,6 @@ final class ZoomDriver: @unchecked Sendable {
       dNew = exp(log(digitalNow) + log(digitalTarget / digitalNow) * (1 - exp(-dt / 0.07)))
     } else { dNew = digitalTarget }
     if dNew != digitalNow { digitalNow = dNew; digitalLog.append((t, dNew)); if digitalLog.count > 1200 { digitalLog.removeFirst(digitalLog.count - 1200) } }
-    if let g = nativeOut {
-      let cur = Double(d.videoZoomFactor)
-      if cur <= Double(g.to) * 1.0006 {
-        nativeOut = nil; lock.unlock(); return
-      }
-      // Mesmo relógio e ease-in/out do IN, incluindo o próximo passo de quadro.
-      // Se a câmera atrasou, aumenta a velocidade nativa para alcançar a curva;
-      // nunca atribui o fator final nem amplia/desamplia a imagem da prévia.
-      let k = min(1, max(0, (CACurrentMediaTime() - g.t0 + dt) / g.dur))
-      let e = k * k * (3 - 2 * k)
-      let expected = exp(log(Double(g.from)) + log(Double(g.to / g.from)) * e)
-      let catchUp = max(0, log2(cur / expected)) / dt
-      let remaining = max(dt, g.dur - (CACurrentMediaTime() - g.t0))
-      let rate = max(catchUp, max(0, log2(cur / Double(g.to))) / remaining)
-      lock.unlock()
-      if rate > 0 {
-        configure(d) { d.ramp(toVideoZoomFactor: g.to, withRate: Float(rate)) }
-      }
-      return
-    }
     if var g = glidePlan {
       if g.t0 == nil { g.t0 = t; glidePlan = g }
       let k = min(1, max(0, (t - g.t0!) / max(0.001, g.dur)))
@@ -186,6 +156,11 @@ final class ZoomDriver: @unchecked Sendable {
       if kk >= 1 { glidePlan = nil }
       lock.unlock()
       put(d, clamp(d, z))
+      if kk >= 1 {
+        Diag.step("zoom-frame-sync-v1", ["de": Double(g.from), "para": Double(g.to),
+          "pedido_ms": Int(g.dur * 1000), "decorrido_ms": Int((t - g.t0! + 1.0 / 60) * 1000),
+          "real": Double(d.videoZoomFactor)])
+      }
       return
     }
     guard let tgt = target else { lock.unlock(); return }
