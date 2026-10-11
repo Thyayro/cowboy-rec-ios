@@ -34,6 +34,7 @@ enum Geometry {
 struct CameraOverlay: View {
   let video: CGRect
   let interfaceAngle: Double          // 90 retrato · 0/180 deitado
+  let levelAngle: Double              // orientação física, sem mudar o layout fixo
   @ObservedObject var tools: OverlayState
   @ObservedObject var camera: NativeCamera
   private let gold = Color(red: 1, green: 0.8, blue: 0)
@@ -108,18 +109,17 @@ struct CameraOverlay: View {
   private func drawLevel(_ ctx: GraphicsContext, _ m: MotionHub.Snapshot) {
     let g = m.gravity
     guard abs(g.z) < 0.9 else { return }
-    let th = screenTheta()
-    let sx = g.x * cos(th) - g.y * sin(th), sy = g.x * sin(th) + g.y * cos(th)
-    var tilt = atan2(sx, -sy)
-    while tilt > .pi / 4 { tilt -= .pi / 2 }; while tilt < -.pi / 4 { tilt += .pi / 2 }
+    let reference = levelAngle * .pi / 180
+    var tilt = -atan2(g.x, -g.y) - reference
+    while tilt > .pi / 2 { tilt -= .pi }; while tilt < -.pi / 2 { tilt += .pi }
     let ok = abs(tilt) < .pi / 180
     let c = CGPoint(x: video.midX, y: video.midY), half = min(video.width, video.height) * 0.22
-    let a = ok ? 0 : -tilt
+    let a = reference + (ok ? 0 : tilt)
     var line = Path()
     line.move(to: CGPoint(x: c.x - cos(a) * half, y: c.y - sin(a) * half)); line.addLine(to: CGPoint(x: c.x + cos(a) * half, y: c.y + sin(a) * half))
     var fixed = Path()
-    fixed.move(to: CGPoint(x: c.x - half * 1.35, y: c.y)); fixed.addLine(to: CGPoint(x: c.x - half * 1.1, y: c.y))
-    fixed.move(to: CGPoint(x: c.x + half * 1.1, y: c.y)); fixed.addLine(to: CGPoint(x: c.x + half * 1.35, y: c.y))
+    fixed.move(to: CGPoint(x: c.x - cos(reference) * half * 1.35, y: c.y - sin(reference) * half * 1.35)); fixed.addLine(to: CGPoint(x: c.x - cos(reference) * half * 1.1, y: c.y - sin(reference) * half * 1.1))
+    fixed.move(to: CGPoint(x: c.x + cos(reference) * half * 1.1, y: c.y + sin(reference) * half * 1.1)); fixed.addLine(to: CGPoint(x: c.x + cos(reference) * half * 1.35, y: c.y + sin(reference) * half * 1.35))
     ctx.stroke(fixed, with: .color(.white.opacity(0.7)), lineWidth: 1.5)
     ctx.stroke(line, with: .color(ok ? gold : .white), lineWidth: ok ? 2.2 : 1.5)
   }
