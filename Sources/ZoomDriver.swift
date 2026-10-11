@@ -112,13 +112,15 @@ final class ZoomDriver: @unchecked Sendable {
     let stops = abs(log2(Double(to / from)))
     guard stops > 0.003 else { return 0 }
     let dur = max(minDur, seconds * (0.7 + 0.3 * min(1, stops / 3.3)))
-    // Descendo para a ultra, deixe o dispositivo virtual preparar e cruzar as lentes.
+    // Ida e volta da ultra usam a mesma rampa, duração e velocidade do modo.
+    // Misturar passos por quadro na ida com rampa nativa na volta dava ritmos
+    // diferentes: a rampa nativa acrescenta a aceleração do próprio dispositivo.
     // Atribuir videoZoomFactor por quadro são degraus imediatos; na passagem para
     // 0,5× eles podem reconfigurar o sensor direto no alvo, pulando a regressão real.
     if d.isVirtualDevice,
        d.constituentDevices.contains(where: { $0.deviceType == .builtInUltraWideCamera }),
-       from > to,
-       abs(to - d.minAvailableVideoZoomFactor) < 0.001 {
+       (abs(to - d.minAvailableVideoZoomFactor) < 0.001 ||
+        abs(from - d.minAvailableVideoZoomFactor) < 0.001) {
       configure(d) {
         d.ramp(toVideoZoomFactor: to, withRate: Float(stops / dur))
       }
