@@ -1,3 +1,5 @@
 "NSCameraUsageDescription" = "O Cowboy usa a câmera do iPhone para gravar direto na nuvem.";
 "NSMicrophoneUsageDescription" = "O Cowboy grava o áudio junto do vídeo.";
+"NSPhotoLibraryUsageDescription" = "O Cowboy acessa fotos e vídeos que você escolhe para enviar à sua galeria na VPS.";
+"NSPhotoLibraryAddUsageDescription" = "O Cowboy salva na Fototeca as mídias que você escolher exportar.";
 "CFBundleDisplayName" = "Cowboy Rec";

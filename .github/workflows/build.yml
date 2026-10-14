@@ -21,6 +21,10 @@ jobs:
         run: python3 tools/extract_shader.py /tmp/bake.metal && xcrun -sdk iphoneos metal -c /tmp/bake.metal -o /tmp/bake.air && echo SHADER OK
       - name: Build native camera
         run: xcodebuild -project CowboyRec.xcodeproj -scheme CowboyRec -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Verify photo library permissions in compiled app
+        run: |
+          /usr/libexec/PlistBuddy -c 'Print :NSPhotoLibraryUsageDescription' build/Build/Products/Release-iphoneos/CowboyRec.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :NSPhotoLibraryAddUsageDescription' build/Build/Products/Release-iphoneos/CowboyRec.app/Info.plist
       - name: Package unsigned IPA
         run: |
           mkdir Payload
