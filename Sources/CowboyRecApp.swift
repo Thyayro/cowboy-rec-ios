@@ -141,7 +141,8 @@ struct RecorderView: View {
     }) { destination in
       VStack(spacing: 0) {
         HStack {
-          Text("Cowboy Rec · 0.5").font(.caption.weight(.bold))
+          if let d = portalControl.downloadText { Text(d).font(.caption.weight(.bold)).lineLimit(1).minimumScaleFactor(0.7) }
+          else { Text("Cowboy Rec").font(.caption.weight(.bold)) }
           Spacer()
           Button("Voltar à câmera") {
             Task { if await portalControl.canReturnToCamera() { portal = nil } else { captureWarning = true } }

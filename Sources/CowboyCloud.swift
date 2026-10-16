@@ -3,6 +3,7 @@ import Observation
 import SwiftUI
 import WebKit
 import AVFoundation
+import Photos
 
 final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
   func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
@@ -157,6 +158,8 @@ enum CowboyPortal: String, Identifiable {
 
 @MainActor @Observable final class CowboyPortalControl {
   weak var web: WKWebView?
+  // download em andamento (0.10.7): antes o "Baixar" de 300–400 MB não mostrava nada até acabar = "não tá baixando"
+  var downloadText: String?
   func canReturnToCamera() async -> Bool {
     guard let web else { return true }
     // Do not unload the full Rec while it is capturing or transmitting live.
@@ -168,15 +171,15 @@ enum CowboyPortal: String, Identifiable {
 struct CowboyAccountView: UIViewRepresentable {
   var destination: CowboyPortal = .account
   var control: CowboyPortalControl
-  func makeCoordinator() -> Coordinator { Coordinator(destination: destination) }
+  func makeCoordinator() -> Coordinator { Coordinator(destination: destination, control: control) }
   func makeUIView(context: Context) -> WKWebView {
     let config = WKWebViewConfiguration()
     config.websiteDataStore = .default()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
-    if destination == .library {
-      // Biblioteca = SÓ a galeria da VPS. A página /rec ligava a câmera dela ao abrir e tomava a câmera do app (voltava
-      // travada). Reforço: a página da biblioteca nunca recebe câmera/microfone.
+    if destination != .rec {
+      // Biblioteca e Conta = SÓ a galeria da VPS. A página /rec ligava a câmera dela ao abrir e tomava a câmera do app (voltava
+      // travada; visto de novo em 15/10 23:19 pela CONTA, que levava pro /rec completo). Nunca recebem câmera/microfone.
       let script = "try{if(navigator.mediaDevices){navigator.mediaDevices.getUserMedia=function(){return Promise.reject(Object.assign(new Error('câmera do app'),{name:'NotAllowedError'}))}}}catch(e){}"
       config.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
     }
@@ -194,13 +197,15 @@ struct CowboyAccountView: UIViewRepresentable {
   func updateUIView(_ uiView: WKWebView, context: Context) {}
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
     let destination: CowboyPortal
+    let control: CowboyPortalControl
     private var downloads: [ObjectIdentifier: URL] = [:]
-    init(destination: CowboyPortal) { self.destination=destination }
+    private var watchers: [ObjectIdentifier: NSKeyValueObservation] = [:]
+    init(destination: CowboyPortal, control: CowboyPortalControl) { self.destination=destination; self.control=control }
     @MainActor func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
       Task { await CowboyCloud.shared.refresh() }
       if destination == .account, webView.url?.path != "/login" {
         // Login is shared with uploads; the same account sees its VPS recordings.
-        if webView.url?.path != "/rec" { webView.load(URLRequest(url: CowboyCloud.origin.appendingPathComponent("rec"))) }
+        if webView.url?.path != "/rec" { webView.load(URLRequest(url: URL(string: "rec?galeria=1", relativeTo: CowboyCloud.origin)!.absoluteURL)) }
       }
     }
     @MainActor func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
@@ -212,8 +217,18 @@ struct CowboyAccountView: UIViewRepresentable {
       let attachment = (navigationResponse.response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition")?.lowercased().contains("attachment") == true
       decisionHandler(attachment || !navigationResponse.canShowMIMEType ? .download : .allow)
     }
-    @MainActor func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) { download.delegate=self }
-    @MainActor func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) { download.delegate=self }
+    @MainActor func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) { watch(download) }
+    @MainActor func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) { watch(download) }
+    @MainActor private func watch(_ download: WKDownload) {
+      download.delegate=self
+      control.downloadText = "Baixando…"
+      let control = self.control
+      watchers[ObjectIdentifier(download)] = download.progress.observe(\.completedUnitCount, options: [.new]) { p, _ in
+        let done = Double(p.completedUnitCount) / 1_048_576, total = Double(p.totalUnitCount) / 1_048_576
+        let text = p.totalUnitCount > 0 ? String(format: "Baixando %.0f%% · %.0f de %.0f MB", done / total * 100, done, total) : String(format: "Baixando %.0f MB", done)
+        DispatchQueue.main.async { if control.downloadText?.hasPrefix("Baixando") ?? true { control.downloadText = text } }
+      }
+    }
     @MainActor func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
       let directory=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
       do {
@@ -223,7 +238,29 @@ struct CowboyAccountView: UIViewRepresentable {
       } catch { completionHandler(nil) }
     }
     @MainActor func downloadDidFinish(_ download: WKDownload) {
-      guard let file=downloads.removeValue(forKey: ObjectIdentifier(download)),
+      watchers.removeValue(forKey: ObjectIdentifier(download))?.invalidate()
+      guard let file=downloads.removeValue(forKey: ObjectIdentifier(download)) else { control.downloadText = nil; return }
+      // vídeo/foto vai DIRETO pra Fototeca (como o "Salvar" da câmera); sem permissão ou outro tipo = folha de compartilhar
+      let ext = file.pathExtension.lowercased(), video = ["mp4", "mov", "m4v"].contains(ext), photo = ["jpg", "jpeg", "png", "heic"].contains(ext)
+      guard video || photo else { share(file); return }
+      control.downloadText = "Salvando na Fototeca…"
+      let control = self.control
+      PHPhotoLibrary.requestAuthorization(for: .addOnly) { st in
+        guard st == .authorized || st == .limited else { DispatchQueue.main.async { control.downloadText = nil; self.share(file) }; return }
+        PHPhotoLibrary.shared().performChanges({
+          let opt = PHAssetResourceCreationOptions(); opt.shouldMoveFile = true
+          PHAssetCreationRequest.forAsset().addResource(with: video ? .video : .photo, fileURL: file, options: opt)
+        }) { ok, error in
+          DispatchQueue.main.async {
+            if ok { control.downloadText = "Salvo na Fototeca ✓"; DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if control.downloadText == "Salvo na Fototeca ✓" { control.downloadText = nil } } }
+            else { control.downloadText = nil; Diag.step("download-photos-fail", ["erro": error?.localizedDescription ?? "?"]); self.share(file) }
+          }
+        }
+      }
+    }
+    @MainActor private func share(_ file: URL) {
+      control.downloadText = nil
+      guard
         let scene=UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
         var controller=scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else { return }
       while let presented=controller.presentedViewController { controller=presented }
@@ -231,6 +268,9 @@ struct CowboyAccountView: UIViewRepresentable {
     }
     @MainActor func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
       downloads.removeValue(forKey: ObjectIdentifier(download))
+      watchers.removeValue(forKey: ObjectIdentifier(download))?.invalidate()
+      control.downloadText = "Download interrompido — toque em Baixar de novo"
+      Diag.step("download-fail", ["erro": error.localizedDescription])
       CowboyCloud.shared.status="Download interrompido: \(error.localizedDescription)"
     }
     @MainActor func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {

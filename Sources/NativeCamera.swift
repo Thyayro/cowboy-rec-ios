@@ -853,20 +853,19 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = cam.focusPointOfInterest }
     cam.focusMode = .continuousAutoFocus
   }
-  // LENTE NOVA CHEGA EM FOCO (0.8.9): medido nos trechos da 0.8.6–0.8.8, a principal ficava ~0,8 s PARADA (L0,922) depois
-  // da troca vinda do 0,5× e só então procurava = "sai focado do 0,5 e chega desfocado". Na troca: UM foco na hora
-  // (one-shot — o foco por fase da lente nova acha em ~0,1–0,3 s) e, assentou, contínuo de novo, sem mexer no ponto. Não é
-  // o "reafirmar o contínuo" da 0.8.4 (que reiniciava a busca 0,4–0,7 s DEPOIS, com a lente já focada): aqui a busca é já.
+  // LENTE NOVA (0.10.7): o foco da passagem é 100% do iPhone — NENHUM comando (volta à regra da 0.8.4). O one-shot da 0.8.9
+  // na troca, MEDIDO no uso real de 15/10 (0.10.5): deixava o foco em `.autoFocus`/travado ~1,2 s depois de cada troca
+  // (marcas U/T no diag), 2 de 9 trocas "achou false", e ultra→principal levou a lente de foco de 0,855 pro INFINITO (1,000)
+  // com a nitidez caindo 1282→736 e ficando lá = "foco bugado / mudança repentina de foco". Aqui só MEDE (diag), sem mexer.
+  // `forced` = o one-shot do TOQUE (focusAt), o único que devolve o contínuo no fim.
   private var lastPrimary: AVCaptureDevice.DeviceType?
-  private var lensFocus: (gen: Int, t0: Double, l0: Float, moved: Bool, from: String, to: String)?
+  private var lensFocus: (gen: Int, t0: Double, l0: Float, moved: Bool, from: String, to: String, forced: Bool)?
   private func focusNewLens(_ cam: AVCaptureDevice) {
     let type = cam.activePrimaryConstituent?.deviceType
     let before = lastPrimary; lastPrimary = type
-    guard let before, let type, before != type, cam.position == .back, !manualFocus,
-      cam.isFocusModeSupported(.autoFocus), cam.isFocusModeSupported(.continuousAutoFocus) else { return }
-    focusGen += 1
-    lensFocus = (focusGen, CACurrentMediaTime(), cam.lensPosition, false, LensMatch.name(before), LensMatch.name(type))
-    _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .autoFocus; cam.unlockForConfiguration() } }
+    guard let before, let type, before != type, cam.position == .back, !manualFocus else { return }
+    if let w = lensFocus, w.forced { return }   // foco do toque em andamento: ele termina e devolve o contínuo
+    lensFocus = (focusGen, CACurrentMediaTime(), cam.lensPosition, false, LensMatch.name(before), LensMatch.name(type), false)
     queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }
   }
   private func lensFocusTick() {
@@ -876,8 +875,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let el = CACurrentMediaTime() - w.t0
     guard (w.moved && !cam.isAdjustingFocus) || el > 1.2 else { queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }; return }
     lensFocus = nil
-    if !manualFocus { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .continuousAutoFocus; cam.unlockForConfiguration() } } }
-    Diag.step("focus-new-lens", ["de": w.from, "para": w.to, "ms": Int(el * 1000), "L": String(format: "%.3f>%.3f", w.l0, cam.lensPosition), "achou": w.moved])
+    if w.forced && !manualFocus { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .continuousAutoFocus; cam.unlockForConfiguration() } } }
+    Diag.step(w.forced ? "focus-tap-done" : "focus-new-lens", ["de": w.from, "para": w.to, "ms": Int(el * 1000), "L": String(format: "%.3f>%.3f", w.l0, cam.lensPosition), "achou": w.moved, "modo": w.forced ? "toque" : "iphone"])
   }
   static func thermalName() -> String {
     switch ProcessInfo.processInfo.thermalState { case .nominal: return "normal"; case .fair: return "morno"; case .serious: return "quente"; case .critical: return "crítico"; @unknown default: return "?" }
@@ -1118,7 +1117,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         // assentou, contínuo no MESMO ponto (segue o assunto) até a cena mudar ou um zoom
         self.focusGen += 1; self.focusHeld = false
         cam.focusMode = .autoFocus
-        self.lensFocus = (self.focusGen, CACurrentMediaTime(), cam.lensPosition, false, "toque", "ponto")
+        self.lensFocus = (self.focusGen, CACurrentMediaTime(), cam.lensPosition, false, "toque", "ponto", true)
         self.queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }
         self.publish { self.manualFocus = false }
       }
