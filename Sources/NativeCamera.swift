@@ -211,7 +211,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var rawLog = false
   @Published var droppedFrames = 0
   @Published var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
-  @Published var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant") as? Bool ?? true
+  @Published var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant2") as? Bool ?? false   // 0.10.8: padrão = quadro como é (ver PreviewRenderer)
   // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
   @Published var bake709 = UserDefaults.standard.object(forKey: "bake709") as? Bool ?? true { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
   @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
@@ -532,7 +532,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       cam.videoZoomFactor = max(cam.minAvailableVideoZoomFactor, min(CGFloat(relative) * nativeBase, cam.maxAvailableVideoZoomFactor))
       if relative <= 0.51 { publish { self.ultraLock = true; UserDefaults.standard.set(true, forKey: "ultraLock") } }
       if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
-      if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = false }   // modo suave demorava >2 s pra achar o foco
+      // FOCO SUAVE (0.10.8): uso real 16/10 (0.10.7) "parado numa cena desfoca sozinho e volta DE UMA VEZ" = o contínuo rápido
+      // caçando. A Apple recomenda o suave pra filmagem (a lente anda devagar, sem o "estalo" de volta). Os >2 s da 0.8.1 eram com a
+      // troca `.restricted` forçando a principal perto demais; com `.auto` o iOS já escolhe a lente que foca. Na troca de lente e
+      // no toque o suave sai por ~1,2 s (achar rápido) e volta (`smoothFocus`).
+      if cam.isSmoothAutoFocusSupported { cam.isSmoothAutoFocusEnabled = true }
       if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
       if cam.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { cam.whiteBalanceMode = .continuousAutoWhiteBalance }
       guard let connection = videoOut.connection(with: .video) else { throw failure("Saída de vídeo indisponível") }
@@ -635,6 +639,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           match.lensChanged(LensMatch.name(cam.activePrimaryConstituent?.deviceType))
           self?.queue.async {
             self?.applyLensLock(cam)
+            self?.lastFocusCause = CACurrentMediaTime()
             self?.focusNewLens(cam)
             // lente física nova: o foco fica com o iPhone (0.8.4). Reafirmar o contínuo aqui fazia a lente de foco dar um
             // passinho 0,4–0,7 s depois de cada troca (medido: 0,227→0,216, 0,518→0,502…) = o "foco ajustando entre as lentes"
@@ -644,6 +649,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let st0 = match.status()
       zoomDriver.attach(cam)
       // diagnóstico: posição da lente de foco e se o AF está andando, junto da nitidez depois de cada troca de lente
+      watchFocusHunt(cam)
       renderer.focusProbe = { [weak cam] in
         guard let c = cam else { return "" }
         return String(format: "L%.3fI%.0fE%.0f", c.lensPosition, c.iso, CMTimeGetSeconds(c.exposureDuration) * 10000) + (c.isAdjustingFocus ? "A" : "") + (c.isAdjustingExposure ? "X" : "") + (c.focusMode == .continuousAutoFocus ? "" : c.focusMode == .locked ? "T" : "U")
@@ -755,7 +761,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       } else { self.configureStabilization() }
     }
   }
-  func setZoomInstant(_ value: Bool) { UserDefaults.standard.set(value, forKey: "zoomInstant"); renderer.zoomInstant = value; publish { self.zoomInstant = value } }
+  func setZoomInstant(_ value: Bool) { UserDefaults.standard.set(value, forKey: "zoomInstant2"); renderer.zoomInstant = value; publish { self.zoomInstant = value } }
   func setLightPreview(_ value: Bool) { UserDefaults.standard.set(value, forKey: "lightPreview"); renderer.lightPreview = value; publish { self.lightPreview = value } }
   func setBitrate(_ value: Int) { UserDefaults.standard.set(value, forKey: "bitrate"); publish { self.bitrateChoice = value } }
   // interface girou (retrato/deitado): a prévia acompanha; o arquivo usa o ângulo do horizonte travado ao começar
@@ -865,6 +871,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let before = lastPrimary; lastPrimary = type
     guard let before, let type, before != type, cam.position == .back, !manualFocus else { return }
     if let w = lensFocus, w.forced { return }   // foco do toque em andamento: ele termina e devolve o contínuo
+    smoothFocus(cam, false, back: 1.2)   // lente nova acha o foco no ritmo normal; depois volta o suave (sem mexer em modo/ponto)
     lensFocus = (focusGen, CACurrentMediaTime(), cam.lensPosition, false, LensMatch.name(before), LensMatch.name(type), false)
     queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }
   }
@@ -875,8 +882,37 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let el = CACurrentMediaTime() - w.t0
     guard (w.moved && !cam.isAdjustingFocus) || el > 1.2 else { queue.asyncAfter(deadline: .now() + 0.04) { self.lensFocusTick() }; return }
     lensFocus = nil
-    if w.forced && !manualFocus { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .continuousAutoFocus; cam.unlockForConfiguration() } } }
+    if w.forced && !manualFocus { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.focusMode = .continuousAutoFocus; cam.unlockForConfiguration() } }; smoothFocus(cam, true) }
     Diag.step(w.forced ? "focus-tap-done" : "focus-new-lens", ["de": w.from, "para": w.to, "ms": Int(el * 1000), "L": String(format: "%.3f>%.3f", w.l0, cam.lensPosition), "achou": w.moved, "modo": w.forced ? "toque" : "iphone"])
+  }
+  // liga/desliga o foco suave (só a velocidade da lente; não troca modo nem ponto). back = volta pro suave depois de N s
+  private var smoothGen = 0
+  private func smoothFocus(_ cam: AVCaptureDevice, _ on: Bool, back: Double? = nil) {
+    guard cam.isSmoothAutoFocusSupported else { return }
+    smoothGen += 1; let gen = smoothGen
+    if cam.isSmoothAutoFocusEnabled != on { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.isSmoothAutoFocusEnabled = on; cam.unlockForConfiguration() } } }
+    if let back { queue.asyncAfter(deadline: .now() + back) { [weak self, weak cam] in guard let self, let cam, gen == self.smoothGen else { return }; self.smoothFocus(cam, true) } }
+  }
+  // FOCO CAÇANDO SOZINHO (diag 0.10.8): o AF começou a andar sem toque/zoom/troca nos últimos 2 s = a "desfocada sozinha".
+  // Mede quanto a lente andou e quanto tempo levou; no máximo 20 por abertura.
+  private var focusAdjustObservation: NSKeyValueObservation?
+  private var huntStart: (t: Double, l: Float)?
+  private var huntCount = 0
+  var lastFocusCause = 0.0   // toque/zoom/troca de lente (hora)
+  private func watchFocusHunt(_ cam: AVCaptureDevice) {
+    focusAdjustObservation?.invalidate(); huntCount = 0
+    focusAdjustObservation = cam.observe(\.isAdjustingFocus, options: [.new]) { [weak self] cam, _ in
+      guard let self else { return }
+      let now = CACurrentMediaTime(), adj = cam.isAdjustingFocus, l = cam.lensPosition
+      self.queue.async {
+        if adj { self.huntStart = (now, l); return }
+        guard let h = self.huntStart else { return }; self.huntStart = nil
+        guard now - self.lastFocusCause > 2, self.huntCount < 20, !cam.isRampingVideoZoom else { return }
+        self.huntCount += 1
+        Diag.step("focus-hunt", ["lente": LensMatch.name(cam.activePrimaryConstituent?.deviceType ?? cam.deviceType), "ms": Int((now - h.t) * 1000),
+          "L": String(format: "%.3f>%.3f", h.l, l), "suave": cam.isSmoothAutoFocusEnabled, "zoom": String(format: "%.2f", Double(cam.videoZoomFactor)), "n": self.huntCount])
+      }
+    }
   }
   static func thermalName() -> String {
     switch ProcessInfo.processInfo.thermalState { case .nominal: return "normal"; case .fair: return "morno"; case .serious: return "quente"; case .critical: return "crítico"; @unknown default: return "?" }
@@ -915,7 +951,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       gestureMode = (out || CACurrentMediaTime() < contentModeUntil) ? 2 : 1
       if gestureMode == 2 { renderer.tapStart(z: zoomFactorRaw, dz: zoomDriver.digital) } else { renderer.tapEnd() }
     }
-    pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3)
+    pinchTarget = display; recenterFocus("zoom"); holdFocus(0.3); lastFocusCause = CACurrentMediaTime()
     // 0.10.2: pinça partindo do 0,5× = IGUAL À CÂMERA ORIGINAL — ao entrar na faixa de outra lente o iPhone troca pra ela
     // (pedido do filmmaker 10/10: "em vez de manter o zoom inteiro na 0,5"). O zoom digital na ultra (0.8.7–0.9.3) fica desligado.
     if Self.pinchDigitalOnUltra && ultraLock && maxDigital > 1 {
@@ -1108,8 +1144,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
     }
     Diag.step("focus-tap", ["toque": String(format: "%.3f,%.3f", p0.x, p0.y), "sensor": String(format: "%.3f,%.3f", point.x, point.y), "corte": String(format: "%.3f", c)])
+    lastFocusCause = CACurrentMediaTime()
     control { cam in
       self.focusGen += 1; self.focusHeld = false
+      self.smoothFocus(cam, false, back: 3)   // toque acha rápido como no iPhone; o suave volta quando assentar (lensFocusTick)
       // contínuo NO PONTO (segue o assunto se ele chegar perto/longe), até a cena mudar ou um zoom
       if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.autoFocus) {
         cam.focusPointOfInterest = point

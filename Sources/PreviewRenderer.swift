@@ -42,7 +42,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // "na hora" sobre o quadro atrasado: o conteúdo chega ~25 ms ADIANTADO em relação ao zoom lido na tela (variando 0–35 ms
   // de gesto pra gesto com a Extrema), e a ampliação passava do ponto 7–12%. Com o adiantamento medido: ~3,5% em média.
   // zoomInstant = false: a tela mostra exatamente o arquivo (sem ampliação) — liso, mas o zoom aparece ~0,5 s depois.
-  var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant") as? Bool ?? true
+  // 0.10.8: padrão DESLIGADO também na PINÇA. Medido nos trechos de 16/10 (0.10.7, pinça aproximando): ao soltar a tela estava
+  // +3,3% / −3,5% fora do enquadramento final, oscilou 3,8% e 7% e terminou com degrau de 2,7% num quadro — a ampliação adivinha
+  // o zoom de um quadro que a Extrema ainda vai entregar. O conteúdo (k = 1, = arquivo) para liso. Quem quiser, liga em Ajustes.
+  var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant2") as? Bool ?? false
   static let contentLead = 0.025
   let zoomTrack = FastZoomTracker()   // zoom real de cada instante, medido na saída rápida (0.7.9)
   // TROCA DE LENTE SEM PULO (0.8.0, ver LensSwitchHider): sensor de cada quadro nas duas saídas; a rápida mede a troca e
@@ -529,7 +532,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if a >= 1 || a < 0 { xfade = nil } else { image = x.image.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: image, kCIInputTimeKey: a * a * (3 - 2 * a)]) }
     }
     prevShown = (fresh, sid)
-    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "") }
+    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "", focus: focusProbe?() ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)
