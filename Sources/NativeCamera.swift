@@ -887,10 +887,14 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   }
   // liga/desliga o foco suave (só a velocidade da lente; não troca modo nem ponto). back = volta pro suave depois de N s
   private var smoothGen = 0
-  private func smoothFocus(_ cam: AVCaptureDevice, _ on: Bool, back: Double? = nil) {
+  // locked = quem chama JÁ segurou lockForConfiguration (control/toque): seta direto, sem pedir a trava de novo (0.10.10)
+  private func smoothFocus(_ cam: AVCaptureDevice, _ on: Bool, back: Double? = nil, locked: Bool = false) {
     guard cam.isSmoothAutoFocusSupported else { return }
     smoothGen += 1; let gen = smoothGen
-    if cam.isSmoothAutoFocusEnabled != on { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.isSmoothAutoFocusEnabled = on; cam.unlockForConfiguration() } } }
+    if cam.isSmoothAutoFocusEnabled != on {
+      if locked { _ = CowboyObjC.catching { cam.isSmoothAutoFocusEnabled = on } }
+      else { _ = CowboyObjC.catching { if (try? cam.lockForConfiguration()) != nil { cam.isSmoothAutoFocusEnabled = on; cam.unlockForConfiguration() } } }
+    }
     if let back { queue.asyncAfter(deadline: .now() + back) { [weak self, weak cam] in guard let self, let cam, gen == self.smoothGen else { return }; self.smoothFocus(cam, true) } }
   }
   // FOCO CAÇANDO SOZINHO (diag 0.10.8): o AF começou a andar sem toque/zoom/troca nos últimos 2 s = a "desfocada sozinha".
@@ -1147,7 +1151,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     lastFocusCause = CACurrentMediaTime()
     control { cam in
       self.focusGen += 1; self.focusHeld = false
-      self.smoothFocus(cam, false, back: 3)   // toque acha rápido como no iPhone; o suave volta quando assentar (lensFocusTick)
+      self.smoothFocus(cam, false, back: 3, locked: true)   // toque acha rápido como no iPhone; o suave volta quando assentar (lensFocusTick)
       // contínuo NO PONTO (segue o assunto se ele chegar perto/longe), até a cena mudar ou um zoom
       if cam.isFocusPointOfInterestSupported && cam.isFocusModeSupported(.autoFocus) {
         cam.focusPointOfInterest = point
