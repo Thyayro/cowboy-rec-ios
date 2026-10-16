@@ -44,16 +44,26 @@ struct LensCorrection: Codable, Equatable {
     return LensCorrection(gain: gain, gamma: gamma, scale: scale, samples: 1)
   }
 }
-struct FrameStats { let mean: SIMD3<Float>; let p25: Float; let p75: Float }
+struct FrameStats {
+  let mean: SIMD3<Float>; let p25: Float; let p75: Float
+  // a + (b − a)·w (w=0 → a, w=1 → b)
+  static func lerp(_ a: FrameStats, _ b: FrameStats, _ w: Float) -> FrameStats {
+    FrameStats(mean: a.mean + (b.mean - a.mean) * w, p25: a.p25 + (b.p25 - a.p25) * w, p75: a.p75 + (b.p75 - a.p75) * w)
+  }
+}
 
 final class LensMatch: @unchecked Sendable {
   static let reference = "wide"
-  static let fade = 1.2
+  // 0.10.8: 1,2 s soltando às cegas → 0,7 s SEGUINDO a lente nova (ver correction). Medido 16/10: a principal entrava igual à
+  // ultra e clareava 115→150 durante +1 s DEPOIS do dissolve (ISO ainda convergindo) = a "terceira mudança" da troca.
+  static let fade = 0.7
   private let lock = NSLock()
   private var history: [(Double, String)] = []
   private var table: [String: LensCorrection] = [:]
   private var last: (lens: String, t: Double, s: FrameStats)?
-  private var transitions: [(t0: Double, lens: String, c: LensCorrection)] = []
+  // before = como a lente velha APARECIA (com a correção dela no instante); c = correção fixa antiga (reserva sem medida)
+  private var transitions: [(t0: Double, lens: String, c: LensCorrection, before: FrameStats)] = []
+  private var samples: [(t: Double, lens: String, s: FrameStats)] = []   // cor/luz da saída rápida (10/s), últimos 4 s
   private var pendingLearn: (lens: String, t0: Double, before: FrameStats, beforeLens: String)?
   private var still = true
   private(set) var enabled = UserDefaults.standard.object(forKey: "lensMatch") as? Bool ?? true
@@ -87,13 +97,40 @@ final class LensMatch: @unchecked Sendable {
   func correction(at t: Double, lens: String? = nil) -> LensCorrection {
     lock.lock(); defer { lock.unlock() }
     guard enabled else { return .identity }
-    let l = lens ?? lensLocked(at: t)
+    return correctionLocked(at: t, lens: lens ?? lensLocked(at: t))
+  }
+  // TROCA COMO UM MOVIMENTO SÓ (0.10.8): a tela sai EXATAMENTE de como a lente velha aparecia e chega em como a lente nova
+  // está AGORA (medida da saída rápida no mesmo horário, ~0,45 s antes de o quadro ir pra tela/arquivo): alvo = mistura
+  // velha→nova-atual com curva suave em 0,7 s. A exposição da lente nova se acomodando entra DENTRO desse movimento em vez
+  // de virar uma 3ª mudança depois. Sem medida da lente nova (escuro/estourado): solta a correção fixa como antes.
+  private func correctionLocked(at t: Double, lens l: String) -> LensCorrection {
     var c = staticLocked(l)
-    if let tr = transitions.last(where: { $0.t0 <= t }), tr.lens == l, t - tr.t0 < Self.fade {
-      let k = Float(1 - (t - tr.t0) / Self.fade)
-      c = c.then(tr.c.mix(k * k * (3 - 2 * k)))   // solta com curva suave (smoothstep)
+    guard let tr = transitions.last(where: { $0.t0 <= t }), tr.lens == l, t - tr.t0 < Self.fade else { return c }
+    let x = Float((t - tr.t0) / Self.fade), w = x * x * (3 - 2 * x)
+    if let raw = statsLocked(at: t, lens: l, since: tr.t0) {
+      let cur = c.apply(raw)
+      if let f = LensCorrection.fit(from: cur, to: FrameStats.lerp(tr.before, cur, w)) { return c.then(f) }
     }
+    let k = 1 - w
+    c = c.then(tr.c.mix(k))
     return c
+  }
+  // cor/luz da lente l no horário t (entre as duas amostras vizinhas da mesma lente, desde a troca)
+  private func statsLocked(at t: Double, lens l: String, since t0: Double) -> FrameStats? {
+    var a: (t: Double, s: FrameStats)?, b: (t: Double, s: FrameStats)?
+    for e in samples where e.lens == l && e.t >= t0 - 0.001 {
+      if e.t <= t { a = (e.t, e.s) } else { b = (e.t, e.s); break }
+    }
+    switch (a, b) {
+    case let (a?, b?): return FrameStats.lerp(a.s, b.s, Float((t - a.t) / max(0.001, b.t - a.t)))
+    case let (a?, nil): return a.s
+    case let (nil, b?): return b.s
+    default: return nil
+    }
+  }
+  private func addSample(_ s: FrameStats, lens: String, at t: Double) {
+    if let i = samples.lastIndex(where: { $0.t <= t }), i < samples.count - 1 { samples.insert((t, lens, s), at: i + 1) } else { samples.append((t, lens, s)) }
+    samples.removeAll { t - $0.t > 4 }
   }
 
   // TROCA NO QUADRO EXATO (0.8.1): o último quadro da lente velha e o 1º da nova (sensor de cada quadro) — a nova fica
@@ -102,8 +139,10 @@ final class LensMatch: @unchecked Sendable {
   func switched(at t: Double, from: String, before: FrameStats, to: String, after: FrameStats) {
     let rot = motion?() ?? 0
     lock.lock()
-    let b = staticLocked(from).apply(before), a = staticLocked(to).apply(after)
-    if let c = LensCorrection.fit(from: a, to: b) { transitions.append((t, to, c)); if transitions.count > 20 { transitions.removeFirst() } }
+    // como a velha APARECIA (inclui a transição dela, se ainda soltando — troca logo depois de outra) × a nova com a fixa
+    let b = correctionLocked(at: t - 0.001, lens: from).apply(before), a = staticLocked(to).apply(after)
+    addSample(after, lens: to, at: t)
+    if let c = LensCorrection.fit(from: a, to: b) { transitions.append((t, to, c, b)); if transitions.count > 20 { transitions.removeFirst() } }
     pendingLearn = (to, t, before, from); still = rot < 0.35
     lock.unlock()
   }
@@ -114,11 +153,12 @@ final class LensMatch: @unchecked Sendable {
     lock.lock()
     let l = lensLocked(at: t)
     if rot > 0.35 { still = false }
+    addSample(s, lens: l, at: t)
     if let p = last, p.lens != l, t - p.t < 0.2, !transitions.contains(where: { $0.lens == l && abs($0.t0 - t) < 0.35 }) {
-      // TROCA: a lente nova (com a fixa) fica igual ao último quadro da anterior (com a fixa dela) e solta em 1,2 s
-      let before = staticLocked(p.lens).apply(p.s), after = staticLocked(l).apply(s)
+      // TROCA (reserva, sem o quadro exato): a lente nova parte do último quadro da anterior e segue a nova em 0,7 s
+      let before = correctionLocked(at: p.t, lens: p.lens).apply(p.s), after = staticLocked(l).apply(s)
       if let c = LensCorrection.fit(from: after, to: before) {
-        transitions.append((t, l, c)); if transitions.count > 20 { transitions.removeFirst() }
+        transitions.append((t, l, c, before)); if transitions.count > 20 { transitions.removeFirst() }
       }
       pendingLearn = (l, t, p.s, p.lens); still = rot < 0.35
     }
