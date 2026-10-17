@@ -147,7 +147,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   @Published var rawSupported = false
   @Published var flash: PhotoFlash = PhotoFlash(rawValue: UserDefaults.standard.integer(forKey: "photoFlash")) ?? .off { didSet { UserDefaults.standard.set(flash.rawValue, forKey: "photoFlash") } }
   @Published var flashAvailable = false
-  @Published var maxQuality: Bool = UserDefaults.standard.object(forKey: "photoMaxQ") as? Bool ?? true { didSet { UserDefaults.standard.set(maxQuality, forKey: "photoMaxQ") } }
+  @Published var maxQuality: Bool = UserDefaults.standard.object(forKey: "photoMaxQ") as? Bool ?? true { didSet { UserDefaults.standard.set(maxQuality, forKey: "photoMaxQ"); let on = !maxQuality; queue.async { self.applyResponsive(on) } } }
   @Published var timer: Int = UserDefaults.standard.integer(forKey: "photoTimer") { didSet { UserDefaults.standard.set(timer, forKey: "photoTimer") } }
   @Published var saveToPhotos: Bool = UserDefaults.standard.object(forKey: "photoToLibrary") as? Bool ?? true { didSet { UserDefaults.standard.set(saveToPhotos, forKey: "photoToLibrary") } }
   @Published var aspect: PhotoAspect = PhotoAspect(rawValue: UserDefaults.standard.string(forKey: "photoAspect") ?? "") ?? .full { didSet { UserDefaults.standard.set(aspect.rawValue, forKey: "photoAspect") } }
@@ -204,8 +204,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     let mps = Array(Set(dims.map { Self.mp($0) })).sorted()
     output.maxPhotoQualityPrioritization = .quality
     let rawOK = output.isAppleProRAWSupported
-    _ = CowboyObjC.catching { if self.output.isResponsiveCaptureSupported { self.output.isResponsiveCaptureEnabled = true } }
-    _ = CowboyObjC.catching { if self.output.isFastCapturePrioritizationSupported { self.output.isFastCapturePrioritizationEnabled = true } }
+    applyResponsive(!maxQuality)
     applyRaw()
     // zoom: 1× = a principal (fator de troca ultra→principal); ultra = 0,5×
     let switches = cam.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat(truncating: $0) }
@@ -239,6 +238,17 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   }
   // rótulo comercial: 8064×6048 = 48,8 milhões de pontos = "48 MP"; 5712×4284 = "24 MP"
   static func mp(_ d: CMVideoDimensions) -> Int { let m = Double(d.width) * Double(d.height) / 1e6; return m >= 40 ? 48 : m >= 20 ? 24 : m >= 10 ? 12 : max(1, Int(m.rounded())) }
+  // CALOR (0.11.2): a captura responsiva + priorização rápida mantêm um buffer de quadros sendo processado o tempo todo (o
+  // celular esquentou em 1,5 min no modo foto da 0.11.0). Só ligadas no "Disparo rápido"; na "Qualidade máxima" a foto
+  // demora um pouco mais pra liberar o próximo disparo, mas o aparelho fica frio.
+  private func applyResponsive(_ on: Bool) {
+    _ = CowboyObjC.catching {
+      // a rápida depende da responsiva: liga responsiva → rápida; desliga rápida → responsiva
+      if !on && self.output.isFastCapturePrioritizationEnabled { self.output.isFastCapturePrioritizationEnabled = false }
+      if self.output.isResponsiveCaptureSupported && self.output.isResponsiveCaptureEnabled != on { self.output.isResponsiveCaptureEnabled = on }
+      if on && self.output.isFastCapturePrioritizationSupported { self.output.isFastCapturePrioritizationEnabled = true }
+    }
+  }
   private func applyRaw() {
     guard output.isAppleProRAWSupported else { return }
     let want = format.needsRaw

@@ -164,7 +164,7 @@ struct RecorderView: View {
       if ok && !UserDefaults.standard.bool(forKey: "zoomcalib_075") { UserDefaults.standard.set(true, forKey: "zoomcalib_075"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
     }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
-    .fullScreenCover(isPresented: $photoMode, onDismiss: { camera.start() }) { PhotoCameraView { photoMode = false } }
+    .fullScreenCover(isPresented: $photoMode, onDismiss: { camera.renderer.paused = false; camera.start() }) { PhotoCameraView { photoMode = false } }
     .task {
       Diag.install(); Diag.step("open")
       UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -504,7 +504,7 @@ struct RecorderView: View {
   private var modeRow: some View {
     HStack(spacing: 26) {
       Text("VÍDEO").font(.system(size: 13, weight: .heavy)).foregroundStyle(gold)
-      Button { panel = nil; fxOpen = false; camera.close { Task { @MainActor in photoMode = true } } } label: {
+      Button { panel = nil; fxOpen = false; camera.renderer.paused = true; MotionHub.shared.stop(); camera.close { Task { @MainActor in photoMode = true } } } label: {
         Text("FOTO").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.85)).padding(.vertical, 6).padding(.horizontal, 8).contentShape(Rectangle())
       }.buttonStyle(.plain).disabled(!camera.ready).accessibilityLabel("Modo foto")
     }

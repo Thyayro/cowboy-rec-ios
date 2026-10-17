@@ -623,6 +623,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       al.onAlign = { stream, g, e, e0 in Diag.step("lens-align", ["stream": stream, "s": String(format: "%.4f", g.s), "tx": String(format: "%.4f", g.tx), "ty": String(format: "%.4f", g.ty), "gain": String(format: "%.2f", e0 > 0 ? 1 - e / e0 : 0)]) }
       match.motion = { MotionHub.shared.rotationSpeed() }
       renderer.onSwitch = { info in Diag.step("lens-switch", info) }
+      renderer.recordingNow = { [weak self] in self?.recording ?? false }
       var lastBorderDiag = 0.0
       renderer.blackBorder = { [weak cam] in
         let now = CACurrentMediaTime(); guard now - lastBorderDiag > 4 else { return }; lastBorderDiag = now

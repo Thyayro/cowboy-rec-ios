@@ -75,6 +75,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   var blurShutter: (() -> Double)?   // obturador sintético agora (s), já sem a exposição real
   var blurFOV = 106.0                // campo horizontal do formato no zoom 1 do aparelho (graus)
   var blurHot = false                // aparelho quente: menos cópias na tela (o arquivo não muda)
+  // CALOR (0.11.2, "celular inteiro esquentando", 17/10): quente e SEM gravar, com o zoom parado = a TELA desenha a 30 qps
+  // (a câmera continua a 60: a latência da Extrema é em quadros), amostras de cor 4/s em vez de 10/s (10/s volta por 1,5 s
+  // depois de mexer no zoom/troca), sem trechos de diagnóstico. Modo foto = tela de vídeo PAUSADA (antes desenhava por trás).
+  var recordingNow: (() -> Bool)?
+  weak var mtkView: MTKView?
+  var paused = false { didSet { let p = paused; DispatchQueue.main.async { self.mtkView?.isPaused = p } } }
+  private var shownFPS = 60
   // TOQUE NAS LENTES (0.9.0): do toque em diante a tela mostra o QUADRO como ele é (igual ao arquivo: o zoom de edição com o
   // rastro dele), sem ampliação adivinhada — num zoom de milissegundos, 5 ms de erro na adivinhação viram ~10% de escala
   // ("volta" ao estacionar). A pinça continua "na hora" (amplia o quadro atrasado pelo zoom medido).
@@ -211,7 +218,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let now = CACurrentMediaTime()
     fastAt = now
     let wantStats = now >= nextStats && !statsBusy
-    if wantStats { nextStats = now + 0.1; statsBusy = true }   // 10/s (era 33/s: aquecia)
+    if wantStats { nextStats = now + (blurHot && now - lastZoomMove > 1.5 ? 0.25 : 0.1); statsBusy = true }   // 10/s (era 33/s: aquecia); quente e parado: 4/s
     let calm = now - lastZoomMove > 1.2   // zoom parado há um tempo: dá pra medir o corte
     let go = calm && !calibBusy && now >= nextCalib && !cropFrozen
     if go { calibBusy = true; nextCalib = now + 0.5 }
@@ -490,7 +497,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let dzSpeed = lastDrawAt > 0 ? log(dzNow / max(1, lastDZ)) / max(1.0 / 120, now - lastDrawAt) : 0
     lastDZ = dzNow; lastDrawAt = now
     var dz = dzNow
-    tap.tick(now: now, moving: zoomMovedNow || dMoved)
+    if !blurHot { tap.tick(now: now, moving: zoomMovedNow || dMoved) }
+    // quente, sem gravar e com o zoom parado há 1 s: a tela a 30 qps (metade do trabalho de GPU da prévia)
+    let wantFPS = blurHot && !(recordingNow?() ?? false) && now - lastZoomMove > 1.0 && xfade == nil ? 30 : 60
+    if wantFPS != shownFPS { shownFPS = wantFPS; view.preferredFramesPerSecond = wantFPS; Diag.step("screen-fps", ["qps": wantFPS], send: false) }
     if live {
       guard let liveFrame else { return }
       drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now, lens: LensID.name(liveFrame)) ?? .identity,
@@ -616,6 +626,8 @@ struct MetalPreview: UIViewRepresentable {
     view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
     view.isUserInteractionEnabled = false
     view.delegate = renderer
+    renderer.mtkView = view
+    view.isPaused = renderer.paused
     return view
   }
   func updateUIView(_ view: MTKView, context: Context) {}
