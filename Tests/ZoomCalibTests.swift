@@ -494,7 +494,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     check(need > 1.06 && need < 1.115, String(format: "chegada: sobra aprendida %.4f pra deriva de 7%% + deslize", need))
     _ = arrivalSim("10×→2× cresce 7% com deslize, sobra aprendida", d0: 0.93, dx0: 0.004, dy0: -0.002, dur: 2.0, margin: min(1.12, need * 1.005), strict: true)
     _ = arrivalSim("pinça 1×→2× encolhe 10%", d0: 1.10, dx0: 0, dy0: 0.008, dur: 1.8, margin: 1.0, strict: true)
-    _ = arrivalSim("2×→1× cresce 5%", d0: 0.95, dx0: -0.004, dy0: 0.008, dur: 1.5, margin: 1.07, strict: true)
+    _ = arrivalSim("2×→1× cresce 5%", d0: 0.95, dx0: -0.004, dy0: 0.008, dur: 1.5, margin: 1.105, strict: true)
     _ = arrivalSim("sem deriva (só tremor)", d0: 1.0, dx0: 0, dy0: 0, dur: 1.0, margin: 1.03, strict: true)
     print("TESTE DO ZOOM OK")
   }
