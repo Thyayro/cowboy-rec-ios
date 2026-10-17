@@ -25,6 +25,34 @@ enum PhotoFlash: Int, CaseIterable { case off, auto, on
   var mode: AVCaptureDevice.FlashMode { self == .off ? .off : self == .auto ? .auto : .on }
 }
 
+// PROPORÇÃO (0.11.1): 3:4 é o sensor inteiro; 1:1, 4:5 e 9:16 são recortes centrais (em pé; deitado vira 5:4 / 16:9, como
+// no iPhone). A prévia escurece o que fica fora; o arquivo salvo já sai recortado e o RAW guarda o original inteiro com a
+// proporção ao lado (`<id>.aspect`), que o editor aplica — revelar do DNG sai no mesmo quadro que foi fotografado.
+enum PhotoAspect: String, CaseIterable, Identifiable {
+  case full = "3:4", square = "1:1", r45 = "4:5", r916 = "9:16"
+  var id: String { rawValue }
+  var portrait: CGFloat { switch self { case .full: return 3.0 / 4; case .square: return 1; case .r45: return 0.8; case .r916: return 9.0 / 16 } }
+  var next: PhotoAspect { let a = Self.allCases; return a[(a.firstIndex(of: self)! + 1) % a.count] }
+  // recorte central desta proporção dentro de um quadro em pé (prévia)
+  func rect(in r: CGRect) -> CGRect {
+    let have = r.width / max(1, r.height), want = portrait
+    if abs(have - want) < 0.001 { return r }
+    if want < have { let w = r.height * want; return CGRect(x: r.midX - w / 2, y: r.minY, width: w, height: r.height) }
+    let h = r.width / want; return CGRect(x: r.minX, y: r.midY - h / 2, width: r.width, height: h)
+  }
+  // recorte central da imagem já orientada (deitada = proporção invertida); sem mudança se já estiver nela
+  func crop(_ img: CIImage) -> CIImage {
+    guard self != .full else { return img }
+    let e = img.extent, want = e.width > e.height ? 1 / portrait : portrait, have = e.width / max(1, e.height)
+    guard abs(have - want) > 0.002 else { return img }
+    var r = e
+    if have > want { let w = (e.height * want).rounded(); r = CGRect(x: (e.midX - w / 2).rounded(), y: e.minY, width: w, height: e.height) }
+    else { let h = (e.width / want).rounded(); r = CGRect(x: e.minX, y: (e.midY - h / 2).rounded(), width: e.width, height: h) }
+    let c = img.cropped(to: r)
+    return c.transformed(by: CGAffineTransform(translationX: -c.extent.minX, y: -c.extent.minY))
+  }
+}
+
 // uma foto na pasta do app: arquivo principal (HEIF/JPEG ou DNG), RAW ao lado (se houver) e a versão editada
 struct PhotoShot: Identifiable, Hashable {
   let id: String
@@ -61,7 +89,25 @@ enum PhotoStore {
     }.sorted { $0.date > $1.date }
   }
   static func delete(_ s: PhotoShot) {
-    for u in [s.main, s.raw, s.edited].compactMap({ $0 }) { try? FileManager.default.removeItem(at: u) }
+    for u in [s.main, s.raw, s.edited, dir.appendingPathComponent(s.id + ".aspect")].compactMap({ $0 }) { try? FileManager.default.removeItem(at: u) }
+  }
+  static func aspect(_ id: String) -> PhotoAspect {
+    (try? String(contentsOf: dir.appendingPathComponent(id + ".aspect"), encoding: .utf8)).flatMap { PhotoAspect(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? .full
+  }
+  private static let cropContext = CIContext(options: [.cacheIntermediates: false])
+  // arquivo recortado na proporção (HEIF 10 bits P3, ou JPEG se o original era JPEG), metadados do original com orientação 1
+  static func cropped(_ src: URL, aspect: PhotoAspect, to dst: URL) -> Bool {
+    var img: CIImage?
+    if src.pathExtension.lowercased() == "dng", let d = try? Data(contentsOf: src) { img = CIRAWFilter(imageData: d, identifierHint: "com.adobe.raw-image")?.outputImage }
+    else { img = CIImage(contentsOf: src, options: [.applyOrientationProperty: true]) }
+    guard let base = img, let cs = CGColorSpace(name: CGColorSpace.displayP3) else { return false }
+    var props = base.properties; props[kCGImagePropertyOrientation as String] = 1
+    let c = aspect.crop(base).settingProperties(props)
+    let data: Data?
+    if dst.pathExtension.lowercased() == "jpg" { data = cropContext.jpegRepresentation(of: c, colorSpace: cs, options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.92]) }
+    else { data = (try? cropContext.heif10Representation(of: c, colorSpace: cs, options: [:])) ?? cropContext.heifRepresentation(of: c, format: .RGBA8, colorSpace: cs, options: [:]) }
+    guard let data, (try? data.write(to: dst, options: .atomic)) != nil else { return false }
+    return true
   }
   static func thumbnail(_ url: URL, size: CGFloat = 240) -> UIImage? {
     guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
@@ -90,7 +136,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   private var coordinator: AVCaptureDevice.RotationCoordinator?
   weak var previewLayer: AVCaptureVideoPreviewLayer? { didSet { if let l = previewLayer { attach(l) } } }
   private let lock = NSLock()
-  private var pending: [Int64: (processed: Data?, raw: Data?, t0: Double, format: PhotoFormat, mp: Int)] = [:]
+  private var pending: [Int64: (processed: Data?, raw: Data?, t0: Double, format: PhotoFormat, mp: Int, aspect: PhotoAspect)] = [:]
   private var subjectObserver: NSObjectProtocol?
 
   @Published var ready = false
@@ -104,6 +150,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   @Published var maxQuality: Bool = UserDefaults.standard.object(forKey: "photoMaxQ") as? Bool ?? true { didSet { UserDefaults.standard.set(maxQuality, forKey: "photoMaxQ") } }
   @Published var timer: Int = UserDefaults.standard.integer(forKey: "photoTimer") { didSet { UserDefaults.standard.set(timer, forKey: "photoTimer") } }
   @Published var saveToPhotos: Bool = UserDefaults.standard.object(forKey: "photoToLibrary") as? Bool ?? true { didSet { UserDefaults.standard.set(saveToPhotos, forKey: "photoToLibrary") } }
+  @Published var aspect: PhotoAspect = PhotoAspect(rawValue: UserDefaults.standard.string(forKey: "photoAspect") ?? "") ?? .full { didSet { UserDefaults.standard.set(aspect.rawValue, forKey: "photoAspect") } }
   @Published var zoom: Double = 1
   @Published var minZoom: Double = 1
   @Published var maxZoom: Double = 10
@@ -267,7 +314,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   }
   func cancelTimer() { countdown = 0 }
   private func capture(angle: CGFloat) {
-    let fmt = format, mp = megapixels, fl = flash, maxQ = maxQuality
+    let fmt = format, mp = megapixels, fl = flash, maxQ = maxQuality, asp = aspect
     inFlight += 1
     queue.async {
       guard self.device != nil else { self.publish { self.inFlight = max(0, self.inFlight - 1) }; return }
@@ -289,7 +336,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
       s.photoQualityPrioritization = maxQ ? .quality : .balanced
       if self.output.supportedFlashModes.contains(fl.mode) { s.flashMode = fl.mode }
       if let conn = self.output.connection(with: .video), conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
-      self.lock.lock(); self.pending[s.uniqueID] = (nil, nil, CACurrentMediaTime(), used, mp); self.lock.unlock()
+      self.lock.lock(); self.pending[s.uniqueID] = (nil, nil, CACurrentMediaTime(), used, mp, asp); self.lock.unlock()
       if CowboyObjC.catching({ self.output.capturePhoto(with: s, delegate: self) }) != nil {
         self.lock.lock(); self.pending[s.uniqueID] = nil; self.lock.unlock()
         Diag.step("photo-fail", ["etapa": "capturePhoto", "formato": used.label])
@@ -324,10 +371,23 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
       if (try? d.write(to: fixed)) != nil { main = fixed }
     }
     if let d = p.raw { let u = dir.appendingPathComponent(id + ".dng"); if (try? d.write(to: u)) != nil { raw = u } }
-    guard let m = main ?? raw else { publish { self.status = "Sem espaço pra salvar a foto" }; return }
-    let shot = PhotoShot(id: id, main: m, raw: main == nil ? nil : raw, date: Date())
+    guard var m = main ?? raw else { publish { self.status = "Sem espaço pra salvar a foto" }; return }
+    // proporção: o principal sai recortado (só RAW = um HEIF recortado vira o principal e o DNG inteiro fica junto)
+    var cropOK = true
+    if p.aspect != .full {
+      try? p.aspect.rawValue.write(to: dir.appendingPathComponent(id + ".aspect"), atomically: true, encoding: .utf8)
+      let ext = main?.pathExtension.lowercased() == "jpg" ? "jpg" : "heic"
+      let dst = dir.appendingPathComponent(id + ".crop." + ext)
+      cropOK = PhotoStore.cropped(m, aspect: p.aspect, to: dst)
+      if cropOK {
+        let final = dir.appendingPathComponent(id + "." + ext)
+        if let old = main { try? FileManager.default.removeItem(at: old) }
+        if (try? FileManager.default.moveItem(at: dst, to: final)) != nil { m = final }
+      }
+    }
+    let shot = PhotoShot(id: id, main: m, raw: m == raw ? nil : raw, date: Date())
     let ms = Int((CACurrentMediaTime() - p.t0) * 1000), bytes = (p.processed?.count ?? 0) + (p.raw?.count ?? 0)
-    Diag.step("photo-shot", ["formato": p.format.label, "mp": p.mp, "ms": ms, "kb": bytes / 1024, "raw": raw != nil])
+    Diag.step("photo-shot", ["formato": p.format.label, "mp": p.mp, "ms": ms, "kb": bytes / 1024, "raw": raw != nil, "proporcao": p.aspect.rawValue, "recorte": cropOK])
     let thumb = PhotoStore.thumbnail(m, size: 160)
     publish { self.lastShot = shot; self.lastThumb = thumb }
     if saveToPhotos {

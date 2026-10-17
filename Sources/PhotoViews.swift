@@ -50,6 +50,12 @@ struct PhotoCameraView: View {
                 .position(x: sx, y: p.y - CGFloat(max(-3, min(3, cam.exposureBias))) * 22)
             }.allowsHitTesting(false)
           }
+          // fora da proporção escolhida: escurecido (o arquivo sai recortado)
+          let a = cam.aspect.rect(in: r)
+          if a != r {
+            Path { pth in pth.addRect(r); pth.addRect(a) }.fill(Color.black.opacity(0.62), style: FillStyle(eoFill: true)).allowsHitTesting(false)
+            Rectangle().stroke(.white.opacity(0.35), lineWidth: 0.5).frame(width: a.width, height: a.height).position(x: a.midX, y: a.midY).allowsHitTesting(false)
+          }
           if blink { Color.black.frame(width: r.width, height: r.height).position(x: r.midX, y: r.midY).allowsHitTesting(false) }
           if cam.countdown > 0 {
             Text("\(cam.countdown)").font(.system(size: 120, weight: .thin)).foregroundStyle(.white).shadow(radius: 6).position(x: r.midX, y: r.midY).allowsHitTesting(false)
@@ -99,6 +105,7 @@ struct PhotoCameraView: View {
         Picker("Formato", selection: $cam.format) {
           ForEach(PhotoFormat.allCases) { f in if !f.needsRaw || cam.rawSupported { Text(f.label).tag(f) } }
         }
+        Picker("Proporção", selection: $cam.aspect) { ForEach(PhotoAspect.allCases) { Text($0.rawValue).tag($0) } }
         Picker("Resolução", selection: $cam.megapixels) { ForEach(cam.mpOptions, id: \.self) { Text("\($0) MP").tag($0) } }
         Toggle("Qualidade máxima (fusão de quadros)", isOn: $cam.maxQuality)
         Toggle("Salvar na Fototeca", isOn: $cam.saveToPhotos)
@@ -111,6 +118,11 @@ struct PhotoCameraView: View {
           Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).opacity(0.7)
         }.foregroundStyle(.white).padding(.horizontal, 10).padding(.vertical, 7).background(.white.opacity(0.12), in: Capsule())
       }
+      Button { withAnimation(.easeOut(duration: 0.15)) { cam.aspect = cam.aspect.next } } label: {
+        Text(cam.aspect.rawValue).font(.system(size: 12, weight: .heavy)).frame(minWidth: 34).padding(.horizontal, 6).padding(.vertical, 7)
+          .background(cam.aspect == .full ? Color.white.opacity(0.12) : gold, in: Capsule()).foregroundStyle(cam.aspect == .full ? Color.white : Color.black)
+          .frame(height: 44).contentShape(Rectangle())
+      }.buttonStyle(.plain).accessibilityLabel("Proporção " + cam.aspect.rawValue)
       Spacer()
       if abs(cam.exposureBias) > 0.05 {
         Button { cam.setBias(0) } label: { Text(String(format: "%+.1f EV", cam.exposureBias)).font(.system(size: 12, weight: .bold, design: .monospaced)).padding(.horizontal, 8).padding(.vertical, 6).background(gold, in: Capsule()).foregroundStyle(.black) }.buttonStyle(.plain)
@@ -226,13 +238,14 @@ final class PhotoEditModel: ObservableObject, @unchecked Sendable {
   private let queue = DispatchQueue(label: "cowboy.photo.dev", qos: .userInitiated)
   private func main(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
 
-  init(shot: PhotoShot) { self.shot = shot; load() }
+  let aspect: PhotoAspect
+  init(shot: PhotoShot) { self.shot = shot; aspect = PhotoStore.aspect(shot.id); load() }
   private func load() {
     busy = "Abrindo…"
     queue.async {
       guard let full = self.dev.load(self.shot.source) else { self.main { self.busy = "Não abriu esta foto" }; return }
       let fullSide = max(full.image.extent.width, full.image.extent.height)
-      let p = self.dev.load(self.shot.source, maxSide: 1600)?.image ?? full.image
+      let p = self.aspect.crop(self.dev.load(self.shot.source, maxSide: 1600)?.image ?? full.image)
       self.proxy = p; self.proxyScale = max(p.extent.width, p.extent.height) / max(1, fullSide)
       self.small = Self.shrink(p, 180)
       let orig = self.dev.cgImage(self.dev.develop(p, PhotoAdjust(), rawEV: false, scale: self.proxyScale)).map { UIImage(cgImage: $0) }
@@ -309,7 +322,7 @@ final class PhotoEditModel: ObservableObject, @unchecked Sendable {
     let a = adjust, ai = aiBase
     queue.async {
       let t0 = CACurrentMediaTime()
-      guard let b = ai ?? self.dev.load(self.shot.source)?.image else { self.main { self.busy = nil; done("Não abriu a foto original") }; return }
+      guard let b = ai ?? self.dev.load(self.shot.source).map({ self.aspect.crop($0.image) }) else { self.main { self.busy = nil; done("Não abriu a foto original") }; return }
       let out = self.dev.develop(b, a, rawEV: false, scale: 1)
       guard let data = self.dev.heif(out) else { self.main { self.busy = nil; done("Não deu pra gerar o HEIF") }; return }
       let url = PhotoStore.dir.appendingPathComponent(self.shot.id + "-ed.heic")
