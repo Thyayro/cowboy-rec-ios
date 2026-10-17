@@ -1,0 +1,355 @@
+import AVFoundation
+import Photos
+import SwiftUI
+import UIKit
+
+// ÁREA DE FOTOGRAFIA (0.11.0, pedido do filmmaker 17/10: "área de fotografia além de vídeo com TODAS as funções da câmera,
+// HDR, log/RAW nativo, o que de mais profissional se usa em foto"). Sessão PRÓPRIA (a de vídeo fecha antes, como no AR):
+// nada aqui mexe no caminho de vídeo (Extrema, Log, troca de lente, nuvem).
+// - Câmera virtual tripla (0,5 / 1 / 2 / 5 e pinça), troca de lente e foco 100% do iPhone (lição do vídeo: não brigar).
+// - Formatos: HEIF (HDR inteligente + mapa de ganho, 10 bits), JPEG, Apple ProRAW (DNG, a "latitude de Log" da foto) e
+//   RAW+HEIF. Resolução 12/24/48 MP (o que o formato da lente aceitar). Prioridade "Máxima" = fusão multi-quadro (Deep
+//   Fusion / Smart HDR / noite automática); "Rápida" = disparo em sequência.
+// - Flash, temporizador, compensação de luz (sol), toque = foco+luz no ponto, nível pela orientação real (RotationCoordinator).
+// - Cada foto vai pra pasta do app (Documents/Fotos, base do editor) e, ligado, pra Fototeca (RAW+HEIF = um item só).
+enum PhotoFormat: String, CaseIterable, Identifiable {
+  case heif, jpeg, raw, rawHeif
+  var id: String { rawValue }
+  var label: String {
+    switch self { case .heif: return "HEIF"; case .jpeg: return "JPEG"; case .raw: return "ProRAW"; case .rawHeif: return "RAW+HEIF" }
+  }
+  var needsRaw: Bool { self == .raw || self == .rawHeif }
+}
+enum PhotoFlash: Int, CaseIterable { case off, auto, on
+  var icon: String { self == .off ? "bolt.slash" : self == .auto ? "bolt.badge.automatic" : "bolt.fill" }
+  var mode: AVCaptureDevice.FlashMode { self == .off ? .off : self == .auto ? .auto : .on }
+}
+
+// uma foto na pasta do app: arquivo principal (HEIF/JPEG ou DNG), RAW ao lado (se houver) e a versão editada
+struct PhotoShot: Identifiable, Hashable {
+  let id: String
+  let main: URL
+  let raw: URL?
+  let date: Date
+  var edited: URL? { let u = PhotoStore.dir.appendingPathComponent(id + "-ed.heic"); return FileManager.default.fileExists(atPath: u.path) ? u : nil }
+  var isRaw: Bool { main.pathExtension.lowercased() == "dng" }
+  // fonte da edição: o RAW quando existe (latitude), senão o processado
+  var source: URL { raw ?? main }
+}
+
+enum PhotoStore {
+  static var dir: URL {
+    let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Fotos", isDirectory: true)
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+    return d
+  }
+  static func all() -> [PhotoShot] {
+    let fm = FileManager.default
+    guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.creationDateKey]) else { return [] }
+    var byID: [String: (main: URL?, raw: URL?, date: Date)] = [:]
+    for f in files {
+      let name = f.deletingPathExtension().lastPathComponent, ext = f.pathExtension.lowercased()
+      guard !name.hasSuffix("-ed") else { continue }
+      let date = (try? f.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+      var e = byID[name] ?? (nil, nil, date)
+      if ext == "dng" { e.raw = f } else if ["heic", "jpg", "jpeg"].contains(ext) { e.main = f }
+      e.date = min(e.date, date); byID[name] = e
+    }
+    return byID.compactMap { id, e in
+      guard let m = e.main ?? e.raw else { return nil }
+      return PhotoShot(id: id, main: m, raw: e.main == nil ? nil : e.raw, date: e.date)
+    }.sorted { $0.date > $1.date }
+  }
+  static func delete(_ s: PhotoShot) {
+    for u in [s.main, s.raw, s.edited].compactMap({ $0 }) { try? FileManager.default.removeItem(at: u) }
+  }
+  static func thumbnail(_ url: URL, size: CGFloat = 240) -> UIImage? {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: size]
+    return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary).map { UIImage(cgImage: $0) }
+  }
+  // Fototeca (só adicionar): principal + RAW como item único (o app Fotos mostra o processado e guarda o DNG junto)
+  static func saveToLibrary(main: URL, raw: URL?, done: @escaping (Bool, String?) -> Void) {
+    PHPhotoLibrary.requestAuthorization(for: .addOnly) { st in
+      guard st == .authorized || st == .limited else { done(false, "sem permissão da Fototeca"); return }
+      PHPhotoLibrary.shared().performChanges({
+        let r = PHAssetCreationRequest.forAsset()
+        r.addResource(with: .photo, fileURL: main, options: nil)
+        if let raw, raw != main { r.addResource(with: .alternatePhoto, fileURL: raw, options: nil) }
+      }) { ok, err in done(ok, err?.localizedDescription) }
+    }
+  }
+}
+
+final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, @unchecked Sendable {
+  let session = AVCaptureSession()
+  private let queue = DispatchQueue(label: "cowboy.photo.session", qos: .userInitiated)
+  private let output = AVCapturePhotoOutput()
+  private var device: AVCaptureDevice?
+  private var base: CGFloat = 1                 // fator do aparelho que é o "1×" (a principal)
+  private var coordinator: AVCaptureDevice.RotationCoordinator?
+  weak var previewLayer: AVCaptureVideoPreviewLayer? { didSet { if let l = previewLayer { attach(l) } } }
+  private let lock = NSLock()
+  private var pending: [Int64: (processed: Data?, raw: Data?, t0: Double, format: PhotoFormat, mp: Int)] = [:]
+  private var subjectObserver: NSObjectProtocol?
+
+  @Published var ready = false
+  @Published var status = "Abrindo a câmera de foto…"
+  @Published var format: PhotoFormat = PhotoFormat(rawValue: UserDefaults.standard.string(forKey: "photoFormat") ?? "") ?? .heif { didSet { UserDefaults.standard.set(format.rawValue, forKey: "photoFormat"); queue.async { self.applyRaw() } } }
+  @Published var megapixels: Int = UserDefaults.standard.object(forKey: "photoMP") as? Int ?? 24 { didSet { UserDefaults.standard.set(megapixels, forKey: "photoMP") } }
+  @Published var mpOptions: [Int] = [12]
+  @Published var rawSupported = false
+  @Published var flash: PhotoFlash = PhotoFlash(rawValue: UserDefaults.standard.integer(forKey: "photoFlash")) ?? .off { didSet { UserDefaults.standard.set(flash.rawValue, forKey: "photoFlash") } }
+  @Published var flashAvailable = false
+  @Published var maxQuality: Bool = UserDefaults.standard.object(forKey: "photoMaxQ") as? Bool ?? true { didSet { UserDefaults.standard.set(maxQuality, forKey: "photoMaxQ") } }
+  @Published var timer: Int = UserDefaults.standard.integer(forKey: "photoTimer") { didSet { UserDefaults.standard.set(timer, forKey: "photoTimer") } }
+  @Published var saveToPhotos: Bool = UserDefaults.standard.object(forKey: "photoToLibrary") as? Bool ?? true { didSet { UserDefaults.standard.set(saveToPhotos, forKey: "photoToLibrary") } }
+  @Published var zoom: Double = 1
+  @Published var minZoom: Double = 1
+  @Published var maxZoom: Double = 10
+  @Published var lenses: [Double] = [1]
+  @Published var exposureBias: Double = 0
+  @Published var minBias: Double = -4
+  @Published var maxBias: Double = 4
+  @Published var inFlight = 0
+  @Published var countdown = 0
+  @Published var shutterBlink = 0
+  @Published var lastShot: PhotoShot? = PhotoStore.all().first
+  @Published var lastThumb: UIImage?
+
+  private func publish(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
+
+  func start() {
+    Task {
+      guard await AVCaptureDevice.requestAccess(for: .video) else { publish { self.status = "Libere a câmera nos Ajustes do iPhone" }; return }
+      queue.async {
+        self.configure()
+        if !self.session.isRunning { self.session.startRunning() }
+        let ok = self.session.isRunning
+        self.publish { self.ready = ok; self.status = ok ? "" : "Câmera de foto indisponível" }
+      }
+    }
+    if let s = lastShot { DispatchQueue.global(qos: .utility).async { let t = PhotoStore.thumbnail(s.main, size: 160); self.publish { self.lastThumb = t } } }
+  }
+  func stop(_ done: (() -> Void)? = nil) {
+    queue.async {
+      if self.session.isRunning { self.session.stopRunning() }
+      DispatchQueue.main.async { self.ready = false; done?() }
+    }
+  }
+
+  private func configure() {
+    guard session.inputs.isEmpty else { return }
+    session.beginConfiguration()
+    defer { session.commitConfiguration() }
+    session.sessionPreset = .photo
+    let types: [AVCaptureDevice.DeviceType] = [.builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera, .builtInWideAngleCamera]
+    guard let cam = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .back).devices.first,
+          let input = try? AVCaptureDeviceInput(device: cam), session.canAddInput(input), session.canAddOutput(output) else {
+      publish { self.status = "Não deu pra abrir a câmera traseira" }; return
+    }
+    session.addInput(input)
+    session.addOutput(output)
+    device = cam
+    // 48 MP quando a lente/formato aceita (14 Pro em diante); o pedido de cada foto escolhe 12/24/48
+    let dims = cam.activeFormat.supportedMaxPhotoDimensions
+    if let big = dims.max(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) { output.maxPhotoDimensions = big }
+    let mps = Array(Set(dims.map { Self.mp($0) })).sorted()
+    output.maxPhotoQualityPrioritization = .quality
+    let rawOK = output.isAppleProRAWSupported
+    _ = CowboyObjC.catching { if self.output.isResponsiveCaptureSupported { self.output.isResponsiveCaptureEnabled = true } }
+    _ = CowboyObjC.catching { if self.output.isFastCapturePrioritizationSupported { self.output.isFastCapturePrioritizationEnabled = true } }
+    applyRaw()
+    // zoom: 1× = a principal (fator de troca ultra→principal); ultra = 0,5×
+    let switches = cam.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat(truncating: $0) }
+    base = cam.isVirtualDevice && [.builtInTripleCamera, .builtInDualWideCamera].contains(cam.deviceType) ? (switches.first ?? 1) : 1
+    var ls: [Double] = []
+    if base > 1 { ls.append(Double(1 / base)) }
+    ls.append(1)
+    if mps.contains(where: { $0 >= 40 }) || cam.deviceType == .builtInTripleCamera { ls.append(2) }   // 2× = recorte do sensor de 48 MP
+    if cam.deviceType == .builtInTripleCamera, switches.count > 1 { ls.append(Double(switches[1] / base)) }
+    if (try? cam.lockForConfiguration()) != nil {
+      if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
+      if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
+      if cam.isVirtualDevice { _ = CowboyObjC.catching { cam.setPrimaryConstituentDeviceSwitchingBehavior(.auto, restrictedSwitchingBehaviorConditions: []) } }
+      cam.isSubjectAreaChangeMonitoringEnabled = true
+      cam.videoZoomFactor = max(cam.minAvailableVideoZoomFactor, min(base, cam.maxAvailableVideoZoomFactor))
+      cam.unlockForConfiguration()
+    }
+    subjectObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: cam, queue: nil) { [weak self] _ in self?.recenter() }
+    let minZ = Double(cam.minAvailableVideoZoomFactor / base), maxZ = Double(min(cam.maxAvailableVideoZoomFactor, base * 25) / base)
+    let flashOK = cam.hasFlash, lo = Double(cam.minExposureTargetBias), hi = Double(cam.maxExposureTargetBias)
+    Diag.step("photo-open", ["device": cam.deviceType.rawValue, "mp": mps.map(String.init).joined(separator: "/"), "raw": rawOK, "base": String(format: "%.2f", Double(base))])
+    publish {
+      self.mpOptions = mps.isEmpty ? [12] : mps
+      if !self.mpOptions.contains(self.megapixels) { self.megapixels = self.mpOptions.contains(24) ? 24 : (self.mpOptions.last ?? 12) }
+      self.rawSupported = rawOK
+      if !rawOK && self.format.needsRaw { self.format = .heif }
+      self.lenses = ls; self.minZoom = minZ; self.maxZoom = maxZ; self.zoom = 1
+      self.flashAvailable = flashOK; self.minBias = max(-4, lo); self.maxBias = min(4, hi)
+      if let l = self.previewLayer { self.attach(l) }   // a camada nasce antes da sessão ter câmera: gira a prévia agora
+    }
+  }
+  // rótulo comercial: 8064×6048 = 48,8 milhões de pontos = "48 MP"; 5712×4284 = "24 MP"
+  static func mp(_ d: CMVideoDimensions) -> Int { let m = Double(d.width) * Double(d.height) / 1e6; return m >= 40 ? 48 : m >= 20 ? 24 : m >= 10 ? 12 : max(1, Int(m.rounded())) }
+  private func applyRaw() {
+    guard output.isAppleProRAWSupported else { return }
+    let want = format.needsRaw
+    if output.isAppleProRAWEnabled != want { _ = CowboyObjC.catching { self.output.isAppleProRAWEnabled = want } }
+  }
+  private func attach(_ layer: AVCaptureVideoPreviewLayer) {
+    queue.async {
+      guard let cam = self.device else { return }
+      DispatchQueue.main.async {
+        let c = AVCaptureDevice.RotationCoordinator(device: cam, previewLayer: layer)
+        self.coordinator = c
+        if let conn = layer.connection, conn.isVideoRotationAngleSupported(c.videoRotationAngleForHorizonLevelPreview) { conn.videoRotationAngle = c.videoRotationAngleForHorizonLevelPreview }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- zoom, foco, luz
+  func setZoom(_ z: Double, animated: Bool = false) {
+    let zz = max(minZoom, min(maxZoom, z)); zoom = zz
+    queue.async {
+      guard let cam = self.device, (try? cam.lockForConfiguration()) != nil else { return }
+      let f = max(cam.minAvailableVideoZoomFactor, min(cam.maxAvailableVideoZoomFactor, CGFloat(zz) * self.base))
+      if animated { cam.ramp(toVideoZoomFactor: f, withRate: 12) } else { cam.cancelVideoZoomRamp(); cam.videoZoomFactor = f }
+      cam.unlockForConfiguration()
+    }
+  }
+  // ponto em coordenadas da camada da prévia
+  func focus(atLayerPoint p: CGPoint) {
+    guard let layer = previewLayer else { return }
+    let dp = layer.captureDevicePointConverted(fromLayerPoint: p)
+    queue.async {
+      guard let cam = self.device, (try? cam.lockForConfiguration()) != nil else { return }
+      if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = dp }
+      if cam.isFocusModeSupported(.continuousAutoFocus) { cam.focusMode = .continuousAutoFocus }
+      if cam.isExposurePointOfInterestSupported { cam.exposurePointOfInterest = dp }
+      if cam.isExposureModeSupported(.continuousAutoExposure) { cam.exposureMode = .continuousAutoExposure }
+      cam.unlockForConfiguration()
+    }
+  }
+  private func recenter() {
+    queue.async {
+      guard let cam = self.device, (try? cam.lockForConfiguration()) != nil else { return }
+      let c = CGPoint(x: 0.5, y: 0.5)
+      if cam.isFocusPointOfInterestSupported { cam.focusPointOfInterest = c }
+      if cam.isExposurePointOfInterestSupported { cam.exposurePointOfInterest = c }
+      cam.unlockForConfiguration()
+    }
+  }
+  func setBias(_ v: Double) {
+    let b = max(minBias, min(maxBias, v)); exposureBias = b
+    queue.async {
+      guard let cam = self.device, (try? cam.lockForConfiguration()) != nil else { return }
+      cam.setExposureTargetBias(Float(b), completionHandler: nil)
+      cam.unlockForConfiguration()
+    }
+  }
+
+  // ---------------------------------------------------------------- disparo
+  func shoot() {
+    guard ready else { return }
+    let angle = coordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
+    if timer > 0 {
+      countdown = timer
+      func tick() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+          guard self.countdown > 0 else { return }
+          self.countdown -= 1
+          if self.countdown == 0 { self.capture(angle: self.coordinator?.videoRotationAngleForHorizonLevelCapture ?? angle) } else { tick() }
+        }
+      }
+      tick()
+    } else { capture(angle: angle) }
+  }
+  func cancelTimer() { countdown = 0 }
+  private func capture(angle: CGFloat) {
+    let fmt = format, mp = megapixels, fl = flash, maxQ = maxQuality
+    inFlight += 1
+    queue.async {
+      guard self.device != nil else { self.publish { self.inFlight = max(0, self.inFlight - 1) }; return }
+      let rawType = self.output.availableRawPhotoPixelFormatTypes.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
+      let hevc = self.output.availablePhotoCodecTypes.contains(.hevc)
+      var used = fmt
+      let s: AVCapturePhotoSettings
+      switch fmt {
+      case .raw where rawType != nil: s = AVCapturePhotoSettings(rawPixelFormatType: rawType!)
+      case .rawHeif where rawType != nil: s = AVCapturePhotoSettings(rawPixelFormatType: rawType!, processedFormat: [AVVideoCodecKey: hevc ? AVVideoCodecType.hevc : AVVideoCodecType.jpeg])
+      case .jpeg: s = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+      default: used = hevc ? .heif : .jpeg; s = AVCapturePhotoSettings(format: [AVVideoCodecKey: hevc ? AVVideoCodecType.hevc : AVVideoCodecType.jpeg])
+      }
+      // resolução pedida (a mais próxima que o formato aceita, sem passar do máximo da saída)
+      if let cam = self.device {
+        let dims = cam.activeFormat.supportedMaxPhotoDimensions.filter { Int($0.width) * Int($0.height) <= Int(self.output.maxPhotoDimensions.width) * Int(self.output.maxPhotoDimensions.height) }
+        if let d = dims.first(where: { Self.mp($0) == mp }) ?? dims.min(by: { abs(Self.mp($0) - mp) < abs(Self.mp($1) - mp) }) { s.maxPhotoDimensions = d }
+      }
+      s.photoQualityPrioritization = maxQ ? .quality : .balanced
+      if self.output.supportedFlashModes.contains(fl.mode) { s.flashMode = fl.mode }
+      if let conn = self.output.connection(with: .video), conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
+      self.lock.lock(); self.pending[s.uniqueID] = (nil, nil, CACurrentMediaTime(), used, mp); self.lock.unlock()
+      if CowboyObjC.catching({ self.output.capturePhoto(with: s, delegate: self) }) != nil {
+        self.lock.lock(); self.pending[s.uniqueID] = nil; self.lock.unlock()
+        Diag.step("photo-fail", ["etapa": "capturePhoto", "formato": used.label])
+        self.publish { self.inFlight = max(0, self.inFlight - 1); self.status = "A foto falhou — tente de novo" }
+      }
+    }
+  }
+  func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+    publish { self.shutterBlink += 1 }
+  }
+  func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+    guard error == nil, let data = photo.fileDataRepresentation() else {
+      Diag.step("photo-fail", ["etapa": "processar", "erro": error?.localizedDescription ?? "sem dados"]); return
+    }
+    let id = photo.resolvedSettings.uniqueID
+    lock.lock()
+    if var p = pending[id] { if photo.isRawPhoto { p.raw = data } else { p.processed = data }; pending[id] = p }
+    lock.unlock()
+  }
+  func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
+    lock.lock(); let p = pending.removeValue(forKey: resolvedSettings.uniqueID); lock.unlock()
+    publish { self.inFlight = max(0, self.inFlight - 1) }
+    guard let p, p.processed != nil || p.raw != nil else { if error != nil { publish { self.status = "A foto falhou — tente de novo" } }; return }
+    let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss-SSS"; f.locale = Locale(identifier: "en_US_POSIX")
+    let id = "IMG-" + f.string(from: Date())
+    let dir = PhotoStore.dir
+    var main: URL?, raw: URL?
+    if let d = p.processed {
+      let u = dir.appendingPathComponent(id + (p.format == .jpeg || (p.format != .heif && p.format != .rawHeif) ? ".jpg" : ".heic"))
+      let isJPEG = d.starts(with: [0xFF, 0xD8])
+      let fixed = isJPEG ? u.deletingPathExtension().appendingPathExtension("jpg") : u.deletingPathExtension().appendingPathExtension("heic")
+      if (try? d.write(to: fixed)) != nil { main = fixed }
+    }
+    if let d = p.raw { let u = dir.appendingPathComponent(id + ".dng"); if (try? d.write(to: u)) != nil { raw = u } }
+    guard let m = main ?? raw else { publish { self.status = "Sem espaço pra salvar a foto" }; return }
+    let shot = PhotoShot(id: id, main: m, raw: main == nil ? nil : raw, date: Date())
+    let ms = Int((CACurrentMediaTime() - p.t0) * 1000), bytes = (p.processed?.count ?? 0) + (p.raw?.count ?? 0)
+    Diag.step("photo-shot", ["formato": p.format.label, "mp": p.mp, "ms": ms, "kb": bytes / 1024, "raw": raw != nil])
+    let thumb = PhotoStore.thumbnail(m, size: 160)
+    publish { self.lastShot = shot; self.lastThumb = thumb }
+    if saveToPhotos {
+      PhotoStore.saveToLibrary(main: m, raw: shot.raw) { ok, err in if !ok { Diag.step("photo-save-fail", ["erro": err ?? "?"]); self.publish { self.status = "Não salvou na Fototeca: \(err ?? "?")" } } }
+    }
+  }
+}
+
+// prévia da câmera de foto: a camada nativa do iPhone (tempo real, sem o atraso da Extrema — foto não precisa dela)
+struct PhotoPreview: UIViewRepresentable {
+  let camera: PhotoCamera
+  final class View: UIView {
+    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+    var preview: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+  }
+  func makeUIView(context: Context) -> View {
+    let v = View()
+    v.backgroundColor = .black
+    v.preview.session = camera.session
+    v.preview.videoGravity = .resizeAspect
+    camera.previewLayer = v.preview
+    return v
+  }
+  func updateUIView(_ uiView: View, context: Context) {}
+}

@@ -55,6 +55,7 @@ struct RecorderView: View {
   @State private var captureWarning = false
   @State private var settings = false
   @State private var arPresentation = false
+  @State private var photoMode = false   // área de fotografia (0.11.0): sessão própria, a de vídeo fecha antes
   @State private var panel: CameraTool?
   @State private var interfaceAngle: Double = 90
   @State private var pinchStart: Double?
@@ -163,6 +164,7 @@ struct RecorderView: View {
       if ok && !UserDefaults.standard.bool(forKey: "zoomcalib_075") { UserDefaults.standard.set(true, forKey: "zoomcalib_075"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
     }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
+    .fullScreenCover(isPresented: $photoMode, onDismiss: { camera.start() }) { PhotoCameraView { photoMode = false } }
     .task {
       Diag.install(); Diag.step("open")
       UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -189,7 +191,7 @@ struct RecorderView: View {
     }
     .onChange(of: phase) { _, value in
       if value == .background { camera.close(); CloudStream.shared.enterBackground(); MotionHub.shared.stop() }
-      else if value == .active && portal == nil && !arPresentation { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick() } }
+      else if value == .active && portal == nil && !arPresentation && !photoMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick() } }
     }
   }
 
@@ -219,6 +221,7 @@ struct RecorderView: View {
         fxPill.padding(.bottom, 2)   // efeitos e zoom (ícones) em destaque na prévia
         lensBar.padding(.bottom, 8)   // também gravando: tocar = zoom até a lente (0.8.1)
         if (!camera.recording && stream.pendingMB > 1) || (camera.recording && (stream.health == .offline || stream.health == .slow || stream.health == .error)) { uploadLine.padding(.bottom, 8) }
+        if !camera.recording && !camera.finishing { modeRow.padding(.bottom, 2) }
         bottomRow.padding(.bottom, 2)
       }
       .background(GeometryReader { g in Color.clear.preference(key: ControlsTopKey.self, value: g.frame(in: .global).minY) })
@@ -497,6 +500,15 @@ struct RecorderView: View {
   }
   // rodapé SEM fundo: só os três botões sobre a imagem. Área de toque (0.9.2): gravar = 150 pt de largura na faixa inteira,
   // PARAR (gravando) = 220 pt; galeria e câmera = 84 pt; o resto da faixa engole o toque (nunca vira foco/luz)
+  // VÍDEO | FOTO, como na câmera do iPhone (a foto abre a área de fotografia com sessão própria)
+  private var modeRow: some View {
+    HStack(spacing: 26) {
+      Text("VÍDEO").font(.system(size: 13, weight: .heavy)).foregroundStyle(gold)
+      Button { panel = nil; fxOpen = false; camera.close { Task { @MainActor in photoMode = true } } } label: {
+        Text("FOTO").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.85)).padding(.vertical, 6).padding(.horizontal, 8).contentShape(Rectangle())
+      }.buttonStyle(.plain).disabled(!camera.ready).accessibilityLabel("Modo foto")
+    }
+  }
   private var bottomRow: some View {
     HStack(spacing: 0) {
       Button { open(.library) } label: {
