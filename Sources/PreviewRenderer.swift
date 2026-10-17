@@ -51,6 +51,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // TROCA DE LENTE SEM PULO (0.8.0, ver LensSwitchHider): sensor de cada quadro nas duas saídas; a rápida mede a troca e
   // tela + arquivo se preparam antes de o quadro estabilizado da lente nova chegar
   let switchHider = LensSwitchHider()
+  // CHEGADA ASSENTADA (0.10.11, ver ArrivalAnchor): enquadramento da lente nova preso na chegada, deriva desfeita na tela e no
+  // arquivo, sobra solta só no próximo movimento
+  let arrival = ArrivalAnchor()
+  private var arrivalBusy = false
+  private let arrivalQueue = DispatchQueue(label: "cowboy.preview.arrival", qos: .userInitiated)
   var onSwitch: (([String: String]) -> Void)?
   private var lastFast: (buffer: CVPixelBuffer, id: Int, pts: Double)?
   private var lastStab: (buffer: CVPixelBuffer, id: Int)?
@@ -133,6 +138,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let options: [CIContextOption: Any] = [.workingColorSpace: NSNull(), .outputColorSpace: NSNull(), .cacheIntermediates: false]
     if let device { context = CIContext(mtlDevice: device, options: options) } else { context = CIContext(options: options) }
     super.init()
+    arrival.onDone = { [weak self] info in self?.onSwitch?(info) }
   }
   func push(_ buffer: CVPixelBuffer, pts: Double? = nil) {
     let sid = LensID.of(buffer)
@@ -145,6 +151,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let pts, let ps = prevStab, ps.id != sid, ps.id != 0, sid != 0, let ev = switchHider.awaiting(from: ps.id, to: sid, at: pts) {
       measureStabSwitch(ps.buffer, buffer, ev: ev)
     }
+    if let pts { arrivalFrame(buffer, pts: pts, sensor: sid, prev: prevStab?.id ?? 0) }
     lock.lock()
     if frozen { lock.unlock(); return }
     if dropFrames > 0 { dropFrames -= 1; lock.unlock(); return }
@@ -278,11 +285,25 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     onSwitch?(["etapa": "estabilizado", "de": "\(ev.from)", "para": "\(ev.to)", "previsto": ev.pred.map { Self.geoText($0) } ?? "nada",
       "medido": m.map { Self.geoText($0.g) + String(format: " conf %.2f", $0.conf) } ?? "não deu"])
   }
+  // chegada assentada: zoom do conteúdo parado = mede a deriva; zoom andando ou celular girando (giro médio do quadro) = solta
+  private func arrivalFrame(_ buffer: CVPixelBuffer, pts: Double, sensor: Int, prev: Int) {
+    let cz = abs(contentZoomSpeed(at: pts))
+    let turn = MotionHub.shared.rotation(around: pts, half: 0.12).map { ($0.x * $0.x + $0.y * $0.y + $0.z * $0.z).squareRoot() } ?? 0
+    guard arrival.frame(pts: pts, sensor: sensor, prev: prev, still: cz < 0.02, moving: cz > 0.05 || turn > 0.35) else { return }
+    lock.lock(); let busy = arrivalBusy; if !busy { arrivalBusy = true }; lock.unlock()
+    guard !busy else { return }
+    guard let t = ZoomImage.thumb(buffer) else { lock.lock(); arrivalBusy = false; lock.unlock(); return }   // ~0,5 ms; o quadro não fica preso
+    arrivalQueue.async {
+      self.arrival.measure(pts: pts, prepped: ZoomImage.prep(t))
+      self.lock.lock(); self.arrivalBusy = false; self.lock.unlock()
+    }
+  }
   static func geoText(_ g: SwitchGeometry) -> String { String(format: "%.4f %+.4f %+.4f", g.s, g.tx, g.ty) }
   // arquivo: a mesma troca medida que a tela usa (sem segurar quadro: no arquivo a ida-e-volta vira um respiro suave)
   func fileSwitchGeometry(_ pb: CVPixelBuffer?, pts: Double) -> SwitchGeometry {
     guard let pb else { return .identity }
-    let g = switchHider.geometry(pts: pts, sensor: LensID.of(pb), file: true).g
+    let sid = LensID.of(pb)
+    let g = SwitchPlan.compose(arrival.geometry(pts: pts, sensor: sid), switchHider.geometry(pts: pts, sensor: sid, file: true).g)
     let d = Float(max(1, digitalAt?(pts) ?? 1))
     return d > 1.0005 ? SwitchPlan.compose(SwitchGeometry(s: d, tx: 0, ty: 0, exact: true), g) : g
   }
@@ -405,7 +426,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; prevShown = nil; xfade = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; prevShown = nil; xfade = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; arrival.reset(); eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -483,7 +504,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
     var raw = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
-    if !sw.g.isIdentity { raw = Self.aligned(raw, sw.g) }   // no quadro do sensor (mesma conta do arquivo)
+    let geo = pts.map { SwitchPlan.compose(arrival.geometry(pts: $0, sensor: sid), sw.g) } ?? sw.g   // + chegada assentada (0.10.11)
+    if !geo.isIdentity { raw = Self.aligned(raw, geo) }   // no quadro do sensor (mesma conta do arquivo)
     var image = Self.orient(raw, orient, mirrored: mirror)
     // ampliação = zoom pedido agora ÷ zoom do conteúdo do quadro; nunca < 1 (zoom out: o quadro como está, sem borda inventada)
     // toque: a referência é o zoom do instante do toque (a tela não corre na frente do quadro); do toque em diante, k = 1
@@ -532,7 +554,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if a >= 1 || a < 0 { xfade = nil } else { image = x.image.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: image, kCIInputTimeKey: a * a * (3 - 2 * a)]) }
     }
     prevShown = (fresh, sid)
-    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(sw.g.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "", focus: focusProbe?() ?? "") }
+    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(geo.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "", focus: focusProbe?() ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)
