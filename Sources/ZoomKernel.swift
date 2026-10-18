@@ -714,13 +714,14 @@ final class ArrivalAnchor: @unchecked Sendable {
   // miniatura preparada (ZoomImage.prep) do quadro p; roda fora da fila dos quadros (≤1 em voo — o chamador garante)
   func measure(pts p: Double, prepped img: [Float]) {
     lock.lock()
-    guard releaseP == nil else { lock.unlock(); return }
+    // quadro de ANTES desta troca (medida que estava em voo quando a lente trocou) nunca vira referência nem medida da nova
+    guard releaseP == nil, sensor != 0, p >= switchP - 0.001 else { lock.unlock(); return }
     if ref == nil { ref = img; refP = p; measuring = true; samples.append((p, 1)); lastG = SwitchGeometry(exact: true); lock.unlock(); return }
     let r = ref!, around = lastG ?? SwitchGeometry(exact: true)
     lock.unlock()
     let m = ZoomImage.switchGeo(r, img, around: around)
     lock.lock(); defer { lock.unlock() }
-    guard releaseP == nil, ref != nil else { return }
+    guard releaseP == nil, ref != nil, p >= switchP - 0.001 else { return }
     stats.n += 1
     let med = Self.median(raw) ?? 1
     guard let g = m?.g, (m?.conf ?? 0) >= 0.05, abs(g.tx) <= Self.maxShift, abs(g.ty) <= Self.maxShift, abs(g.s / med - 1) <= Self.maxRawJump else { stats.bad += 1; return }
