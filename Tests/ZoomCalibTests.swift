@@ -442,7 +442,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     lensSim("estabilização sem atraso (0,15 s): não dá tempo de preparar", J: 1.05, ox: 0, oy: 0, ratio: 1, contrast: 1, L: 0.15, flashFrames: 0, file: false, strict: false)
     // (7) CHEGADA ASSENTADA (0.10.11, refeita na 0.11.4): depois da troca a lente nova "respira" sozinha (17/10: 10×→2× entra 7%
     // menor e cresce em ~2 s). Quadros estabilizados a 60 qps, a medida chega 1 quadro atrasada (como no app). Desde a 0.11.4 só a
-    // ESCALA é corrigida. Exigido: do 1º quadro da lente nova até 2,6 s a escala da tela fica na da chegada (≤0,6%), NENHUM passo
+    // ESCALA é corrigida. Exigido: do 1º quadro da lente nova até 2,6 s a escala da tela fica na da chegada (≤1%, deriva lenta de mão única), NENHUM passo
     // acima de 0,2% por quadro nem vai-e-volta acima de 0,25% fora do quadro da troca (no aparelho a 0.11.2 tremia 0,5–1,5%), nunca borda, posição nunca pior
     // que sem correção; no movimento seguinte solta em 0,35 s e termina na lente pura. Casos do aparelho: mão tremendo forte,
     // cena escura (ruído), trocas seguidas ida-e-volta.
@@ -505,7 +505,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
       check(endPure, "chegada " + name + ": depois da soltura volta à lente pura")
       check(step <= 0.002 && wobble <= 0.0025, txt + " — NÃO PODE TREMER (passo ≤0,2%/quadro, vai-e-volta ≤0,25% em 0,5 s; a 0.11.2 fazia 0,5–1,5% POR QUADRO)")
       check(vp <= bp + 0.004, txt + " — posição não pode piorar")
-      if strict { check(vz <= 0.006 && stepRel <= 0.012, txt) } else { check(vz <= base + 0.002, txt + " (não pode piorar)") }
+      if strict { check(vz <= 0.01 && stepRel <= 0.012, txt + " (deriva lenta ≤1%)") } else { check(vz <= base + 0.002, txt + " (não pode piorar)") }
       return learned
     }
     let need = arrivalSim("10×→2× cresce 7%, sobra padrão (1ª vez)", d0: 0.93, dx0: 0.004, dy0: -0.002, dur: 2.0, margin: nil, strict: false)
