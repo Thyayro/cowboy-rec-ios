@@ -443,7 +443,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     // (7) CHEGADA ASSENTADA (0.10.11, refeita na 0.11.4): depois da troca a lente nova "respira" sozinha (17/10: 10×→2× entra 7%
     // menor e cresce em ~2 s). Quadros estabilizados a 60 qps, a medida chega 1 quadro atrasada (como no app). Desde a 0.11.4 só a
     // ESCALA é corrigida. Exigido: do 1º quadro da lente nova até 2,6 s a escala da tela fica na da chegada (≤0,6%), NENHUM passo
-    // acima de 0,15% por quadro fora do quadro da troca (no aparelho a 0.11.2 tremia 0,5–1,5%), nunca borda, posição nunca pior
+    // acima de 0,2% por quadro nem vai-e-volta acima de 0,25% fora do quadro da troca (no aparelho a 0.11.2 tremia 0,5–1,5%), nunca borda, posição nunca pior
     // que sem correção; no movimento seguinte solta em 0,35 s e termina na lente pura. Casos do aparelho: mão tremendo forte,
     // cena escura (ruído), trocas seguidas ida-e-volta.
     ArrivalAnchor.on = true
@@ -482,19 +482,28 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
       guard let r0 = win.first else { check(false, name + ": sem quadros"); return 0 }
       var vz = 0.0, vp = 0.0, bp = 0.0, step = 0.0, stepRel = 0.0
       for s in win { vz = max(vz, abs(log(s.z / r0.z))) }
+      // vai-e-volta (o tremor de verdade): caminho percorrido menos o deslocamento líquido, em janelas de 0,5 s
+      var wobble = 0.0
       for k in 1..<shown.count where !shown[k].sw {
         let dzk = abs(log(shown[k].z / shown[k - 1].z))
         if shown[k].p < tm { step = max(step, dzk) } else { stepRel = max(stepRel, dzk) }
+      }
+      var i0 = 0
+      while i0 < shown.count {
+        var i1 = i0, path = 0.0
+        while i1 + 1 < shown.count && shown[i1 + 1].p < min(shown[i0].p + 0.5, tm) && !shown[i1 + 1].sw { path += abs(log(shown[i1 + 1].z / shown[i1].z)); i1 += 1 }
+        if i1 > i0 { wobble = max(wobble, path - abs(log(shown[i1].z / shown[i0].z))) }
+        i0 = i1 + 1
       }
       // posição: a correção não mexe mais nela — só confere que não piorou (mesma conta com e sem)
       for s in win { vp = max(vp, abs(s.x - r0.x) * s.z / 0.9, abs(s.y - r0.y) * s.z / 0.9) }
       bp = max(abs(dx0), abs(dy0)) * Z / 0.9 + shake * 40
       let base = abs(log(d0))
-      let txt = String(format: "chegada %@: tela variou %.2f%% de tamanho em 2,6 s (sem: %.2f%%), maior passo fora da troca %.3f%%, soltura %.2f%%/quadro, posição %.2f%%, aprendeu sobra %.4f",
-        name, vz * 100, base * 100, step * 100, stepRel * 100, vp * 100, learned)
+      let txt = String(format: "chegada %@: tela variou %.2f%% de tamanho em 2,6 s (sem: %.2f%%), maior passo fora da troca %.3f%%, vai-e-volta %.3f%%, soltura %.2f%%/quadro, posição %.2f%%, aprendeu sobra %.4f",
+        name, vz * 100, base * 100, step * 100, wobble * 100, stepRel * 100, vp * 100, learned)
       check(border < 1e-4, "chegada " + name + ": nunca mostra borda")
       check(endPure, "chegada " + name + ": depois da soltura volta à lente pura")
-      check(step <= 0.0015, txt + " — NÃO PODE TREMER (≤0,15%/quadro)")
+      check(step <= 0.002 && wobble <= 0.0025, txt + " — NÃO PODE TREMER (passo ≤0,2%/quadro, vai-e-volta ≤0,25% em 0,5 s; a 0.11.2 fazia 0,5–1,5% POR QUADRO)")
       check(vp <= bp + 0.004, txt + " — posição não pode piorar")
       if strict { check(vz <= 0.006 && stepRel <= 0.012, txt) } else { check(vz <= base + 0.002, txt + " (não pode piorar)") }
       return learned
