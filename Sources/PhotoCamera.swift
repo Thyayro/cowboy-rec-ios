@@ -65,6 +65,8 @@ struct PhotoShot: Identifiable, Hashable {
   let date: Date
   var edited: URL? { let u = PhotoStore.dir.appendingPathComponent(id + "-ed.heic"); return FileManager.default.fileExists(atPath: u.path) ? u : nil }
   var isRaw: Bool { main.pathExtension.lowercased() == "dng" }
+  // gerada pela IA (0.11.5): cada resultado vira um item da galeria do app na hora, salvo ou não na Fototeca
+  var isAI: Bool { id.contains("-ia-") }
   // fonte da edição: o RAW quando existe (latitude), senão o processado
   var source: URL { raw ?? main }
 }
@@ -128,6 +130,15 @@ enum PhotoStore {
         else { Diag.step("photo-delete", ["fotos": 0, "cancelado": true, "erro": err?.localizedDescription ?? ""]); main { done(0, "Cancelado — nada foi apagado") } }
       }
     }
+  }
+  // resultado da IA → `<foto>-ia-<hora>.heic` na pasta do app (fica como "temporária": só no app até o Salvar mandar pra Fototeca)
+  static func saveAI(_ data: Data, from id: String) -> PhotoShot? {
+    let rootID = id.components(separatedBy: "-ia-").first ?? id
+    let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss-SSS"; f.locale = Locale(identifier: "en_US_POSIX")
+    let newID = rootID + "-ia-" + f.string(from: Date())
+    let u = dir.appendingPathComponent(newID + ".heic")
+    guard (try? data.write(to: u, options: .atomic)) != nil else { return nil }
+    return PhotoShot(id: newID, main: u, raw: nil, date: Date())
   }
   static func aspect(_ id: String) -> PhotoAspect {
     (try? String(contentsOf: dir.appendingPathComponent(id + ".aspect"), encoding: .utf8)).flatMap { PhotoAspect(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? .full
@@ -211,7 +222,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   @Published var inFlight = 0
   @Published var countdown = 0
   @Published var shutterBlink = 0
-  @Published var lastShot: PhotoShot? = PhotoStore.all().first
+  @Published var lastShot: PhotoShot? = PhotoStore.all().first { !$0.isAI }
   @Published var lastThumb: UIImage?
 
   private func publish(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
@@ -405,7 +416,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   func cancelTimer() { countdown = 0 }
   // depois de apagar na galeria/revelação: miniatura do botão de fotos = a mais nova que sobrou
   func refreshLast() {
-    let s = PhotoStore.all().first
+    let s = PhotoStore.all().first { !$0.isAI }
     lastShot = s
     guard let s else { lastThumb = nil; return }
     DispatchQueue.global(qos: .utility).async { let t = PhotoStore.thumbnail(s.edited ?? s.main, size: 160); self.publish { if self.lastShot?.id == s.id { self.lastThumb = t } } }

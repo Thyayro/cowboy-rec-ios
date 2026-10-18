@@ -224,31 +224,21 @@ struct PhotoGalleryView: View {
     NavigationStack {
       ScrollView {
         if shots.isEmpty { Text("Nenhuma foto ainda.").foregroundStyle(.secondary).padding(.top, 60) }
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 3)], spacing: 3) {
-          ForEach(shots) { s in
-            let on = selected.contains(s.id)
-            Button { if selecting { toggle(s) } else { onPick(s) } } label: {
-              ZStack(alignment: .topTrailing) {
-                Color.white.opacity(0.06).aspectRatio(3 / 4, contentMode: .fit)
-                  .overlay { if let t = thumbs[s.id] { Image(uiImage: t).resizable().scaledToFill() } }.clipped()
-                  .overlay { if selecting && on { Color.black.opacity(0.35) } }
-                HStack(spacing: 3) {
-                  if s.edited != nil { Image(systemName: "wand.and.stars").font(.system(size: 9, weight: .bold)) }
-                  if s.raw != nil || s.isRaw { Text("RAW").font(.system(size: 8, weight: .heavy)) }
-                }.padding(3).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 3)).padding(4).foregroundStyle(.white)
-                if selecting {
-                  Image(systemName: on ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 24, weight: .semibold)).foregroundStyle(on ? gold : Color.white)
-                    .background(Circle().fill(on ? Color.black : Color.black.opacity(0.25)).padding(3))
-                    .shadow(radius: 2).padding(6).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                }
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 3)], spacing: 3, pinnedViews: [.sectionHeaders]) {
+          ForEach([false, true], id: \.self) { ai in
+            let list = shots.filter { $0.isAI == ai }
+            if !list.isEmpty {
+              Section {
+                ForEach(list) { s in cell(s) }
+              } header: {
+                HStack {
+                  Text(ai ? "Geradas pela IA" : "Fotos").font(.subheadline.bold())
+                  if ai { Text("ficam só no app até você Salvar").font(.caption).foregroundStyle(.secondary) }
+                  Spacer()
+                  if selecting && ai { Button("Marcar todas") { list.forEach { selected.insert($0.id) } }.font(.caption) }
+                }.padding(.horizontal, 10).padding(.vertical, 6).background(.black.opacity(0.85))
               }
-            }.buttonStyle(.plain)
-            .contextMenu {
-              Button("Apagar", systemImage: "trash", role: .destructive) { toDelete = [s] }
-              Button("Selecionar várias", systemImage: "checkmark.circle") { selecting = true; selected = [s.id] }
             }
-            .task { if thumbs[s.id] == nil { let u = s.edited ?? s.main; let t = await Task.detached { PhotoStore.thumbnail(u, size: 300) }.value; thumbs[s.id] = t } }
           }
         }
       }
@@ -282,6 +272,32 @@ struct PhotoGalleryView: View {
       })
     }.preferredColorScheme(.dark)
   }
+  @ViewBuilder private func cell(_ s: PhotoShot) -> some View {
+    let on = selected.contains(s.id)
+    Button { if selecting { toggle(s) } else { onPick(s) } } label: {
+      ZStack(alignment: .topTrailing) {
+        Color.white.opacity(0.06).aspectRatio(3 / 4, contentMode: .fit)
+          .overlay { if let t = thumbs[s.id] { Image(uiImage: t).resizable().scaledToFill() } }.clipped()
+          .overlay { if selecting && on { Color.black.opacity(0.35) } }
+        HStack(spacing: 3) {
+          if s.edited != nil { Image(systemName: "wand.and.stars").font(.system(size: 9, weight: .bold)) }
+          if s.raw != nil || s.isRaw { Text("RAW").font(.system(size: 8, weight: .heavy)) }
+          if s.isAI { Text("IA").font(.system(size: 8, weight: .heavy)) }
+        }.padding(3).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 3)).padding(4).foregroundStyle(.white)
+        if selecting {
+          Image(systemName: on ? "checkmark.circle.fill" : "circle")
+            .font(.system(size: 24, weight: .semibold)).foregroundStyle(on ? gold : Color.white)
+            .background(Circle().fill(on ? Color.black : Color.black.opacity(0.25)).padding(3))
+            .shadow(radius: 2).padding(6).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+        }
+      }
+    }.buttonStyle(.plain)
+    .contextMenu {
+      Button("Apagar", systemImage: "trash", role: .destructive) { toDelete = [s] }
+      Button("Selecionar várias", systemImage: "checkmark.circle") { selecting = true; selected = [s.id] }
+    }
+    .task { if thumbs[s.id] == nil { let u = s.edited ?? s.main; let t = await Task.detached { PhotoStore.thumbnail(u, size: 300) }.value; thumbs[s.id] = t } }
+  }
   private func toggle(_ s: PhotoShot) { if selected.contains(s.id) { selected.remove(s.id) } else { selected.insert(s.id) } }
   private func show(_ s: String) { withAnimation { note = s }; DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if note == s { withAnimation { note = nil } } } }
 }
@@ -297,9 +313,12 @@ final class PhotoEditModel: ObservableObject, @unchecked Sendable {
   @Published var busy: String?
   @Published var aiNote: String?
   @Published var canUndo = false
+  @Published var canRedo = false
+  @Published var aiSaved: PhotoShot?     // último resultado da IA já guardado na galeria do app
   private var proxy: CIImage?, small: CIImage?, proxyScale: CGFloat = 1
   private var aiBase: CIImage?          // resultado da IA (vira a nova base; resolução que a IA devolveu)
   private var undo: [(ai: CIImage?, adjust: PhotoAdjust)] = []
+  private var redo: [(ai: CIImage?, adjust: PhotoAdjust)] = []
   private var gen = 0
   private let queue = DispatchQueue(label: "cowboy.photo.dev", qos: .userInitiated)
   private func main(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
@@ -342,11 +361,22 @@ final class PhotoEditModel: ObservableObject, @unchecked Sendable {
     }
   }
   // antes de cada mudança "de verdade" (fim do arrasto, filtro, IA): guarda pra desfazer
-  func checkpoint() { undo.append((aiBase, adjust)); if undo.count > 30 { undo.removeFirst() }; canUndo = true }
+  // VOLTAR / AVANÇAR (0.11.5): toda mudança "de verdade" (IA, filtro, fim de arrasto) entra no histórico; voltar guarda o
+  // estado atual pro avançar, e uma mudança nova depois de voltar apaga o que dava pra avançar (como em todo editor).
+  func checkpoint() { undo.append((aiBase, adjust)); if undo.count > 30 { undo.removeFirst() }; redo.removeAll(); canUndo = true; canRedo = false }
   func undoLast() {
     guard let u = undo.popLast() else { return }
-    let changedBase = (u.ai == nil) != (aiBase == nil) || u.ai !== aiBase
-    aiBase = u.ai; adjust = u.adjust; canUndo = !undo.isEmpty
+    redo.append((aiBase, adjust))
+    go(u)
+  }
+  func redoNext() {
+    guard let r = redo.popLast() else { return }
+    undo.append((aiBase, adjust))
+    go(r)
+  }
+  private func go(_ st: (ai: CIImage?, adjust: PhotoAdjust)) {
+    let changedBase = (st.ai == nil) != (aiBase == nil) || st.ai !== aiBase
+    aiBase = st.ai; adjust = st.adjust; canUndo = !undo.isEmpty; canRedo = !redo.isEmpty
     if changedBase { render(); makeLookThumbs() }
   }
   func resetAll() { checkpoint(); aiBase = nil; adjust = PhotoAdjust(); render(); makeLookThumbs() }
@@ -370,7 +400,12 @@ final class PhotoEditModel: ObservableObject, @unchecked Sendable {
           self.adjust = PhotoAdjust()   // os ajustes já foram junto na foto enviada
           self.busy = nil
           let engineName = r.engine == "gratis" ? "pool grátis (\(r.model))" : r.engine == "openai" ? "OpenAI (\(r.model))" : r.model
-          self.aiNote = String(format: "Feito por %@ em %.0f s · %d×%d px", engineName, Date().timeIntervalSince(t0), Int(fitted.extent.width), Int(fitted.extent.height))
+          self.aiNote = String(format: "Feito por %@ em %.0f s · %d×%d px · guardada na galeria do app", engineName, Date().timeIntervalSince(t0), Int(fitted.extent.width), Int(fitted.extent.height))
+          let sid = self.shot.id
+          self.queue.async {
+            guard let d = self.dev.heif(fitted), let saved = PhotoStore.saveAI(d, from: sid) else { Diag.step("photo-ai-save-fail", [:]); return }
+            self.main { self.aiSaved = saved }
+          }
           Diag.step("photo-ai", ["ok": true, "motor": r.engine, "modelo": r.model, "s": Int(Date().timeIntervalSince(t0)), "tentativas": r.tried.count])
           self.render(); self.makeLookThumbs()
         } catch {
@@ -410,6 +445,7 @@ struct PhotoEditorView: View {
   @State private var group = "Luz"
   @FocusState private var promptFocused: Bool
   @State private var toDelete: [PhotoShot]?
+  @State private var aiDelete: [PhotoShot]?
   init(shot: PhotoShot) { _model = StateObject(wrappedValue: PhotoEditModel(shot: shot)) }
 
   var body: some View {
@@ -435,6 +471,8 @@ struct PhotoEditorView: View {
     .background(Color.black.ignoresSafeArea())
     .preferredColorScheme(.dark).tint(gold)
     .modifier(PhotoDeleteConfirm(target: $toDelete) { n, msg in if n > 0 { dismiss() } else if let msg { flash(msg) } })
+    // apagar a imagem que a IA gerou (da galeria do app; se já foi salva, também pode sair da Fototeca) — a edição na tela continua
+    .modifier(PhotoDeleteConfirm(target: $aiDelete) { n, msg in if n > 0 { model.aiSaved = nil; flash(msg ?? "Imagem da IA apagada") } else if let msg { flash(msg) } })
   }
 
   private var header: some View {
@@ -442,7 +480,8 @@ struct PhotoEditorView: View {
       Button("Fechar") { dismiss() }
       Button { toDelete = [model.shot] } label: { Image(systemName: "trash") }.disabled(model.busy != nil).accessibilityLabel("Apagar esta foto")
       Spacer()
-      Button { model.undoLast() } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!model.canUndo).accessibilityLabel("Desfazer")
+      Button { model.undoLast() } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!model.canUndo || model.busy != nil).accessibilityLabel("Voltar")
+      Button { model.redoNext() } label: { Image(systemName: "arrow.uturn.forward") }.disabled(!model.canRedo || model.busy != nil).accessibilityLabel("Avançar")
       Button { model.resetAll() } label: { Image(systemName: "arrow.counterclockwise.circle") }.accessibilityLabel("Voltar ao original")
       Button { model.export { msg in flash(msg) } } label: { Text("Salvar").bold() }.buttonStyle(.borderedProminent).disabled(model.busy != nil)
     }.padding(.horizontal, 14).padding(.vertical, 10)
@@ -506,6 +545,14 @@ struct PhotoEditorView: View {
           .buttonStyle(.plain).disabled(prompt.trimmingCharacters(in: .whitespaces).isEmpty || model.busy != nil).accessibilityLabel("Editar com IA")
       }
       Picker("Motor", selection: $engine) { ForEach(PhotoAI.Engine.allCases) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
+      HStack(spacing: 10) {
+        Button { model.undoLast() } label: { Label("Voltar", systemImage: "chevron.backward") }.disabled(!model.canUndo || model.busy != nil)
+        Button { model.redoNext() } label: { Label("Avançar", systemImage: "chevron.forward") }.disabled(!model.canRedo || model.busy != nil)
+        Spacer()
+        if let g = model.aiSaved {
+          Button(role: .destructive) { aiDelete = [g] } label: { Label("Apagar a gerada", systemImage: "trash") }.disabled(model.busy != nil)
+        }
+      }.font(.footnote).buttonStyle(.bordered)
       if let n = model.aiNote { Text(n).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
       else { Text("Grátis primeiro: tenta o Nano Banana (Gemini) nas chaves grátis e, sem cota, usa a OpenAI (gpt-image-1.5). A IA devolve até ~1,5 MP; os ajustes e filtros continuam valendo por cima.").font(.caption).foregroundStyle(.secondary) }
     }.padding(.horizontal, 14).padding(.top, 4)
