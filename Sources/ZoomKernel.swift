@@ -651,8 +651,8 @@ final class LensSwitchHider: @unchecked Sendable {
 // 0.11.4 — o que a 0.10.11 errou no aparelho (18/10, trechos 0.11.2: 38 saltos de 0,5–1,5% por quadro = "tremendo"):
 //  1. corrigia também o DESLOCAMENTO: isso é mão + Extrema, não respiração; a medida de posição se perdia (13–15% do quadro)
 //     e arrastava a escala junto. Agora só ESCALA; posição medida serve só pra descartar medida ruim (>4% = outra cena).
-//  2. aplicava a medida crua de cada quadro: o ruído virava tremor. Agora mediana das 5 últimas → limite de 0,12% por medida
-//     (a respiração real anda ~0,06%/quadro) → a tela nunca anda mais que isso fora da troca.
+//  2. aplicava a medida crua de cada quadro: o ruído virava tremor. Agora mediana das 5 últimas → limite de 0,18% por medida
+//     (a respiração real anda 0,06–0,14%/quadro) → a tela nunca anda mais que isso fora da troca.
 //  3. a sobra (pra desfazer imagem que CRESCE) subia em 0,15 s DEPOIS da troca = pulso visível nas trocas seguidas. Agora entra
 //     num degrau só NO quadro da troca (o pulo da lente + o dissolve escondem). Sobra aprendida só da escala (0–8%, chave nova).
 // O que sobra no fim só sai no PRÓXIMO MOVIMENTO (zoom ou giro do celular), onde não se vê. Nunca borda.
@@ -662,7 +662,7 @@ final class ArrivalAnchor: @unchecked Sendable {
   static let releaseDur = 0.35     // s: soltar no movimento seguinte
   static let maxScale: Float = 1.12
   static let defaultMargin: Float = 1.03
-  static let maxStep: Float = 0.0012   // o que a escala aplicada pode andar por medida (fora da troca)
+  static let maxStep: Float = 0.0018   // o que a escala aplicada pode andar por medida (fora da troca)
   static let maxRawJump: Float = 0.02  // medida crua que pula mais que isso da mediana = descartada
   static let maxShift: Float = 0.04    // deslocamento medido acima disso = a medida pegou outra coisa
   private let lock = NSLock()
