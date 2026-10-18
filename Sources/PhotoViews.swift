@@ -56,6 +56,7 @@ struct PhotoCameraView: View {
             Path { pth in pth.addRect(r); pth.addRect(a) }.fill(Color.black.opacity(0.62), style: FillStyle(eoFill: true)).allowsHitTesting(false)
             Rectangle().stroke(.white.opacity(0.35), lineWidth: 0.5).frame(width: a.width, height: a.height).position(x: a.midX, y: a.midY).allowsHitTesting(false)
           }
+          if cam.switching { Color.black.opacity(0.85).frame(width: r.width, height: r.height).position(x: r.midX, y: r.midY).allowsHitTesting(false).transition(.opacity) }
           if blink { Color.black.frame(width: r.width, height: r.height).position(x: r.midX, y: r.midY).allowsHitTesting(false) }
           if cam.countdown > 0 {
             Text("\(cam.countdown)").font(.system(size: 120, weight: .thin)).foregroundStyle(.white).shadow(radius: 6).position(x: r.midX, y: r.midY).allowsHitTesting(false)
@@ -79,10 +80,10 @@ struct PhotoCameraView: View {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { withAnimation(.easeOut(duration: 0.18)) { blink = false } }
       UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
-    .sheet(isPresented: $gallery) {
+    .sheet(isPresented: $gallery, onDismiss: { cam.refreshLast() }) {
       PhotoGalleryView { shot in gallery = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { editShot = shot } }
     }
-    .fullScreenCover(item: $editShot) { PhotoEditorView(shot: $0) }
+    .fullScreenCover(item: $editShot, onDismiss: { cam.refreshLast() }) { PhotoEditorView(shot: $0) }
   }
 
   // em pé: quadro 3:4 logo abaixo da faixa de cima (como a câmera do iPhone)
@@ -109,11 +110,13 @@ struct PhotoCameraView: View {
         Picker("Resolução", selection: $cam.megapixels) { ForEach(cam.mpOptions, id: \.self) { Text("\($0) MP").tag($0) } }
         Toggle("Qualidade máxima (fusão de quadros)", isOn: $cam.maxQuality)
         Toggle("Salvar na Fototeca", isOn: $cam.saveToPhotos)
+        if cam.position == .front { Toggle("Espelhar a frontal (igual à prévia)", isOn: $cam.mirrorFront) }
       } label: {
         HStack(spacing: 4) {
-          Text(cam.format.label).font(.system(size: 12, weight: .heavy))
+          Text(cam.effectiveFormat.label).font(.system(size: 12, weight: .heavy))
           Text("\(cam.megapixels) MP").font(.system(size: 12, weight: .semibold)).opacity(0.85)
-          if cam.format.needsRaw { Text("RAW").font(.system(size: 9, weight: .heavy)).padding(.horizontal, 4).padding(.vertical, 1).background(Color.purple, in: RoundedRectangle(cornerRadius: 3)) }
+          if !cam.maxQuality { Image(systemName: "hare.fill").font(.system(size: 10, weight: .bold)) }
+          if cam.effectiveFormat.needsRaw { Text("RAW").font(.system(size: 9, weight: .heavy)).padding(.horizontal, 4).padding(.vertical, 1).background(Color.purple, in: RoundedRectangle(cornerRadius: 3)) }
           else { Text("HDR").font(.system(size: 9, weight: .heavy)).padding(.horizontal, 4).padding(.vertical, 1).background(Color.orange, in: RoundedRectangle(cornerRadius: 3)) }
           Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).opacity(0.7)
         }.foregroundStyle(.white).padding(.horizontal, 10).padding(.vertical, 7).background(.white.opacity(0.12), in: Capsule())
@@ -128,7 +131,9 @@ struct PhotoCameraView: View {
         Button { cam.setBias(0) } label: { Text(String(format: "%+.1f EV", cam.exposureBias)).font(.system(size: 12, weight: .bold, design: .monospaced)).padding(.horizontal, 8).padding(.vertical, 6).background(gold, in: Capsule()).foregroundStyle(.black) }.buttonStyle(.plain)
       }
       circle(cam.timer == 0 ? "timer" : cam.timer == 3 ? "3.circle" : "10.circle", cam.timer > 0) { cam.timer = cam.timer == 0 ? 3 : cam.timer == 3 ? 10 : 0 }.accessibilityLabel("Temporizador")
-      circle(cam.maxQuality ? "sparkles" : "hare.fill", cam.maxQuality) { cam.maxQuality.toggle() }.accessibilityLabel(cam.maxQuality ? "Qualidade máxima" : "Disparo rápido")
+      // 0.11.5: o canto de baixo virou o "virar câmera" (como no iPhone); revelar a última foto sobe pra cá.
+      // Qualidade máxima × disparo rápido continua no menu (a lebre no rótulo = disparo rápido ligado).
+      circle("camera.filters", false) { if let s = cam.lastShot { editShot = s } }.disabled(cam.lastShot == nil).opacity(cam.lastShot == nil ? 0.4 : 1).accessibilityLabel("Revelar a última foto")
     }
     .padding(.horizontal, 12).padding(.top, 6).frame(height: 54)
   }
@@ -177,14 +182,32 @@ struct PhotoCameraView: View {
           Circle().fill(.white).frame(width: 64, height: 64).scaleEffect(cam.inFlight > 0 ? 0.88 : 1)
           if cam.countdown > 0 { Image(systemName: "xmark").font(.system(size: 22, weight: .bold)).foregroundStyle(.black) }
         }.frame(width: 150, height: 100).contentShape(Rectangle()).animation(.easeOut(duration: 0.12), value: cam.inFlight)
-      }.buttonStyle(.plain).disabled(!cam.ready).accessibilityLabel("Fotografar")
+      }.buttonStyle(.plain).disabled(!cam.ready || cam.switching).accessibilityLabel("Fotografar")
       Spacer(minLength: 0)
-      Button { if let s = cam.lastShot { editShot = s } } label: {
-        Image(systemName: "camera.filters").font(.system(size: 20, weight: .semibold)).frame(width: 50, height: 50)
-          .background(.white.opacity(0.12), in: Circle()).foregroundStyle(cam.lastShot == nil ? .gray : .white)
+      Button { withAnimation(.easeOut(duration: 0.15)) { cam.flip() } } label: {
+        Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 20, weight: .semibold)).frame(width: 50, height: 50)
+          .background(cam.position == .front ? gold : .white.opacity(0.12), in: Circle()).foregroundStyle(cam.position == .front ? .black : .white)
+          .rotationEffect(.degrees(cam.position == .front ? 180 : 0))
           .frame(width: 84, height: 100).contentShape(Rectangle())
-      }.buttonStyle(.plain).disabled(cam.lastShot == nil).accessibilityLabel("Revelar a última foto")
+      }.buttonStyle(.plain).disabled(!cam.ready || cam.switching || cam.countdown > 0).accessibilityLabel(cam.position == .front ? "Usar a câmera traseira" : "Usar a câmera frontal")
     }.padding(.horizontal, 10).frame(height: 100).contentShape(Rectangle()).onTapGesture {}
+  }
+}
+
+// APAGAR (0.11.5): segurar a foto → Apagar; "Selecionar" → marca várias (ou Tudo) → Apagar. Pergunta sempre se sai só do
+// app ou do app E da Fototeca (o iOS confirma de novo e guarda 30 dias em Apagados Recentemente).
+struct PhotoDeleteConfirm: ViewModifier {
+  @Binding var target: [PhotoShot]?
+  let done: (Int, String?) -> Void
+  func body(content: Content) -> some View {
+    let n = target?.count ?? 0
+    content.confirmationDialog(n == 1 ? "Apagar esta foto?" : "Apagar \(n) fotos?", isPresented: Binding(get: { target != nil }, set: { if !$0 { target = nil } }), titleVisibility: .visible) {
+      if let t = target {
+        Button("Apagar do app e da Fototeca", role: .destructive) { target = nil; PhotoStore.delete(t, fromLibrary: true, done: done) }
+        Button("Apagar só do app", role: .destructive) { target = nil; PhotoStore.delete(t, fromLibrary: false, done: done) }
+      }
+      Button("Cancelar", role: .cancel) { target = nil }
+    } message: { Text("Na Fototeca a foto vai pra Apagados Recentemente (dá pra recuperar por 30 dias). No app não tem volta.") }
   }
 }
 
@@ -192,6 +215,10 @@ struct PhotoGalleryView: View {
   let onPick: (PhotoShot) -> Void
   @State private var shots = PhotoStore.all()
   @State private var thumbs: [String: UIImage] = [:]
+  @State private var selecting = false
+  @State private var selected: Set<String> = []
+  @State private var toDelete: [PhotoShot]?
+  @State private var note: String?
   @Environment(\.dismiss) private var dismiss
   var body: some View {
     NavigationStack {
@@ -199,25 +226,64 @@ struct PhotoGalleryView: View {
         if shots.isEmpty { Text("Nenhuma foto ainda.").foregroundStyle(.secondary).padding(.top, 60) }
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 3)], spacing: 3) {
           ForEach(shots) { s in
-            Button { onPick(s) } label: {
+            let on = selected.contains(s.id)
+            Button { if selecting { toggle(s) } else { onPick(s) } } label: {
               ZStack(alignment: .topTrailing) {
                 Color.white.opacity(0.06).aspectRatio(3 / 4, contentMode: .fit)
                   .overlay { if let t = thumbs[s.id] { Image(uiImage: t).resizable().scaledToFill() } }.clipped()
+                  .overlay { if selecting && on { Color.black.opacity(0.35) } }
                 HStack(spacing: 3) {
                   if s.edited != nil { Image(systemName: "wand.and.stars").font(.system(size: 9, weight: .bold)) }
                   if s.raw != nil || s.isRaw { Text("RAW").font(.system(size: 8, weight: .heavy)) }
                 }.padding(3).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 3)).padding(4).foregroundStyle(.white)
+                if selecting {
+                  Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 24, weight: .semibold)).foregroundStyle(on ? gold : Color.white)
+                    .background(Circle().fill(on ? Color.black : Color.black.opacity(0.25)).padding(3))
+                    .shadow(radius: 2).padding(6).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                }
               }
             }.buttonStyle(.plain)
-            .contextMenu { Button("Apagar do app (a Fototeca não muda)", role: .destructive) { PhotoStore.delete(s); shots = PhotoStore.all() } }
+            .contextMenu {
+              Button("Apagar", systemImage: "trash", role: .destructive) { toDelete = [s] }
+              Button("Selecionar várias", systemImage: "checkmark.circle") { selecting = true; selected = [s.id] }
+            }
             .task { if thumbs[s.id] == nil { let u = s.edited ?? s.main; let t = await Task.detached { PhotoStore.thumbnail(u, size: 300) }.value; thumbs[s.id] = t } }
           }
         }
       }
-      .navigationTitle("Fotos").navigationBarTitleDisplayMode(.inline)
-      .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Fechar") { dismiss() } } }
+      .safeAreaInset(edge: .bottom) {
+        if selecting {
+          HStack {
+            Button(selected.count == shots.count && !shots.isEmpty ? "Nenhuma" : "Tudo") { selected = selected.count == shots.count ? [] : Set(shots.map(\.id)) }
+            Spacer()
+            Text(selected.isEmpty ? "Toque nas fotos" : "\(selected.count) selecionada" + (selected.count == 1 ? "" : "s")).font(.footnote).foregroundStyle(.secondary)
+            Spacer()
+            Button(role: .destructive) { toDelete = shots.filter { selected.contains($0.id) } } label: { Label("Apagar", systemImage: "trash").bold() }
+              .disabled(selected.isEmpty).tint(.red)
+          }.padding(.horizontal, 18).padding(.vertical, 12).background(.bar)
+        }
+      }
+      .overlay(alignment: .bottom) {
+        if let note { Text(note).font(.footnote).padding(10).background(.black.opacity(0.85), in: Capsule()).padding(.bottom, selecting ? 70 : 20).transition(.opacity) }
+      }
+      .navigationTitle(selecting ? "Selecionar" : "Fotos").navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          if !shots.isEmpty || selecting { Button(selecting ? "Cancelar" : "Selecionar") { selecting.toggle(); selected = [] } }
+        }
+        ToolbarItem(placement: .topBarTrailing) { Button("Fechar") { dismiss() } }
+      }
+      .modifier(PhotoDeleteConfirm(target: $toDelete) { n, msg in
+        shots = PhotoStore.all()
+        selected = selected.filter { id in shots.contains { $0.id == id } }
+        if n > 0 { selecting = false; selected = [] }
+        show(msg ?? (n == 1 ? "Foto apagada" : "\(n) fotos apagadas"))
+      })
     }.preferredColorScheme(.dark)
   }
+  private func toggle(_ s: PhotoShot) { if selected.contains(s.id) { selected.remove(s.id) } else { selected.insert(s.id) } }
+  private func show(_ s: String) { withAnimation { note = s }; DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if note == s { withAnimation { note = nil } } } }
 }
 
 // estado da revelação (fila própria; a prévia é uma cópia de até 1600 px, a exportação usa a resolução cheia)
@@ -328,7 +394,7 @@ final class PhotoEditModel: ObservableObject, @unchecked Sendable {
       let url = PhotoStore.dir.appendingPathComponent(self.shot.id + "-ed.heic")
       do { try data.write(to: url, options: .atomic) } catch { self.main { self.busy = nil; done("Sem espaço: \(error.localizedDescription)") }; return }
       Diag.step("photo-export", ["px": "\(Int(out.extent.width))x\(Int(out.extent.height))", "kb": data.count / 1024, "ms": Int((CACurrentMediaTime() - t0) * 1000), "ia": ai != nil, "filtro": a.look])
-      PhotoStore.saveToLibrary(main: url, raw: nil) { ok, err in self.main { self.busy = nil; done(ok ? "Salva na Fototeca" : "Ficou no app; Fototeca: \(err ?? "?")") } }
+      PhotoStore.saveToLibrary(main: url, raw: nil, shotID: self.shot.id) { ok, err in self.main { self.busy = nil; done(ok ? "Salva na Fototeca" : "Ficou no app; Fototeca: \(err ?? "?")") } }
     }
   }
 }
@@ -343,6 +409,7 @@ struct PhotoEditorView: View {
   @State private var toast: String?
   @State private var group = "Luz"
   @FocusState private var promptFocused: Bool
+  @State private var toDelete: [PhotoShot]?
   init(shot: PhotoShot) { _model = StateObject(wrappedValue: PhotoEditModel(shot: shot)) }
 
   var body: some View {
@@ -367,11 +434,13 @@ struct PhotoEditorView: View {
     }
     .background(Color.black.ignoresSafeArea())
     .preferredColorScheme(.dark).tint(gold)
+    .modifier(PhotoDeleteConfirm(target: $toDelete) { n, msg in if n > 0 { dismiss() } else if let msg { flash(msg) } })
   }
 
   private var header: some View {
     HStack(spacing: 14) {
       Button("Fechar") { dismiss() }
+      Button { toDelete = [model.shot] } label: { Image(systemName: "trash") }.disabled(model.busy != nil).accessibilityLabel("Apagar esta foto")
       Spacer()
       Button { model.undoLast() } label: { Image(systemName: "arrow.uturn.backward") }.disabled(!model.canUndo).accessibilityLabel("Desfazer")
       Button { model.resetAll() } label: { Image(systemName: "arrow.counterclockwise.circle") }.accessibilityLabel("Voltar ao original")

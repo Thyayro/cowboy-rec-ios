@@ -20,6 +20,10 @@ enum PhotoFormat: String, CaseIterable, Identifiable {
   }
   var needsRaw: Bool { self == .raw || self == .rawHeif }
 }
+extension PhotoCamera {
+  // o que o disparo realmente grava neste lado (ProRAW escolhido na traseira vira HEIF na frontal sem RAW)
+  var effectiveFormat: PhotoFormat { format.needsRaw && !rawSupported ? .heif : format }
+}
 enum PhotoFlash: Int, CaseIterable { case off, auto, on
   var icon: String { self == .off ? "bolt.slash" : self == .auto ? "bolt.badge.automatic" : "bolt.fill" }
   var mode: AVCaptureDevice.FlashMode { self == .off ? .off : self == .auto ? .auto : .on }
@@ -88,8 +92,42 @@ enum PhotoStore {
       return PhotoShot(id: id, main: m, raw: e.main == nil ? nil : e.raw, date: e.date)
     }.sorted { $0.date > $1.date }
   }
-  static func delete(_ s: PhotoShot) {
-    for u in [s.main, s.raw, s.edited, dir.appendingPathComponent(s.id + ".aspect")].compactMap({ $0 }) { try? FileManager.default.removeItem(at: u) }
+  private static func removeFiles(_ s: PhotoShot) {
+    for u in [s.main, s.raw, s.edited, dir.appendingPathComponent(s.id + ".aspect"), dir.appendingPathComponent(s.id + ".assets")].compactMap({ $0 }) { try? FileManager.default.removeItem(at: u) }
+  }
+  // APAGAR (0.11.5): cada foto que o app põe na Fototeca guarda o identificador do item em `<id>.assets` (original e a
+  // revelada). Apagar "do app e da Fototeca" pede leitura+escrita da Fototeca e o iOS mostra a confirmação dele; lá o item
+  // vai pra "Apagados Recentemente" (30 dias). Cancelou a confirmação do iOS = nada sai, nem do app.
+  // Fotos de antes da 0.11.5 não têm o identificador: saem só do app.
+  static func libraryIDs(_ id: String) -> [String] {
+    ((try? String(contentsOf: dir.appendingPathComponent(id + ".assets"), encoding: .utf8)) ?? "")
+      .split(whereSeparator: \.isNewline).map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+  }
+  private static func remember(_ localID: String, for id: String) {
+    let ids = libraryIDs(id) + [localID]
+    try? ids.joined(separator: "\n").write(to: dir.appendingPathComponent(id + ".assets"), atomically: true, encoding: .utf8)
+  }
+  // done(quantas saíram do app, aviso) — sempre na main
+  static func delete(_ shots: [PhotoShot], fromLibrary: Bool, done: @escaping (Int, String?) -> Void) {
+    let main: (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) }
+    let ids = fromLibrary ? shots.flatMap { libraryIDs($0.id) } : []
+    let semID = shots.filter { libraryIDs($0.id).isEmpty }.count
+    func local(_ note: String?) {
+      shots.forEach(removeFiles)
+      Diag.step("photo-delete", ["fotos": shots.count, "fototeca": fromLibrary, "itens_fototeca": ids.count, "aviso": note ?? ""])
+      main { done(shots.count, note) }
+    }
+    let oldNote: String? = fromLibrary && semID > 0 ? (semID == 1 ? "1 foto antiga só saiu do app (apague na Fototeca)" : "\(semID) fotos antigas só saíram do app (apague na Fototeca)") : nil
+    guard !ids.isEmpty else { local(oldNote); return }
+    PHPhotoLibrary.requestAuthorization(for: .readWrite) { st in
+      guard st == .authorized || st == .limited else { local("Saiu do app; sem permissão pra apagar na Fototeca"); return }
+      let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+      guard assets.count > 0 else { local(oldNote); return }
+      PHPhotoLibrary.shared().performChanges({ PHAssetChangeRequest.deleteAssets(assets) }) { ok, err in
+        if ok { local(oldNote) }
+        else { Diag.step("photo-delete", ["fotos": 0, "cancelado": true, "erro": err?.localizedDescription ?? ""]); main { done(0, "Cancelado — nada foi apagado") } }
+      }
+    }
   }
   static func aspect(_ id: String) -> PhotoAspect {
     (try? String(contentsOf: dir.appendingPathComponent(id + ".aspect"), encoding: .utf8)).flatMap { PhotoAspect(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? .full
@@ -115,14 +153,20 @@ enum PhotoStore {
     return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary).map { UIImage(cgImage: $0) }
   }
   // Fototeca (só adicionar): principal + RAW como item único (o app Fotos mostra o processado e guarda o DNG junto)
-  static func saveToLibrary(main: URL, raw: URL?, done: @escaping (Bool, String?) -> Void) {
+  private final class IDBox: @unchecked Sendable { var value: String? }
+  static func saveToLibrary(main: URL, raw: URL?, shotID: String, done: @escaping (Bool, String?) -> Void) {
     PHPhotoLibrary.requestAuthorization(for: .addOnly) { st in
       guard st == .authorized || st == .limited else { done(false, "sem permissão da Fototeca"); return }
+      let box = IDBox()
       PHPhotoLibrary.shared().performChanges({
         let r = PHAssetCreationRequest.forAsset()
         r.addResource(with: .photo, fileURL: main, options: nil)
         if let raw, raw != main { r.addResource(with: .alternatePhoto, fileURL: raw, options: nil) }
-      }) { ok, err in done(ok, err?.localizedDescription) }
+        box.value = r.placeholderForCreatedAsset?.localIdentifier
+      }) { ok, err in
+        if ok, let lid = box.value { remember(lid, for: shotID) }
+        done(ok, err?.localizedDescription)
+      }
     }
   }
 }
@@ -142,7 +186,13 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   @Published var ready = false
   @Published var status = "Abrindo a câmera de foto…"
   @Published var format: PhotoFormat = PhotoFormat(rawValue: UserDefaults.standard.string(forKey: "photoFormat") ?? "") ?? .heif { didSet { UserDefaults.standard.set(format.rawValue, forKey: "photoFormat"); queue.async { self.applyRaw() } } }
-  @Published var megapixels: Int = UserDefaults.standard.object(forKey: "photoMP") as? Int ?? 24 { didSet { UserDefaults.standard.set(megapixels, forKey: "photoMP") } }
+  // FRONTAL (0.11.5): a escolha frontal/traseira fica salva; resolução guardada POR LADO (a frontal só tem 12 MP na
+  // maioria dos aparelhos e não pode apagar os 24/48 MP escolhidos na traseira). Padrão da frontal = a MAIOR resolução.
+  @Published var position: AVCaptureDevice.Position = UserDefaults.standard.bool(forKey: "photoFront") ? .front : .back { didSet { UserDefaults.standard.set(position == .front, forKey: "photoFront") } }
+  @Published var switching = false
+  @Published var mirrorFront: Bool = UserDefaults.standard.bool(forKey: "photoMirrorFront") { didSet { UserDefaults.standard.set(mirrorFront, forKey: "photoMirrorFront") } }
+  private static func mpKey(_ p: AVCaptureDevice.Position) -> String { p == .front ? "photoMPFront" : "photoMP" }
+  @Published var megapixels: Int = UserDefaults.standard.object(forKey: PhotoCamera.mpKey(UserDefaults.standard.bool(forKey: "photoFront") ? .front : .back)) as? Int ?? 24 { didSet { UserDefaults.standard.set(megapixels, forKey: Self.mpKey(position)) } }
   @Published var mpOptions: [Int] = [12]
   @Published var rawSupported = false
   @Published var flash: PhotoFlash = PhotoFlash(rawValue: UserDefaults.standard.integer(forKey: "photoFlash")) ?? .off { didSet { UserDefaults.standard.set(flash.rawValue, forKey: "photoFlash") } }
@@ -167,10 +217,11 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   private func publish(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
 
   func start() {
+    let want = position
     Task {
       guard await AVCaptureDevice.requestAccess(for: .video) else { publish { self.status = "Libere a câmera nos Ajustes do iPhone" }; return }
       queue.async {
-        self.configure()
+        self.configure(want)
         if !self.session.isRunning { self.session.startRunning() }
         let ok = self.session.isRunning
         self.publish { self.ready = ok; self.status = ok ? "" : "Câmera de foto indisponível" }
@@ -185,22 +236,45 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     }
   }
 
-  private func configure() {
+  private func configure(_ want: AVCaptureDevice.Position) {
     guard session.inputs.isEmpty else { return }
+    if !useCamera(want) && want == .front { _ = useCamera(.back) }   // frontal indisponível: abre a traseira
+  }
+  // vira a câmera (frontal ↔ traseira) na MESMA sessão: troca só a entrada, a saída de foto fica
+  func flip() {
+    guard ready, !switching, countdown == 0, inFlight == 0 else { return }
+    let to: AVCaptureDevice.Position = position == .back ? .front : .back
+    switching = true
+    queue.async {
+      let ok = self.useCamera(to)
+      self.publish { self.switching = false; if !ok { self.status = to == .front ? "Câmera frontal indisponível" : "Câmera traseira indisponível" } }
+    }
+  }
+  @discardableResult private func useCamera(_ pos: AVCaptureDevice.Position) -> Bool {
+    let types: [AVCaptureDevice.DeviceType] = pos == .front
+      ? [.builtInTrueDepthCamera, .builtInWideAngleCamera]
+      : [.builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera, .builtInWideAngleCamera]
+    guard let cam = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: pos).devices.first,
+          let input = try? AVCaptureDeviceInput(device: cam) else {
+      publish { self.status = pos == .front ? "Não deu pra abrir a câmera frontal" : "Não deu pra abrir a câmera traseira" }; return false
+    }
     session.beginConfiguration()
-    defer { session.commitConfiguration() }
-    session.sessionPreset = .photo
-    let types: [AVCaptureDevice.DeviceType] = [.builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera, .builtInWideAngleCamera]
-    guard let cam = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .back).devices.first,
-          let input = try? AVCaptureDeviceInput(device: cam), session.canAddInput(input), session.canAddOutput(output) else {
-      publish { self.status = "Não deu pra abrir a câmera traseira" }; return
+    let old = session.inputs
+    old.forEach { session.removeInput($0) }
+    if session.sessionPreset != .photo && session.canSetSessionPreset(.photo) { session.sessionPreset = .photo }
+    guard session.canAddInput(input), session.outputs.contains(output) || session.canAddOutput(output) else {
+      old.forEach { if session.canAddInput($0) { session.addInput($0) } }
+      session.commitConfiguration()
+      publish { self.status = pos == .front ? "Não deu pra abrir a câmera frontal" : "Não deu pra abrir a câmera traseira" }; return false
     }
     session.addInput(input)
-    session.addOutput(output)
+    if !session.outputs.contains(output) { session.addOutput(output) }
+    session.commitConfiguration()   // formato da lente nova (preset .photo) já valendo antes de ler resolução/zoom
+    if let o = subjectObserver { NotificationCenter.default.removeObserver(o); subjectObserver = nil }
     device = cam
     // 48 MP quando a lente/formato aceita (14 Pro em diante); o pedido de cada foto escolhe 12/24/48
     let dims = cam.activeFormat.supportedMaxPhotoDimensions
-    if let big = dims.max(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) { output.maxPhotoDimensions = big }
+    if let big = dims.max(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) { _ = CowboyObjC.catching { self.output.maxPhotoDimensions = big } }
     let mps = Array(Set(dims.map { Self.mp($0) })).sorted()
     output.maxPhotoQualityPrioritization = .quality
     let rawOK = output.isAppleProRAWSupported
@@ -224,20 +298,26 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     }
     subjectObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: cam, queue: nil) { [weak self] _ in self?.recenter() }
     let minZ = Double(cam.minAvailableVideoZoomFactor / base), maxZ = Double(min(cam.maxAvailableVideoZoomFactor, base * 25) / base)
-    let flashOK = cam.hasFlash, lo = Double(cam.minExposureTargetBias), hi = Double(cam.maxExposureTargetBias)
-    Diag.step("photo-open", ["device": cam.deviceType.rawValue, "mp": mps.map(String.init).joined(separator: "/"), "raw": rawOK, "base": String(format: "%.2f", Double(base))])
+    // frontal: o "flash" é a tela acesa (Retina Flash), que a saída de foto oferece como modo de flash
+    let flashOK = cam.hasFlash || output.supportedFlashModes.contains(.on), lo = Double(cam.minExposureTargetBias), hi = Double(cam.maxExposureTargetBias)
+    Diag.step("photo-open", ["lado": pos == .front ? "frontal" : "traseira", "device": cam.deviceType.rawValue, "mp": mps.map(String.init).joined(separator: "/"), "raw": rawOK, "base": String(format: "%.2f", Double(base))])
     publish {
+      self.position = pos
       self.mpOptions = mps.isEmpty ? [12] : mps
-      if !self.mpOptions.contains(self.megapixels) { self.megapixels = self.mpOptions.contains(24) ? 24 : (self.mpOptions.last ?? 12) }
+      // resolução deste lado: a salva; sem salva, traseira = 24 MP e frontal = a maior que ela tem
+      let saved = UserDefaults.standard.object(forKey: Self.mpKey(pos)) as? Int
+      let fallback = pos == .front ? (self.mpOptions.last ?? 12) : (self.mpOptions.contains(24) ? 24 : (self.mpOptions.last ?? 12))
+      self.megapixels = saved.flatMap { self.mpOptions.contains($0) ? $0 : nil } ?? fallback
+      // sem ProRAW neste lado o disparo sai em HEIF, mas a escolha (ProRAW) fica guardada pro outro lado
       self.rawSupported = rawOK
-      if !rawOK && self.format.needsRaw { self.format = .heif }
       self.lenses = ls; self.minZoom = minZ; self.maxZoom = maxZ; self.zoom = 1
       self.flashAvailable = flashOK; self.minBias = max(-4, lo); self.maxBias = min(4, hi)
       if let l = self.previewLayer { self.attach(l) }   // a camada nasce antes da sessão ter câmera: gira a prévia agora
     }
+    return true
   }
   // rótulo comercial: 8064×6048 = 48,8 milhões de pontos = "48 MP"; 5712×4284 = "24 MP"
-  static func mp(_ d: CMVideoDimensions) -> Int { let m = Double(d.width) * Double(d.height) / 1e6; return m >= 40 ? 48 : m >= 20 ? 24 : m >= 10 ? 12 : max(1, Int(m.rounded())) }
+  static func mp(_ d: CMVideoDimensions) -> Int { let m = Double(d.width) * Double(d.height) / 1e6; return m >= 40 ? 48 : m >= 20 ? 24 : m >= 15 ? 18 : m >= 10 ? 12 : max(1, Int(m.rounded())) }
   // CALOR (0.11.2): a captura responsiva + priorização rápida mantêm um buffer de quadros sendo processado o tempo todo (o
   // celular esquentou em 1,5 min no modo foto da 0.11.0). Só ligadas no "Disparo rápido"; na "Qualidade máxima" a foto
   // demora um pouco mais pra liberar o próximo disparo, mas o aparelho fica frio.
@@ -308,7 +388,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
 
   // ---------------------------------------------------------------- disparo
   func shoot() {
-    guard ready else { return }
+    guard ready, !switching else { return }
     let angle = coordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
     if timer > 0 {
       countdown = timer
@@ -323,8 +403,15 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     } else { capture(angle: angle) }
   }
   func cancelTimer() { countdown = 0 }
+  // depois de apagar na galeria/revelação: miniatura do botão de fotos = a mais nova que sobrou
+  func refreshLast() {
+    let s = PhotoStore.all().first
+    lastShot = s
+    guard let s else { lastThumb = nil; return }
+    DispatchQueue.global(qos: .utility).async { let t = PhotoStore.thumbnail(s.edited ?? s.main, size: 160); self.publish { if self.lastShot?.id == s.id { self.lastThumb = t } } }
+  }
   private func capture(angle: CGFloat) {
-    let fmt = format, mp = megapixels, fl = flash, maxQ = maxQuality, asp = aspect
+    let fmt = format, mp = megapixels, fl = flash, maxQ = maxQuality, asp = aspect, mirror = position == .front && mirrorFront
     inFlight += 1
     queue.async {
       guard self.device != nil else { self.publish { self.inFlight = max(0, self.inFlight - 1) }; return }
@@ -345,7 +432,11 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
       }
       s.photoQualityPrioritization = maxQ ? .quality : .balanced
       if self.output.supportedFlashModes.contains(fl.mode) { s.flashMode = fl.mode }
-      if let conn = self.output.connection(with: .video), conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
+      if let conn = self.output.connection(with: .video) {
+        if conn.isVideoRotationAngleSupported(angle) { conn.videoRotationAngle = angle }
+        // frontal: igual ao iPhone de fábrica = a foto sai como o mundo vê (não espelhada); "Espelhar frontal" = como na prévia
+        if conn.isVideoMirroringSupported { conn.automaticallyAdjustsVideoMirroring = false; conn.isVideoMirrored = mirror }
+      }
       self.lock.lock(); self.pending[s.uniqueID] = (nil, nil, CACurrentMediaTime(), used, mp, asp); self.lock.unlock()
       if CowboyObjC.catching({ self.output.capturePhoto(with: s, delegate: self) }) != nil {
         self.lock.lock(); self.pending[s.uniqueID] = nil; self.lock.unlock()
@@ -401,7 +492,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
     let thumb = PhotoStore.thumbnail(m, size: 160)
     publish { self.lastShot = shot; self.lastThumb = thumb }
     if saveToPhotos {
-      PhotoStore.saveToLibrary(main: m, raw: shot.raw) { ok, err in if !ok { Diag.step("photo-save-fail", ["erro": err ?? "?"]); self.publish { self.status = "Não salvou na Fototeca: \(err ?? "?")" } } }
+      PhotoStore.saveToLibrary(main: m, raw: shot.raw, shotID: id) { ok, err in if !ok { Diag.step("photo-save-fail", ["erro": err ?? "?"]); self.publish { self.status = "Não salvou na Fototeca: \(err ?? "?")" } } }
     }
   }
 }
