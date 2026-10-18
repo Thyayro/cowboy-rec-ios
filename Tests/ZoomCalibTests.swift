@@ -445,6 +445,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     // medida chega 1 quadro atrasada (como no app). Exigido: do fim do dissolve até 2,6 s a tela fica no enquadramento da
     // chegada (≤0,6% de tamanho, ≤0,4% de posição — sem a correção: a deriva inteira), passo ≤0,25%/quadro, nunca borda;
     // no movimento seguinte solta em 0,35 s e termina na lente pura. Sem deriva (só tremor): não acrescenta nada.
+    ArrivalAnchor.on = true   // mede o núcleo; no app está desligado desde a 0.11.3 (tremia no aparelho)
     func arrivalSim(_ name: String, d0: Double, dx0: Double, dy0: Double, dur: Double, margin: Float?, strict: Bool) -> Float {
       let fps = 60.0, Z = 2.4, te = 1.0, tm = 4.2
       let a = ArrivalAnchor()

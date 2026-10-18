@@ -654,7 +654,11 @@ final class LensSwitchHider: @unchecked Sendable {
 // da troca (o dissolve esconde). O que sobra no fim (sobra + deriva) só sai no PRÓXIMO MOVIMENTO (zoom ou giro do celular),
 // onde não se vê. Nunca borda; medida ruim = segura a anterior (nunca piora); conteúdo andando (giro) = para de medir e solta.
 final class ArrivalAnchor: @unchecked Sendable {
-  static var on = true
+  // 0.11.3: DESLIGADA. Uso real 18/10 00:38 e 01:04 (0.11.2): no aparelho a medida se perdia (deslize medido 13–15% do quadro,
+  // "precisou" 1,37–1,44) e a escala aplicada pulava 0,5–1,5% de um quadro pro outro (38 saltos num trecho de 0,5→1) = a tela
+  // "tremendo" na troca de lente. O teste do CI passava (cena sintética sem movimento). Não religar sem rodar em SOMBRA (medir sem
+  // aplicar) e conferir nos trechos reais que a deriva medida bate com a da tela.
+  static var on = false
   static let window = 2.6          // s medindo a deriva depois da troca
   static let marginIn = 0.15       // s: a sobra nasce junto com o dissolve da troca
   static let releaseDur = 0.35     // s: soltar no movimento seguinte
