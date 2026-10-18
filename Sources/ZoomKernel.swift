@@ -727,7 +727,9 @@ final class ArrivalAnchor: @unchecked Sendable {
     lastG = g
     raw.append(g.s); if raw.count > 5 { raw.removeFirst(raw.count - 5) }
     let target = Self.median(raw) ?? g.s
-    sf += max(-Self.maxStep, min(Self.maxStep, target - sf))
+    // suave: anda 30% do caminho por medida (ruído ÷3), nada abaixo de 0,04% (sem tremidinha), nunca mais que maxStep
+    let d = target - sf
+    if abs(d) > 0.0004 { sf += max(-Self.maxStep, min(Self.maxStep, d * 0.3)) }
     samples.append((p, sf)); if samples.count > 240 { samples.removeFirst(samples.count - 240) }
     need = max(need, 1 / max(0.5, sf))
     stats.lo = min(stats.lo, sf); stats.hi = max(stats.hi, sf); stats.shift = max(stats.shift, abs(g.tx), abs(g.ty))
