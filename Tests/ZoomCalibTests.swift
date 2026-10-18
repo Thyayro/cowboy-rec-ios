@@ -440,63 +440,74 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     lensSim("ida-e-volta em 133 ms (arquivo não segura: respira)", J: 1.06, ox: 0.002, oy: 0, ratio: 1, contrast: 1, L: 0.5, flashFrames: 8, file: true, strict: true)
     lensSim("escuro", J: 1.05, ox: 0, oy: 0, ratio: 1, contrast: 0.2, L: 0.5, flashFrames: 0, file: false, strict: false)
     lensSim("estabilização sem atraso (0,15 s): não dá tempo de preparar", J: 1.05, ox: 0, oy: 0, ratio: 1, contrast: 1, L: 0.15, flashFrames: 0, file: false, strict: false)
-    // (7) CHEGADA ASSENTADA (0.10.11): depois da troca a lente nova deriva sozinha (medido 17/10 na tela: 10×→2× entra 7%
-    // menor e cresce em ~2 s com 2% de deslize; pinça 1×→2× entra 10% maior e encolhe). Quadros estabilizados a 60 qps, a
-    // medida chega 1 quadro atrasada (como no app). Exigido: do fim do dissolve até 2,6 s a tela fica no enquadramento da
-    // chegada (≤0,6% de tamanho, ≤0,4% de posição — sem a correção: a deriva inteira), passo ≤0,25%/quadro, nunca borda;
-    // no movimento seguinte solta em 0,35 s e termina na lente pura. Sem deriva (só tremor): não acrescenta nada.
-    ArrivalAnchor.on = true   // mede o núcleo; no app está desligado desde a 0.11.3 (tremia no aparelho)
-    func arrivalSim(_ name: String, d0: Double, dx0: Double, dy0: Double, dur: Double, margin: Float?, strict: Bool) -> Float {
-      let fps = 60.0, Z = 2.4, te = 1.0, tm = 4.2
+    // (7) CHEGADA ASSENTADA (0.10.11, refeita na 0.11.4): depois da troca a lente nova "respira" sozinha (17/10: 10×→2× entra 7%
+    // menor e cresce em ~2 s). Quadros estabilizados a 60 qps, a medida chega 1 quadro atrasada (como no app). Desde a 0.11.4 só a
+    // ESCALA é corrigida. Exigido: do 1º quadro da lente nova até 2,6 s a escala da tela fica na da chegada (≤0,6%), NENHUM passo
+    // acima de 0,15% por quadro fora do quadro da troca (no aparelho a 0.11.2 tremia 0,5–1,5%), nunca borda, posição nunca pior
+    // que sem correção; no movimento seguinte solta em 0,35 s e termina na lente pura. Casos do aparelho: mão tremendo forte,
+    // cena escura (ruído), trocas seguidas ida-e-volta.
+    ArrivalAnchor.on = true
+    func arrivalSim(_ name: String, d0: Double, dx0: Double, dy0: Double, dur: Double, margin: Float?, strict: Bool,
+                    shake: Double = 0.00015, noise: Double = 0.004, switches: [Double] = [1.0]) -> Float {
+      let fps = 60.0, Z = 2.4, tm = 4.2
       let a = ArrivalAnchor()
       var learned: Float = 0
       a.marginFor = { _, _ in margin }
       a.learn = { _, _, n in learned = n }
       var prevId = 1, pending: (Double, [Float])?
-      var shown: [(p: Double, z: Double, x: Double, y: Double)] = [], border = 0.0, endPure = true
+      var shown: [(p: Double, z: Double, x: Double, y: Double, sw: Bool)] = [], border = 0.0, endPure = true
       var jx = 0.0, jy = 0.0
       for n in 0..<Int(5 * fps) {
         let p = Double(n) / fps
-        jx = jx * 0.9 + rng.normal() * 0.00015; jy = jy * 0.9 + rng.normal() * 0.00015
-        let id = p >= te - 1e-9 ? 2 : 1
-        let f = id == 2 ? min(1, (p - te) / dur) : 1, e = SwitchPlan.smooth(f)
-        let ds = id == 2 ? d0 + (1 - d0) * Double(e) : 1, ox = id == 2 ? dx0 * (1 - Double(e)) : 0, oy = id == 2 ? dy0 * (1 - Double(e)) : 0
+        jx = jx * 0.92 + rng.normal() * shake; jy = jy * 0.92 + rng.normal() * shake
+        let k = switches.filter { p >= $0 - 1e-9 }.count, id = k == 0 ? 1 : (k % 2 == 1 ? 2 : 1)
+        let since = k == 0 ? 0 : p - switches[k - 1]
+        let f = k == 0 ? 1 : min(1, since / dur), e = Double(SwitchPlan.smooth(f))
+        let ds = k == 0 ? 1 : d0 + (1 - d0) * e, ox = k == 0 ? 0 : dx0 * (1 - e), oy = k == 0 ? 0 : dy0 * (1 - e)
         let zf = Z * ds, x = ox + jx, y = oy + jy
         let want = a.frame(pts: p, sensor: id, prev: prevId, still: p < tm, moving: p >= tm)
+        let isSwitch = id != prevId
         prevId = id
         if let q = pending { a.measure(pts: q.0, prepped: q.1); pending = nil }   // a medida do quadro anterior chega agora
         let g = a.geometry(pts: p, sensor: id)
-        if want { pending = (p, ZoomImage.prep(scene.thumb(zf, x, y, noise: 0.004, &rng))) }
+        if want { pending = (p, ZoomImage.prep(scene.thumb(zf, x, y, noise: noise, &rng))) }
         border = max(border, Double(max(0, 1 - g.s)), Double(max(abs(g.tx), abs(g.ty)) - (g.s - 1) / 2))
         if p > tm + ArrivalAnchor.releaseDur + 0.02 && !g.isIdentity { endPure = false }
         let zd = zf * Double(g.s)
-        if id == 2 { shown.append((p, zd, x - Double(g.tx) * 0.9 / zd, y - Double(g.ty) * 0.9 / zd)) }
+        if k > 0 { shown.append((p, zd, x - Double(g.tx) * 0.9 / zd, y - Double(g.ty) * 0.9 / zd, isSwitch)) }
       }
-      let lo = te + ArrivalAnchor.marginIn + 0.05, hi = te + ArrivalAnchor.window
+      let last = switches.last ?? 1.0
+      let lo = last, hi = min(last + ArrivalAnchor.window, tm)
       let win = shown.filter { $0.p >= lo && $0.p <= hi }
       guard let r0 = win.first else { check(false, name + ": sem quadros"); return 0 }
-      var vz = 0.0, vp = 0.0, step = 0.0, stepRel = 0.0
-      for s in win { vz = max(vz, abs(log(s.z / r0.z))); vp = max(vp, abs(s.x - r0.x) * s.z / 0.9, abs(s.y - r0.y) * s.z / 0.9) }
-      for k in 1..<shown.count {
+      var vz = 0.0, vp = 0.0, bp = 0.0, step = 0.0, stepRel = 0.0
+      for s in win { vz = max(vz, abs(log(s.z / r0.z))) }
+      for k in 1..<shown.count where !shown[k].sw {
         let dzk = abs(log(shown[k].z / shown[k - 1].z))
-        if shown[k].p >= lo && shown[k].p <= hi { step = max(step, dzk) }
-        if shown[k].p >= tm { stepRel = max(stepRel, dzk) }
+        if shown[k].p < tm { step = max(step, dzk) } else { stepRel = max(stepRel, dzk) }
       }
-      let base = abs(log(d0)), baseP = max(abs(dx0), abs(dy0)) * Z / 0.9
-      let txt = String(format: "chegada %@: tela variou %.2f%% de tamanho / %.2f%% de posição em 2,6 s (sem: %.2f%% / %.2f%%), passo %.2f%%, soltura %.2f%%/quadro, aprendeu sobra %.4f",
-        name, vz * 100, vp * 100, base * 100, baseP * 100, step * 100, stepRel * 100, learned)
+      // posição: a correção não mexe mais nela — só confere que não piorou (mesma conta com e sem)
+      for s in win { vp = max(vp, abs(s.x - r0.x) * s.z / 0.9, abs(s.y - r0.y) * s.z / 0.9) }
+      bp = max(abs(dx0), abs(dy0)) * Z / 0.9 + shake * 40
+      let base = abs(log(d0))
+      let txt = String(format: "chegada %@: tela variou %.2f%% de tamanho em 2,6 s (sem: %.2f%%), maior passo fora da troca %.3f%%, soltura %.2f%%/quadro, posição %.2f%%, aprendeu sobra %.4f",
+        name, vz * 100, base * 100, step * 100, stepRel * 100, vp * 100, learned)
       check(border < 1e-4, "chegada " + name + ": nunca mostra borda")
       check(endPure, "chegada " + name + ": depois da soltura volta à lente pura")
-      if strict { check(vz <= 0.006 && vp <= 0.004 && step <= 0.0025 && stepRel <= 0.012, txt) }
-      else { check(vz <= base + 0.002 && step <= 0.0025, txt + " (não pode piorar)") }
+      check(step <= 0.0015, txt + " — NÃO PODE TREMER (≤0,15%/quadro)")
+      check(vp <= bp + 0.004, txt + " — posição não pode piorar")
+      if strict { check(vz <= 0.006 && stepRel <= 0.012, txt) } else { check(vz <= base + 0.002, txt + " (não pode piorar)") }
       return learned
     }
-    let need = arrivalSim("10×→2× cresce 7% com deslize, sobra padrão (1ª vez)", d0: 0.93, dx0: 0.004, dy0: -0.002, dur: 2.0, margin: nil, strict: false)
-    check(need > 1.06 && need < 1.115, String(format: "chegada: sobra aprendida %.4f pra deriva de 7%% + deslize", need))
-    _ = arrivalSim("10×→2× cresce 7% com deslize, sobra aprendida", d0: 0.93, dx0: 0.004, dy0: -0.002, dur: 2.0, margin: min(1.12, need * 1.005), strict: true)
+    let need = arrivalSim("10×→2× cresce 7%, sobra padrão (1ª vez)", d0: 0.93, dx0: 0.004, dy0: -0.002, dur: 2.0, margin: nil, strict: false)
+    check(need > 1.06 && need <= 1.08, String(format: "chegada: sobra aprendida %.4f pra deriva de 7%%", need))
+    _ = arrivalSim("10×→2× cresce 7%, sobra aprendida", d0: 0.93, dx0: 0.004, dy0: -0.002, dur: 2.0, margin: min(1.08, need * 1.005), strict: true)
     _ = arrivalSim("pinça 1×→2× encolhe 10%", d0: 1.10, dx0: 0, dy0: 0.008, dur: 1.8, margin: 1.0, strict: true)
-    _ = arrivalSim("2×→1× cresce 5%", d0: 0.95, dx0: -0.004, dy0: 0.008, dur: 1.5, margin: 1.105, strict: true)
+    _ = arrivalSim("2×→1× cresce 5%", d0: 0.95, dx0: -0.004, dy0: 0.008, dur: 1.5, margin: 1.06, strict: true)
     _ = arrivalSim("sem deriva (só tremor)", d0: 1.0, dx0: 0, dy0: 0, dur: 1.0, margin: 1.03, strict: true)
+    _ = arrivalSim("mão tremendo FORTE + cresce 3%", d0: 0.97, dx0: 0, dy0: 0, dur: 1.5, margin: 1.04, strict: true, shake: 0.0012)
+    _ = arrivalSim("cena escura (ruído 3×) + cresce 3%", d0: 0.97, dx0: 0.002, dy0: 0, dur: 1.5, margin: 1.04, strict: false, noise: 0.012)
+    _ = arrivalSim("0,5→1→0,5→1 seguidas (1,2 s entre trocas)", d0: 0.98, dx0: 0.003, dy0: 0, dur: 1.2, margin: 1.03, strict: true, switches: [1.0, 2.2, 3.0])
     print("TESTE DO ZOOM OK")
   }
 }

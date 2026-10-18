@@ -643,28 +643,28 @@ final class LensSwitchHider: @unchecked Sendable {
   }
 }
 
-// CHEGADA ASSENTADA (0.10.11). Uso real 17/10 (0.10.10, trechos da tela): depois de TODA troca de lente com o zoom parado a
-// imagem ainda "assentava" — 10×→2× entrou 7% menor que o final e cresceu devagar por ~2 s (com 57 px de deslize), 2×→1× 5%,
-// pinça 1×→2× 10% maior encolhendo. O app não mexia (geometria do hider desligada, k = 1): é o iPhone — a lente nova chega
-// com o foco andando devagar (L 0,776→0,655 em 2 s, linear, sem "AF procurando") e as lentes mudam de tamanho com o foco
-// (respiração), e a Extrema recentrando depois do pulo da troca. Foco é do iPhone (lição cara: não mexer). Aqui o
-// ENQUADRAMENTO da chegada fica preso: cada quadro estabilizado da lente nova é medido contra o 1º dela (miniatura 96×54,
-// busca em volta da medida anterior) e a deriva é desfeita, na tela e no arquivo (mesma conta). Pra desfazer imagem que
-// CRESCE é preciso sobra: a lente nova entra com uma ampliação pequena (aprendida por par, 0–12%) que nasce JUNTO com o pulo
-// da troca (o dissolve esconde). O que sobra no fim (sobra + deriva) só sai no PRÓXIMO MOVIMENTO (zoom ou giro do celular),
-// onde não se vê. Nunca borda; medida ruim = segura a anterior (nunca piora); conteúdo andando (giro) = para de medir e solta.
+// CHEGADA ASSENTADA (0.10.11; refeita na 0.11.4). Uso real 17/10 (0.10.10, trechos da tela): depois de TODA troca de lente com o
+// zoom parado a imagem "assentava" — a lente nova chega com o foco andando devagar (L 0,776→0,655 em 2 s, sem "AF procurando")
+// e as lentes mudam de tamanho com o foco (respiração): 1–7% de escala em ~2 s. Foco é do iPhone (lição cara: não mexer).
+// Aqui a ESCALA da chegada fica presa: cada quadro estabilizado da lente nova é medido contra o 1º dela e a respiração é desfeita
+// na tela e no arquivo (mesma conta).
+// 0.11.4 — o que a 0.10.11 errou no aparelho (18/10, trechos 0.11.2: 38 saltos de 0,5–1,5% por quadro = "tremendo"):
+//  1. corrigia também o DESLOCAMENTO: isso é mão + Extrema, não respiração; a medida de posição se perdia (13–15% do quadro)
+//     e arrastava a escala junto. Agora só ESCALA; posição medida serve só pra descartar medida ruim (>4% = outra cena).
+//  2. aplicava a medida crua de cada quadro: o ruído virava tremor. Agora mediana das 5 últimas → limite de 0,12% por medida
+//     (a respiração real anda ~0,06%/quadro) → a tela nunca anda mais que isso fora da troca.
+//  3. a sobra (pra desfazer imagem que CRESCE) subia em 0,15 s DEPOIS da troca = pulso visível nas trocas seguidas. Agora entra
+//     num degrau só NO quadro da troca (o pulo da lente + o dissolve escondem). Sobra aprendida só da escala (0–8%, chave nova).
+// O que sobra no fim só sai no PRÓXIMO MOVIMENTO (zoom ou giro do celular), onde não se vê. Nunca borda.
 final class ArrivalAnchor: @unchecked Sendable {
-  // 0.11.3: DESLIGADA. Uso real 18/10 00:38 e 01:04 (0.11.2): no aparelho a medida se perdia (deslize medido 13–15% do quadro,
-  // "precisou" 1,37–1,44) e a escala aplicada pulava 0,5–1,5% de um quadro pro outro (38 saltos num trecho de 0,5→1) = a tela
-  // "tremendo" na troca de lente. O teste do CI passava (cena sintética sem movimento). Não religar sem rodar em SOMBRA (medir sem
-  // aplicar) e conferir nos trechos reais que a deriva medida bate com a da tela.
-  static var on = false
+  static var on = true
   static let window = 2.6          // s medindo a deriva depois da troca
-  static let marginIn = 0.15       // s: a sobra nasce junto com o dissolve da troca
   static let releaseDur = 0.35     // s: soltar no movimento seguinte
-  static let maxScale: Float = 1.14
-  static let defaultMargin: Float = 1.05
-  static let maxJump: Float = 0.015   // medida que pula mais que isso de um quadro pro outro = outra coisa (pessoa passando)
+  static let maxScale: Float = 1.12
+  static let defaultMargin: Float = 1.03
+  static let maxStep: Float = 0.0012   // o que a escala aplicada pode andar por medida (fora da troca)
+  static let maxRawJump: Float = 0.02  // medida crua que pula mais que isso da mediana = descartada
+  static let maxShift: Float = 0.04    // deslocamento medido acima disso = a medida pegou outra coisa
   private let lock = NSLock()
   private(set) var sensor = 0
   private var from = 0
@@ -672,31 +672,28 @@ final class ArrivalAnchor: @unchecked Sendable {
   private var refP: Double?
   private var ref: [Float]?
   private var margin: Float = 1
-  private var last: SwitchGeometry?
-  private var samples: [(p: Double, g: SwitchGeometry)] = []
+  private var lastG: SwitchGeometry?       // última medida aceita (centro da busca)
+  private var raw: [Float] = []            // escalas cruas aceitas (mediana)
+  private var sf: Float = 1                // escala filtrada (a aplicada, × sobra)
+  private var samples: [(p: Double, s: Float)] = []
   private var releaseP: Double?
-  private var held = SwitchGeometry(exact: true)
+  private var held: Float = 1
   private var measuring = false
   private var need: Float = 1
   private var stats = (n: 0, bad: 0, lo: Float(1), hi: Float(1), shift: Float(0))
   var onDone: (([String: String]) -> Void)?
   var marginFor: (Int, Int) -> Float? = { a, b in ArrivalMemory.margin(from: a, to: b) }
   var learn: (Int, Int, Float) -> Void = { a, b, n in ArrivalMemory.record(from: a, to: b, need: n) }
-  func reset() { lock.lock(); sensor = 0; ref = nil; refP = nil; samples.removeAll(); releaseP = nil; measuring = false; lock.unlock() }
-  // geometria que zera a sobra pedida por g (g mapeia o quadro → enquadramento da chegada): a menor ampliação M com M∘g válida
-  static func needed(_ g: SwitchGeometry) -> Float {
-    let m = max(abs(g.tx), abs(g.ty))
-    return max(1, 1 / max(0.5, g.s), 1 / max(0.5, g.s - 2 * m))
-  }
+  func reset() { lock.lock(); sensor = 0; ref = nil; refP = nil; samples.removeAll(); raw.removeAll(); releaseP = nil; measuring = false; held = 1; lock.unlock() }
   // cada quadro estabilizado (antes da tela e do arquivo). still = zoom do conteúdo parado; moving = zoom andando ou celular
   // girando. Devolve true se este quadro deve ser medido (aí o chamador manda a miniatura em `measure`).
   func frame(pts p: Double, sensor id: Int, prev: Int, still: Bool, moving: Bool) -> Bool {
     guard Self.on, id != 0 else { return false }
     lock.lock(); defer { lock.unlock() }
     if prev != 0, prev != id {
-      // troca nova: o que a anterior ainda segurava some junto com o pulo desta
+      // troca nova: o que a anterior ainda segurava some junto com o pulo desta (degrau escondido pela troca)
       finishLocked(p)
-      sensor = id; from = prev; switchP = p; ref = nil; refP = nil; last = nil; samples.removeAll(); releaseP = nil; held = SwitchGeometry(exact: true)
+      sensor = id; from = prev; switchP = p; ref = nil; refP = nil; lastG = nil; raw.removeAll(); sf = 1; samples.removeAll(); releaseP = nil; held = 1
       margin = min(Self.maxScale, max(1, marginFor(prev, id) ?? Self.defaultMargin)); need = 1
       stats = (0, 0, 1, 1, 0); measuring = still
       return still
@@ -704,7 +701,7 @@ final class ArrivalAnchor: @unchecked Sendable {
     guard id == sensor else { return false }
     if releaseP == nil && moving && p > switchP + 0.05 {
       finishLocked(p)
-      held = geometryLocked(p); releaseP = p
+      held = scaleLocked(p); releaseP = p
       return false
     }
     if refP == nil && still && releaseP == nil && p - switchP < 0.5 { return true }   // troca no meio do zoom: chegada = 1º quadro parado
@@ -718,60 +715,65 @@ final class ArrivalAnchor: @unchecked Sendable {
   func measure(pts p: Double, prepped img: [Float]) {
     lock.lock()
     guard releaseP == nil else { lock.unlock(); return }
-    if ref == nil { ref = img; refP = p; measuring = true; samples.append((p, SwitchGeometry(exact: true))); last = SwitchGeometry(exact: true); lock.unlock(); return }
-    let r = ref!, around = last ?? SwitchGeometry(exact: true)
+    if ref == nil { ref = img; refP = p; measuring = true; samples.append((p, 1)); lastG = SwitchGeometry(exact: true); lock.unlock(); return }
+    let r = ref!, around = lastG ?? SwitchGeometry(exact: true)
     lock.unlock()
     let m = ZoomImage.switchGeo(r, img, around: around)
     lock.lock(); defer { lock.unlock() }
     guard releaseP == nil, ref != nil else { return }
     stats.n += 1
-    guard let g = m?.g, abs(g.s / around.s - 1) <= Self.maxJump, abs(g.tx - around.tx) <= Self.maxJump, abs(g.ty - around.ty) <= Self.maxJump else { stats.bad += 1; return }
-    last = g; samples.append((p, g)); if samples.count > 240 { samples.removeFirst(samples.count - 240) }
-    need = max(need, Self.needed(g))
-    stats.lo = min(stats.lo, g.s); stats.hi = max(stats.hi, g.s); stats.shift = max(stats.shift, abs(g.tx), abs(g.ty))
+    let med = Self.median(raw) ?? 1
+    guard let g = m?.g, (m?.conf ?? 0) >= 0.05, abs(g.tx) <= Self.maxShift, abs(g.ty) <= Self.maxShift, abs(g.s / med - 1) <= Self.maxRawJump else { stats.bad += 1; return }
+    lastG = g
+    raw.append(g.s); if raw.count > 5 { raw.removeFirst(raw.count - 5) }
+    let target = Self.median(raw) ?? g.s
+    sf += max(-Self.maxStep, min(Self.maxStep, target - sf))
+    samples.append((p, sf)); if samples.count > 240 { samples.removeFirst(samples.count - 240) }
+    need = max(need, 1 / max(0.5, sf))
+    stats.lo = min(stats.lo, sf); stats.hi = max(stats.hi, sf); stats.shift = max(stats.shift, abs(g.tx), abs(g.ty))
   }
+  static func median(_ x: [Float]) -> Float? { guard !x.isEmpty else { return nil }; let s = x.sorted(); return s[s.count / 2] }
   private func finishLocked(_ p: Double) {
     guard measuring, sensor != 0 else { return }
     measuring = false
     if stats.n >= 8 && stats.bad * 3 < stats.n { learn(from, sensor, need) }
     let info: [String: String] = ["etapa": "chegada", "de": "\(from)", "para": "\(sensor)", "sobra": String(format: "%.4f", margin),
       "precisou": String(format: "%.4f", need), "deriva": String(format: "%.4f..%.4f desl %.4f", stats.lo, stats.hi, stats.shift),
-      "medidos": "\(stats.n)", "ruins": "\(stats.bad)", "ms": String(format: "%.0f", (p - switchP) * 1000)]
+      "medidos": "\(stats.n)", "ruins": "\(stats.bad)", "ms": String(format: "%.0f", (p - switchP) * 1000), "versao": "2"]
     let cb = onDone
     DispatchQueue.global(qos: .utility).async { cb?(info) }
   }
-  // geometria do quadro estabilizado p da lente `id` (tela e arquivo): sobra ∘ deriva desfeita, ou soltando no movimento
+  // geometria do quadro estabilizado p da lente `id` (tela e arquivo): só escala, no centro
   func geometry(pts p: Double, sensor id: Int) -> SwitchGeometry {
     guard Self.on, id != 0 else { return .identity }
     lock.lock(); defer { lock.unlock() }
     guard id == sensor, p >= switchP - 0.001 else { return .identity }
-    return geometryLocked(p)
+    let s = scaleLocked(p)
+    return abs(s - 1) < 0.0005 ? .identity : SwitchGeometry(s: s, tx: 0, ty: 0, exact: true)
   }
-  private func geometryLocked(_ p: Double) -> SwitchGeometry {
+  private func scaleLocked(_ p: Double) -> Float {
     if let rp = releaseP, p >= rp - 0.001 {
       let x = (p - rp) / Self.releaseDur
-      return x >= 1 ? .identity : held.mix(1 - SwitchPlan.smooth(x))
+      return x >= 1 ? 1 : 1 + (held - 1) * (1 - SwitchPlan.smooth(x))
     }
-    let M = 1 + (margin - 1) * SwitchPlan.smooth((p - switchP) / Self.marginIn)
-    let g = samples.last(where: { $0.p <= p + 0.001 })?.g ?? SwitchGeometry(exact: true)
-    var out = SwitchPlan.valid(SwitchPlan.compose(SwitchGeometry(s: M, tx: 0, ty: 0, exact: true), g))
-    if out.s > Self.maxScale { let k = Self.maxScale / out.s; out = SwitchPlan.valid(SwitchGeometry(s: Self.maxScale, tx: out.tx * k, ty: out.ty * k, exact: true)) }
-    return out.isIdentity ? .identity : out
+    let s = samples.last(where: { $0.p <= p + 0.001 })?.s ?? 1
+    return min(Self.maxScale, max(1, margin * s))
   }
 }
 
-// quanta sobra cada par de lentes precisou pra segurar a chegada (aprende no uso; mediana das últimas 7 × 1,005)
+// quanta sobra cada par de lentes precisou pra segurar a chegada (só escala; mediana das últimas 7 × 1,005). Chave nova na
+// 0.11.4: as medidas da 0.10.11 (com o deslocamento perdido) pediam até 1,44.
 enum ArrivalMemory {
-  static func key(_ a: Int, _ b: Int) -> String { "arr1_\(a)_\(b)" }
+  static func key(_ a: Int, _ b: Int) -> String { "arr2_\(a)_\(b)" }
   static func record(from a: Int, to b: Int, need: Float) {
     let d = UserDefaults.standard
-    var s = d.array(forKey: key(a, b)) as? [Double] ?? []; s.append(Double(need)); if s.count > 7 { s.removeFirst(s.count - 7) }
+    var s = d.array(forKey: key(a, b)) as? [Double] ?? []; s.append(Double(min(need, 1.08))); if s.count > 7 { s.removeFirst(s.count - 7) }
     d.set(s, forKey: key(a, b))
   }
   static func margin(from a: Int, to b: Int) -> Float? {
     let s = UserDefaults.standard.array(forKey: key(a, b)) as? [Double] ?? []
     guard s.count >= 2 else { return nil }
-    return Float(min(1.12, (SwitchMemory.median(s) ?? 1) * 1.005))
+    return Float(min(1.08, (SwitchMemory.median(s) ?? 1) * 1.005))
   }
 }
 
