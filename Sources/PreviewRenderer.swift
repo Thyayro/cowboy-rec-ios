@@ -54,6 +54,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // CHEGADA ASSENTADA (0.10.11, ver ArrivalAnchor): enquadramento da lente nova preso na chegada, deriva desfeita na tela e no
   // arquivo, sobra solta só no próximo movimento
   let arrival = ArrivalAnchor()
+  // TROCA ENQUADRADA (0.11.7, ver FrameLock): troca na chegada do zoom = preparo dentro do movimento + lente nova medida quadro a
+  // quadro contra a velha (escala e posição) antes da tela e do arquivo
+  let frameLock = FrameLock()
+  private struct FastRetry { let ref: [Float]; let refPTS: Double; let t: Double; let from: Int; let to: Int; let crop: Double; var tries: Int }
+  private var fastRetry: FastRetry?
   private var arrivalBusy = false
   private let arrivalQueue = DispatchQueue(label: "cowboy.preview.arrival", qos: .userInitiated)
   var onSwitch: (([String: String]) -> Void)?
@@ -146,6 +151,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let device { context = CIContext(mtlDevice: device, options: options) } else { context = CIContext(options: options) }
     super.init()
     arrival.onDone = { [weak self] info in self?.onSwitch?(info) }
+    frameLock.onDone = { [weak self] info in self?.onSwitch?(info) }
   }
   func push(_ buffer: CVPixelBuffer, pts: Double? = nil) {
     let sid = LensID.of(buffer)
@@ -153,12 +159,16 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if frozen { lock.unlock(); return }
     let prevStab = lastStab; lastStab = (buffer, sid)
     lock.unlock()
+    // troca enquadrada (0.11.7): a lente nova é medida aqui, antes da tela e do arquivo; a troca que ela cuida não passa pela
+    // chegada assentada nem pela medida antiga do estabilizado (seria corrigir duas vezes)
+    var owned = false
+    if let pts { lockFrame(buffer, pts: pts, sensor: sid, prev: prevStab); owned = frameLock.owns(sensor: sid, pts: pts) }
     // primeiro quadro estabilizado da lente nova: mede o pulo NELE (é o que a tela e o arquivo mostram), em volta da previsão
     // da saída rápida, ANTES de ele ir pra tela e pro arquivo (só na troca; poucos ms)
-    if let pts, let ps = prevStab, ps.id != sid, ps.id != 0, sid != 0, let ev = switchHider.awaiting(from: ps.id, to: sid, at: pts) {
+    if !owned, let pts, let ps = prevStab, ps.id != sid, ps.id != 0, sid != 0, let ev = switchHider.awaiting(from: ps.id, to: sid, at: pts) {
       measureStabSwitch(ps.buffer, buffer, ev: ev)
     }
-    if let pts { arrivalFrame(buffer, pts: pts, sensor: sid, prev: prevStab?.id ?? 0) }
+    if let pts, !owned { arrivalFrame(buffer, pts: pts, sensor: sid, prev: prevStab?.id ?? 0) }
     lock.lock()
     if frozen { lock.unlock(); return }
     if dropFrames > 0 { dropFrames -= 1; lock.unlock(); return }
@@ -193,6 +203,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.15, zHistFast = zoomAt(pts + Self.contentLead) ?? 0
     // troca de lente (0.8.0): sensor deste quadro rápido × o do anterior, com o zoom PARADO nos dois
     let prevFast = lastFast; lastFast = (buffer, sid, pts)
+    // troca enquadrada: a 1ª medida da troca falhou → tenta de novo no próximo quadro da lente nova (até 6)
+    var retryJob: FastRetry?, retryStep = 1.0, retryLost: FastRetry?
+    if let r = fastRetry, sid != 0 {
+      if sid != r.to { fastRetry = nil; retryLost = r }
+      else if !switchBusy && pts > r.t + 0.001 {
+        switchBusy = true; fastRetry = nil; var j = r; j.tries += 1; retryJob = j
+        if let z1 = zoomAt(pts + Self.contentLead), let z0 = zoomAt(r.refPTS + Self.contentLead), z0 > 0 { retryStep = z1 / z0 }
+      }
+    }
     var switchJob = false, still = false, switchStep = 1.0
     if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
       if focusWatch == nil { focusWatch = (pts, lastSharp, [], pf.id, sid) }
@@ -207,8 +226,17 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let cropNow = crop; lock.unlock()
     if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
       lensColorSwitch(pf.buffer, buffer, pts: pts)   // cor/luz: em TODA troca (parado ou andando)
-      if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow, step: switchStep) }
+      if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow, step: switchStep, refPTS: pf.pts) }
       else { onSwitch?(["etapa": "rapida", "de": "\(pf.id)", "para": "\(sid)", "medido": still ? "ocupado" : "zoom andando (o movimento esconde)"]) }
+    }
+    if let r = retryLost { switchQueue.async { self.finishFastSwitch(nil, r, step: 1, why: "lente mudou de novo", releaseBusy: false) } }
+    if let r = retryJob {
+      switchQueue.async {
+        var m = ZoomImage.thumb(buffer).flatMap { ZoomImage.switchGeo(r.ref, ZoomImage.prep($0)) }
+        m = m.map { (SwitchGeometry(s: $0.g.s * Float(retryStep), tx: $0.g.tx, ty: $0.g.ty, exact: true), $0.conf, $0.gain) }
+        if m == nil && r.tries < 6 { self.lock.lock(); self.fastRetry = r; self.switchBusy = false; self.lock.unlock(); return }
+        self.finishFastSwitch(m, r, step: retryStep, why: nil)
+      }
     }
     if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving, sensor: sid) }
     let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming) : (0, 0)
@@ -238,22 +266,58 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   }
   // troca vista na saída rápida (zoom parado): mede o pulo entre o último quadro da lente velha e o 1º da nova e avisa a
   // tela/arquivo ~0,45 s antes de o quadro estabilizado da nova chegar
-  private func measureFastSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, pts: Double, from: Int, to: Int, crop: Double, step: Double = 1) {
+  private func measureFastSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, pts: Double, from: Int, to: Int, crop: Double, step: Double = 1, refPTS: Double) {
     switchQueue.async {
-      var m: (g: SwitchGeometry, conf: Float, gain: Float)?
-      if let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) { m = ZoomImage.switchGeo(ZoomImage.prep(ta), ZoomImage.prep(tb)) }
+      guard let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) else {
+        self.finishFastSwitch(nil, FastRetry(ref: [], refPTS: refPTS, t: pts, from: from, to: to, crop: crop, tries: 1), step: step, why: "sem miniatura"); return
+      }
+      let ref = ZoomImage.prep(ta)
+      var m = ZoomImage.switchGeo(ref, ZoomImage.prep(tb))
       // só o pulo da LENTE: o quadro novo também está `step` mais perto pelo próprio zoom (a ampliação k cuida disso)
       m = m.map { (SwitchGeometry(s: $0.g.s * Float(step), tx: $0.g.tx, ty: $0.g.ty, exact: true), $0.conf, $0.gain) }
-      // previsão pro quadro estabilizado: escala × razão aprendida deste par (o corte da estabilização pode mudar com a lente),
-      // deslocamento × corte (o estabilizado mostra 1/corte do quadro rápido); sem medida: o que este par costuma fazer
-      var pred: SwitchGeometry?
-      if let m { let c = Float(max(1, crop)); pred = SwitchGeometry(s: m.g.s * SwitchMemory.ratio(from: from, to: to), tx: m.g.tx * c, ty: m.g.ty * c, exact: true) }
-      else if let s = SwitchMemory.scale(from: from, to: to) { pred = SwitchGeometry(s: s, tx: 0, ty: 0, exact: true) }
-      self.switchHider.add(t: pts, from: from, to: to, fast: m?.g, pred: pred, step: step)
-      var info: [String: String] = ["etapa": "rapida", "de": "\(from)", "para": "\(to)", "passo": String(format: "%.4f", step), "medido": m.map { Self.geoText($0.g) + String(format: " conf %.2f", $0.conf) } ?? "não deu"]
-      if let pred { info["previsto"] = Self.geoText(pred); info["preparo"] = Self.geoText(SwitchPlan.pre(pred)) }
-      self.onSwitch?(info)
-      self.lock.lock(); self.switchBusy = false; self.lock.unlock()
+      let r = FastRetry(ref: ref, refPTS: refPTS, t: pts, from: from, to: to, crop: crop, tries: 1)
+      // 0.11.7: no aparelho (19/10, 0.11.6) a medida da rápida deu "não deu" nas trocas do clique — tenta nos próximos quadros da
+      // lente nova (até 6 ≈ 0,1 s; ainda ~0,4 s antes de a tela mostrar o zoom)
+      if m == nil && FrameLock.on { self.lock.lock(); self.fastRetry = r; self.switchBusy = false; self.lock.unlock(); return }
+      self.finishFastSwitch(m, r, step: step, why: nil)
+    }
+  }
+  private func finishFastSwitch(_ m: (g: SwitchGeometry, conf: Float, gain: Float)?, _ r: FastRetry, step: Double, why: String?, releaseBusy: Bool = true) {
+    let pts = r.t, from = r.from, to = r.to
+    // previsão pro quadro estabilizado: escala × razão aprendida deste par (o corte da estabilização pode mudar com a lente),
+    // deslocamento × corte (o estabilizado mostra 1/corte do quadro rápido); sem medida: o que este par costuma fazer
+    var pred: SwitchGeometry?
+    if let m { let c = Float(max(1, r.crop)); pred = SwitchGeometry(s: m.g.s * SwitchMemory.ratio(from: from, to: to), tx: m.g.tx * c, ty: m.g.ty * c, exact: true) }
+    else if let s = SwitchMemory.scale(from: from, to: to) { pred = SwitchGeometry(s: s, tx: 0, ty: 0, exact: true) }
+    switchHider.add(t: pts, from: from, to: to, fast: m?.g, pred: pred, step: step)
+    // troca enquadrada: o pulo inteiro da rápida (escala sem a razão antiga: no aparelho rápida × estabilizado bateram); sem medida,
+    // o que este par fez DE VERDADE nas últimas trocas enquadradas (nunca a escala do lsw1, que chegou a dizer 1,0094 pra um 0,956)
+    let c = Float(max(1, r.crop))
+    let lpred = m.map { SwitchGeometry(s: $0.g.s, tx: $0.g.tx * c, ty: $0.g.ty * c, exact: true) } ?? LockMemory.pred(from: from, to: to)
+    lock.lock(); let hist = zoomHistory; lock.unlock()
+    let motion = FrameLock.findMotion(hist, switchAt: pts, lead: Self.contentLead)
+    let status = frameLock.add(t: pts, from: from, to: to, pred: lpred, motion: motion, room: LockMemory.room(from: from, to: to),
+      center: LockMemory.center(from: from, to: to, fromMemory: m == nil))
+    var info: [String: String] = ["etapa": "rapida", "de": "\(from)", "para": "\(to)", "passo": String(format: "%.4f", step), "tentativas": "\(r.tries)",
+      "medido": m.map { Self.geoText($0.g) + String(format: " conf %.2f", $0.conf) } ?? ("não deu" + (why.map { " (\($0))" } ?? "")), "enquadrada": status]
+    if let pred { info["previsto"] = Self.geoText(pred) }
+    if let lpred, m == nil { info["memoria"] = Self.geoText(lpred) }
+    onSwitch?(info)
+    if releaseBusy { lock.lock(); switchBusy = false; lock.unlock() }
+  }
+  // troca enquadrada: decide e mede no quadro estabilizado (síncrono, antes da tela e do arquivo; só perto de uma troca)
+  private func lockFrame(_ buffer: CVPixelBuffer, pts: Double, sensor: Int, prev: (buffer: CVPixelBuffer, id: Int)?) {
+    guard FrameLock.on else { return }
+    let cz = abs(contentZoomSpeed(at: pts))
+    let turn = MotionHub.shared.rotation(around: pts, half: 0.12).map { ($0.x * $0.x + $0.y * $0.y + $0.z * $0.z).squareRoot() } ?? 0
+    switch frameLock.frame(pts: pts, sensor: sensor, prev: prev?.id ?? 0, moving: cz > 0.05 || turn > 0.35, zooming: cz > 0.05) {
+    case .ref:
+      if let pb = prev?.buffer, let ta = ZoomImage.thumb(pb), let tb = ZoomImage.thumb(buffer) {
+        frameLock.begin(pts: pts, sensor: sensor, ref: ZoomImage.prep(ta), img: ZoomImage.prep(tb))
+      }
+    case .measure:
+      if let tb = ZoomImage.thumb(buffer) { frameLock.measure(pts: pts, sensor: sensor, img: ZoomImage.prep(tb)) }
+    case .none: break
     }
   }
   private func watchFocus(pts: Double, sharp: Float) {
@@ -310,7 +374,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   func fileSwitchGeometry(_ pb: CVPixelBuffer?, pts: Double) -> SwitchGeometry {
     guard let pb else { return .identity }
     let sid = LensID.of(pb)
-    let g = SwitchPlan.compose(arrival.geometry(pts: pts, sensor: sid), switchHider.geometry(pts: pts, sensor: sid, file: true).g)
+    let g = SwitchPlan.compose(arrival.geometry(pts: pts, sensor: sid), SwitchPlan.compose(frameLock.geometry(pts: pts, sensor: sid), switchHider.geometry(pts: pts, sensor: sid, file: true).g))
     let d = Float(max(1, digitalAt?(pts) ?? 1))
     return d > 1.0005 ? SwitchPlan.compose(SwitchGeometry(s: d, tx: 0, ty: 0, exact: true), g) : g
   }
@@ -433,7 +497,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; prevShown = nil; xfade = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; arrival.reset(); eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; prevShown = nil; xfade = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; arrival.reset(); frameLock.reset(); fastRetry = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -514,7 +578,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
     var raw = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: NSNull()])
-    let geo = pts.map { SwitchPlan.compose(arrival.geometry(pts: $0, sensor: sid), sw.g) } ?? sw.g   // + chegada assentada (0.10.11)
+    // + troca enquadrada (0.11.7) + chegada assentada (0.10.11)
+    let geo = pts.map { SwitchPlan.compose(arrival.geometry(pts: $0, sensor: sid), SwitchPlan.compose(frameLock.geometry(pts: $0, sensor: sid), sw.g)) } ?? sw.g
     if !geo.isIdentity { raw = Self.aligned(raw, geo) }   // no quadro do sensor (mesma conta do arquivo)
     var image = Self.orient(raw, orient, mirrored: mirror)
     // ampliação = zoom pedido agora ÷ zoom do conteúdo do quadro; nunca < 1 (zoom out: o quadro como está, sem borda inventada)
@@ -564,7 +629,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if a >= 1 || a < 0 { xfade = nil } else { image = x.image.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: image, kCIInputTimeKey: a * a * (3 - 2 * a)]) }
     }
     prevShown = (fresh, sid)
-    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(geo.s), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "", focus: focusProbe?() ?? "") }
+    if tap.active { tap.offer(image, size: target, context: context, at: now, pts: pts ?? 0, k: k * dz, kOld: kOld, g: Double(geo.s), gx: Double(geo.tx), gy: Double(geo.ty), z: zNow ?? 0, lens: LensID.name(buffer) ?? lensMatch?.lens(at: pts ?? now) ?? "", focus: focusProbe?() ?? "") }
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)

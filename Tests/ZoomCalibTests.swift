@@ -610,7 +610,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     lockSim("clique 1×→2×: +4,3%, 2,4% → escorrega até 4,5% (medido 19/10)", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003))
     lockSim("5×: +4,8% e 6,5% de uma vez", J: 1.048, inst: (0.062, -0.004), fin: (0.065, -0.004))
     lockSim("lente nova mais ABERTA −5%, 1%", J: 1 / 1.05, inst: (-0.006, 0.004), fin: (-0.01, 0.006))
-    lockSim("mão tremendo forte", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), shake: 0.0006, strict: false)
+    lockSim("mão tremendo forte", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), strict: false, shake: 0.0006)
     lockSim("cena escura (contraste 0,15)", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), contrast: 0.15, strict: false)
     lockSim("rápida não mediu, previsão aprendida do par", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), fastOK: false,
             memPred: SwitchGeometry(s: Float(1 / 1.043) * 1.003, tx: 0.043, ty: 0.003, exact: true))
