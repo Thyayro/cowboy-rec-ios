@@ -125,6 +125,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private(set) var device: AVCaptureDevice?
   private(set) var base: CGFloat = 1
   private var configured = false
+  // VOLTA DA FOTO (0.11.6): a sessão de foto (preset .photo) troca o formato e o espaço de cor do MESMO aparelho (o
+  // AVCaptureDevice é um só pras duas sessões). Ao voltar, a de vídeo só religava e a tela aplicava a conversão Log→709
+  // num quadro que já não era Log = imagem estourada. Com esta marca o start reaplica o formato do vídeo inteiro.
+  private var reapplyAfterPhoto = false
+  func resumeFromPhoto() { queue.async { self.reapplyAfterPhoto = true; self.publish { self.start() } } }
   private var zoomObservation: NSKeyValueObservation?
   private var rotationObservation: NSKeyValueObservation?
   private var rotation: AVCaptureDevice.RotationCoordinator?
@@ -337,6 +342,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       queue.async {
         do {
           if !self.configured { try self.guarded { try self.configure() } }
+          else if self.reapplyAfterPhoto {
+            self.reapplyAfterPhoto = false
+            try self.guarded { try self.configure(cameraID: self.device?.uniqueID, profile: self.selectedProfile) }
+            let cs = self.device.map { "\($0.activeColorSpace.rawValue)" } ?? "?"
+            Diag.step("photo-back", ["log": self.requestedLog, "hdr": self.requestedHDR, "cor": cs])
+          }
           if !self.session.isRunning { self.session.startRunning() }
           if !self.session.isRunning { self.retryRunning(0) }
           self.configureStabilization()

@@ -164,7 +164,7 @@ struct RecorderView: View {
       if ok && !UserDefaults.standard.bool(forKey: "zoomcalib_075") { UserDefaults.standard.set(true, forKey: "zoomcalib_075"); DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { askSelfTest = true } }
     }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
-    .fullScreenCover(isPresented: $photoMode, onDismiss: { camera.renderer.paused = false; camera.start() }) { PhotoCameraView { photoMode = false } }
+    .fullScreenCover(isPresented: $photoMode, onDismiss: { camera.renderer.paused = false; camera.resumeFromPhoto() }) { PhotoCameraView { photoMode = false } }
     .task {
       Diag.install(); Diag.step("open")
       UIDevice.current.beginGeneratingDeviceOrientationNotifications()
