@@ -57,7 +57,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // TROCA ENQUADRADA (0.11.7, ver FrameLock): troca na chegada do zoom = preparo dentro do movimento + lente nova medida quadro a
   // quadro contra a velha (escala e posição) antes da tela e do arquivo
   let frameLock = FrameLock()
-  private struct FastRetry { let ref: [Float]; let refPTS: Double; let t: Double; let from: Int; let to: Int; let crop: Double; var tries: Int }
+  // acc = soma das miniaturas CRUAS dos quadros novos já tentados (a lente nova parada: somar tira ruído, o prep normaliza)
+  private struct FastRetry { let ref: [Float]; let refPTS: Double; let t: Double; let from: Int; let to: Int; let crop: Double; var tries: Int; var acc: [Float] }
   private var fastRetry: FastRetry?
   private var arrivalBusy = false
   private let arrivalQueue = DispatchQueue(label: "cowboy.preview.arrival", qos: .userInitiated)
@@ -232,10 +233,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let r = retryLost { switchQueue.async { self.finishFastSwitch(nil, r, step: 1, why: "lente mudou de novo", releaseBusy: false) } }
     if let r = retryJob {
       switchQueue.async {
-        var m = ZoomImage.thumb(buffer).flatMap { ZoomImage.switchGeo(r.ref, ZoomImage.prep($0)) }
+        var j = r
+        // 0.11.7: média dos quadros novos até aqui (só se o zoom continua parado: senão o quadro novo sozinho)
+        if let t = ZoomImage.thumb(buffer) { j.acc = abs(log(retryStep)) < 0.002 && j.acc.count == t.count ? zip(j.acc, t).map { $0 + $1 } : t }
+        var m = j.acc.isEmpty || r.ref.isEmpty ? nil : ZoomImage.switchGeo(r.ref, ZoomImage.prep(j.acc))
         m = m.map { (SwitchGeometry(s: $0.g.s * Float(retryStep), tx: $0.g.tx, ty: $0.g.ty, exact: true), $0.conf, $0.gain) }
-        if m == nil && r.tries < 6 { self.lock.lock(); self.fastRetry = r; self.switchBusy = false; self.lock.unlock(); return }
-        self.finishFastSwitch(m, r, step: retryStep, why: nil)
+        if m == nil && r.tries < 6 { self.lock.lock(); self.fastRetry = j; self.switchBusy = false; self.lock.unlock(); return }
+        self.finishFastSwitch(m, j, step: retryStep, why: m == nil && !j.acc.isEmpty && !r.ref.isEmpty ? ZoomImage.switchWhy(r.ref, ZoomImage.prep(j.acc)) : nil)
       }
     }
     if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving, sensor: sid) }
@@ -269,13 +273,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private func measureFastSwitch(_ a: CVPixelBuffer, _ b: CVPixelBuffer, pts: Double, from: Int, to: Int, crop: Double, step: Double = 1, refPTS: Double) {
     switchQueue.async {
       guard let ta = ZoomImage.thumb(a), let tb = ZoomImage.thumb(b) else {
-        self.finishFastSwitch(nil, FastRetry(ref: [], refPTS: refPTS, t: pts, from: from, to: to, crop: crop, tries: 1), step: step, why: "sem miniatura"); return
+        self.finishFastSwitch(nil, FastRetry(ref: [], refPTS: refPTS, t: pts, from: from, to: to, crop: crop, tries: 1, acc: []), step: step, why: "sem miniatura"); return
       }
       let ref = ZoomImage.prep(ta)
       var m = ZoomImage.switchGeo(ref, ZoomImage.prep(tb))
       // só o pulo da LENTE: o quadro novo também está `step` mais perto pelo próprio zoom (a ampliação k cuida disso)
       m = m.map { (SwitchGeometry(s: $0.g.s * Float(step), tx: $0.g.tx, ty: $0.g.ty, exact: true), $0.conf, $0.gain) }
-      let r = FastRetry(ref: ref, refPTS: refPTS, t: pts, from: from, to: to, crop: crop, tries: 1)
+      let r = FastRetry(ref: ref, refPTS: refPTS, t: pts, from: from, to: to, crop: crop, tries: 1, acc: tb)
       // 0.11.7: no aparelho (19/10, 0.11.6) a medida da rápida deu "não deu" nas trocas do clique — tenta nos próximos quadros da
       // lente nova (até 6 ≈ 0,1 s; ainda ~0,4 s antes de a tela mostrar o zoom)
       if m == nil && FrameLock.on { self.lock.lock(); self.fastRetry = r; self.switchBusy = false; self.lock.unlock(); return }
@@ -316,10 +320,15 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
         frameLock.begin(pts: pts, sensor: sensor, ref: ZoomImage.prep(ta), img: ZoomImage.prep(tb))
       }
     case .measure:
+      // roda na fila dos quadros (a do gravador): medida que passou de 6 ms pula o quadro seguinte (fica a anterior, ~1 quadro)
+      if lockSkip { lockSkip = false; return }
+      let t0 = CACurrentMediaTime()
       if let tb = ZoomImage.thumb(buffer) { frameLock.measure(pts: pts, sensor: sensor, img: ZoomImage.prep(tb)) }
+      lockSkip = CACurrentMediaTime() - t0 > 0.006
     case .none: break
     }
   }
+  private var lockSkip = false
   private func watchFocus(pts: Double, sharp: Float) {
     lock.lock()
     var done: [String: String]?

@@ -498,7 +498,12 @@ extension ZoomImage {
   // do aligned da tela e do shader do arquivo). Sem previsão: escala 0,86–1,18 e deslocamento ±8 × ±6 pontos; com previsão:
   // ±4% e ±3 pontos em volta dela (rápido: roda no quadro estabilizado antes de ele ir pra tela/arquivo).
   // nil = cena sem textura, resposta na borda da busca ou confiança baixa — aí não se corrige nada (nunca piora).
-  static func switchGeo(_ ref: [Float], _ img: [Float], around: SwitchGeometry? = nil) -> (g: SwitchGeometry, conf: Float, gain: Float)? {
+  // por que a medida da troca não deu (diag 0.11.7: no aparelho a rápida dizia só "não deu"): melhor ponto, confiança e se encostou na borda
+  static func switchWhy(_ ref: [Float], _ img: [Float]) -> String {
+    guard let r = switchGeo(ref, img, minConf: -.infinity, allowEdge: true) else { return "sem textura" }
+    return String(format: "melhor %.4f %+.4f %+.4f conf %.3f%@", r.g.s, r.g.tx, r.g.ty, r.conf, switchGeo(ref, img, minConf: -.infinity) == nil ? " BORDA" : "")
+  }
+  static func switchGeo(_ ref: [Float], _ img: [Float], around: SwitchGeometry? = nil, minConf: Float = 0.04, allowEdge: Bool = false) -> (g: SwitchGeometry, conf: Float, gain: Float)? {
     let W = Float(w), H = Float(h)
     var best = (s: Float(1), dx: Float(0), dy: Float(0), e: Float.infinity)
     func t1(_ s: Float, _ dx: Float, _ dy: Float, _ step: Int) {
@@ -522,8 +527,8 @@ extension ZoomImage {
     let conf = ((ep + em) / 2 - e) / e
     let gain = e0.isFinite && e0 > 0 ? 1 - e / e0 : 0
     // encostou na borda da busca = o pulo de verdade está fora do alcance (não confia)
-    if best.s < sLo * 1.004 || best.s > sHi / 1.004 || abs(best.dx - cx) > Float(rx) - 0.3 || abs(best.dy - cy) > Float(ry) - 0.3 { return nil }
-    guard conf.isFinite, conf >= 0.04 else { return nil }
+    if !allowEdge && (best.s < sLo * 1.004 || best.s > sHi / 1.004 || abs(best.dx - cx) > Float(rx) - 0.3 || abs(best.dy - cy) > Float(ry) - 0.3) { return nil }
+    guard conf.isFinite, conf >= minConf else { return nil }
     return (SwitchGeometry(s: best.s, tx: best.dx / W, ty: best.dy / H, exact: true), conf, gain)
   }
 }
