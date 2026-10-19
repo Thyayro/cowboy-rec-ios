@@ -799,3 +799,339 @@ enum SwitchMemory {
     Float(min(1.05, max(0.95, median(UserDefaults.standard.array(forKey: key(a, b) + "r") as? [Double] ?? []) ?? 1)))
   }
 }
+
+// ---- TROCA ENQUADRADA (0.11.7) ----
+// Uso real 19/10 (0.11.6, 3 trechos da tela das 22:08, SIFT quadro a quadro): no clique 1×→2× e no 5× o iPhone troca ultra→principal
+// ~80–100 ms DEPOIS de o zoom chegar; a lente nova entra 4,0–4,8% maior e 2,4–6,5% deslocada, e o estabilizador ainda escorrega mais
+// 1,3–2,5% em ~0,35 s. Desde a 0.9.0 a geometria da troca estava desligada (só dissolve): o dissolve cruzava duas imagens desalinhadas
+// = "na chegada a câmera muda e a posição distorce". A medida do pulo funciona nesses quadros (escala 0,956, deslocamento 2,2–3,8%,
+// confiança 0,06–0,19); o que faltava era usar. E a saída rápida vê a troca ~0,5 s ANTES de a tela mostrar o próprio zoom do clique.
+// Então:
+//  1. PREPARO DENTRO DO MOVIMENTO: a lente velha ganha a escala + posição que a nova vai ter proporcional ao PROGRESSO do zoom (não
+//     por tempo, como a 0.8.0): o zoom pousa direto onde a lente nova vai estar e nada anda com a imagem parada.
+//  2. ENTRADA MEDIDA: cada quadro estabilizado da lente nova é medido contra o ÚLTIMO da velha (antes de ir pra tela e pro arquivo) e
+//     entra exatamente no enquadramento dela — escala e POSIÇÃO, inclusive o escorregão do estabilizador (posição por 0,8 s; escala
+//     — respiração do foco — até 2,6 s, filtrada como a chegada assentada).
+//  3. FOLGA: a ampliação extra pra caber o escorregão sem borda (aprendida por par) entra junto no preparo, escondida no movimento.
+//     Tudo fica parado até o PRÓXIMO zoom, onde solta em 0,35 s (sempre antes da troca seguinte).
+// Sem movimento pra esconder (troca com o zoom parado há mais de 0,35 s), estabilização sem atraso (tarde pra preparar) ou sem medida
+// nem previsão aprendida: não faz nada (fica como na 0.11.6). Nunca borda: tudo só amplia e o deslocamento cabe na sobra.
+
+// movimento do zoom do conteúdo que terminou logo antes da troca (pts do quadro; z = zoom do aparelho)
+struct ZoomMotion {
+  let curve: [(p: Double, z: Double)]
+  var p0: Double { curve.first?.p ?? 0 }
+  var p1: Double { curve.last?.p ?? 0 }
+  // 0 no começo do movimento, 1 no fim (em log do zoom: anda junto com o que a tela mostra)
+  func progress(_ p: Double) -> Double {
+    guard let a = curve.first, let b = curve.last, a.z > 0, b.z > 0, abs(log(b.z / a.z)) > 1e-6 else { return p >= p1 ? 1 : 0 }
+    if p <= a.p { return 0 }
+    if p >= b.p { return 1 }
+    var z = b.z
+    for i in 1..<curve.count where curve[i].p >= p {
+      let c0 = curve[i - 1], c1 = curve[i], k = (p - c0.p) / max(1e-6, c1.p - c0.p)
+      z = c0.z + (c1.z - c0.z) * k; break
+    }
+    return min(1, max(0, log(z / a.z) / log(b.z / a.z)))
+  }
+}
+
+extension ZoomImage {
+  // seguir a geometria quadro a quadro (troca enquadrada): busca curta em volta da anterior + refinamento parabólico (sem degrau de
+  // 1/8 de ponto = 0,13% da largura, que viraria tremidinha). nil = encostou na borda da busca (andou mais que um quadro anda) ou
+  // confiança baixa
+  static func trackGeo(_ ref: [Float], _ img: [Float], around a: SwitchGeometry, ds: Float = 0.006, dp: Float = 1.5) -> (g: SwitchGeometry, conf: Float)? {
+    let W = Float(w), H = Float(h)
+    var best = (s: a.s, dx: a.tx * W, dy: a.ty * H, e: Float.infinity)
+    func e(_ s: Float, _ dx: Float, _ dy: Float, _ step: Int) -> Float { cost(ref, img, s, dx / W, dy / H, step: step) }
+    func t1(_ s: Float, _ dx: Float, _ dy: Float, _ step: Int) { let v = e(s, dx, dy, step); if v < best.e { best = (s, dx, dy, v) } }
+    let c0 = best
+    let ns = Int((ds / 0.0015).rounded()), np = Int((dp / 0.5).rounded())
+    for k in -ns...ns { for y in -np...np { for x in -np...np { t1(c0.s * (1 + Float(k) * 0.0015), c0.dx + Float(x) * 0.5, c0.dy + Float(y) * 0.5, 2) } } }
+    let coarse = best
+    if abs(coarse.s / c0.s - 1) > ds - 0.0008 || abs(coarse.dx - c0.dx) > dp - 0.25 || abs(coarse.dy - c0.dy) > dp - 0.25 { return nil }
+    best.e = e(coarse.s, coarse.dx, coarse.dy, 1)
+    for k in -1...1 { for y in -2...2 { for x in -2...2 { t1(coarse.s * (1 + Float(k) * 0.0006), coarse.dx + Float(x) * 0.125, coarse.dy + Float(y) * 0.125, 1) } } }
+    var c = best
+    // parábola em cada eixo (passo h) em volta do melhor ponto da grade
+    func para(_ em: Float, _ e0: Float, _ ep: Float, _ h: Float) -> Float {
+      let d = em - 2 * e0 + ep
+      guard d > 1e-9 else { return 0 }
+      return min(h, max(-h, h * (em - ep) / (2 * d)))
+    }
+    let hp: Float = 0.0625, hs: Float = 0.0004
+    let ddx = para(e(c.s, c.dx - hp, c.dy, 1), c.e, e(c.s, c.dx + hp, c.dy, 1), hp)
+    let ddy = para(e(c.s, c.dx, c.dy - hp, 1), c.e, e(c.s, c.dx, c.dy + hp, 1), hp)
+    let dds = para(e(c.s * (1 - hs), c.dx, c.dy, 1), c.e, e(c.s * (1 + hs), c.dx, c.dy, 1), hs)
+    c.dx += ddx; c.dy += ddy; c.s *= 1 + dds
+    let e0 = e(c.s, c.dx, c.dy, 1)
+    guard e0.isFinite, e0 > 0 else { return nil }
+    let conf = ((e(c.s * 1.006, c.dx, c.dy, 1) + e(c.s / 1.006, c.dx, c.dy, 1)) / 2 - e0) / e0
+    guard conf.isFinite, conf >= 0.03 else { return nil }
+    return (SwitchGeometry(s: c.s, tx: c.dx / W, ty: c.dy / H, exact: true), conf)
+  }
+}
+
+final class FrameLock: @unchecked Sendable {
+  static var on = true
+  static let maxGap = 0.35          // s: troca até isso depois de o zoom parar = dá pra esconder no movimento
+  static let minMove = 0.15         // log do zoom: o movimento tem que ser bem maior que o preparo
+  static let maxPrep: Float = 1.18
+  static let posWindow = 0.8, scaleWindow = 2.6, releaseDur = 0.35, flash = 0.2
+  static let maxShiftStep: Float = 0.012   // fração do quadro que a posição pode andar entre duas medidas (o escorregão anda ~0,3%)
+  enum Need { case none, ref, measure }
+  struct Event {
+    let t: Double; let from: Int; let to: Int
+    let pred: SwitchGeometry        // pulo previsto (nova → velha, quadro estabilizado): o da saída rápida = o pulo INTEIRO
+    let aim: SwitchGeometry         // meio do caminho esperado (o estabilizado mostra parte na hora e escorrega o resto)
+    let plan: SwitchGeometry        // preparo completo da lente velha
+    let motion: ZoomMotion
+    let room: Float
+    var firstSeen: Double?
+    var dead = false
+    var ref: [Float]?
+    var m: SwitchGeometry?          // última medida aceita
+    var mFirst: SwitchGeometry?
+    var tF = (x: Float(0), y: Float(0))
+    var sRaw: [Float] = []
+    var sF: Float = 1
+    var track: [(p: Double, g: SwitchGeometry)] = []
+    var n = 0, bad = 0, badRun = 0
+    var glide: Float = 0
+    var releaseP: Double?, releaseEnd: Double?
+    var held = SwitchGeometry(exact: true)
+    var done = false
+    var lastP = 0.0
+  }
+  private let lock = NSLock()
+  private var events: [Event] = []
+  var onDone: (([String: String]) -> Void)?
+  var learn: (Int, Int, _ first: SwitchGeometry, _ final: SwitchGeometry, _ pred: SwitchGeometry) -> Void = { a, b, f, l, p in LockMemory.record(from: a, to: b, first: f, final: l, pred: p) }
+  static let defaultCenter: Float = 0.75   // 19/10: o estabilizado mostrou 53–70% do pulo na hora e escorregou o resto
+  // folga padrão (sem nada aprendido): cobre de ~45% a 105% do deslocamento previsto em volta do centro
+  static func defaultRoom(_ pred: SwitchGeometry) -> Float { max(0.006, 0.004 + 0.27 * max(abs(pred.tx), abs(pred.ty))) }
+  func reset() { lock.lock(); events.removeAll(); lock.unlock() }
+
+  // movimento de zoom que terminou ≤ maxGap antes da troca, no histórico (hora do pedido, zoom); o conteúdo do quadro p tem o zoom
+  // pedido em p + lead
+  static func findMotion(_ hist: [(Double, Double)], switchAt t: Double, lead: Double) -> ZoomMotion? {
+    let h = hist.map { (p: $0.0 - lead, z: $0.1) }.filter { $0.z > 0 }
+    guard h.count >= 3 else { return nil }
+    var end = -1
+    var i = h.count - 1
+    while i >= 1 {
+      if h[i].p <= t + 0.001 && abs(log(h[i].z / h[i - 1].z)) > 1e-4 { end = i; break }
+      i -= 1
+    }
+    guard end > 0, t - h[end].p <= maxGap else { return nil }
+    let dir: Double = h[end].z > h[end - 1].z ? 1 : -1
+    var start = end - 1
+    while start > 0 && h[start].p - h[start - 1].p < 0.1 && log(h[start].z / h[start - 1].z) * dir > 1e-5 { start -= 1 }
+    let curve = Array(h[start...end])
+    guard abs(log(curve.last!.z / curve.first!.z)) >= minMove else { return nil }
+    return ZoomMotion(curve: curve)
+  }
+  // preparo P da lente velha pro pulo g (nova → velha): a lente nova entra com C = P∘g sem borda e com folga `room` (fração do quadro)
+  // pro escorregão; P desloca a velha pro enquadramento da nova (C sem deslocamento) até onde a sobra deixa. nil = pulo fora da faixa
+  static func plan(_ g: SwitchGeometry, room: Float) -> SwitchGeometry? {
+    let m = max(abs(g.tx), abs(g.ty)), den = (1 + g.s) / 2 - m - room
+    guard g.s > 0.75, g.s < 1.33, den > 0.6, g.s - 2 * room > 0.6 else { return nil }
+    let sP = max(1, 1 / den, (1 + 2 * room) / g.s)
+    guard sP <= maxPrep else { return nil }
+    func axis(_ t: Float) -> Float {
+      let a = (sP - 1) / 2, b = (sP * g.s - 1) / 2 - sP * room, want = -sP * t
+      let lo = max(-a, want - b), hi = min(a, want + b)
+      return lo <= hi ? min(hi, max(lo, want)) : min(a, max(-a, want))
+    }
+    return SwitchGeometry(s: sP, tx: axis(g.tx), ty: axis(g.ty), exact: true)
+  }
+
+  // saída rápida: troca de `from` pra `to` no pts t, com o pulo previsto pro quadro estabilizado e o movimento que acabou antes dela.
+  // Devolve o que fez (diag).
+  // center = fração do deslocamento previsto onde mirar; room ≤ 0 = folga padrão
+  @discardableResult func add(t: Double, from: Int, to: Int, pred: SwitchGeometry?, motion: ZoomMotion?, room: Float = 0, center: Float = FrameLock.defaultCenter) -> String {
+    guard Self.on else { return "desligada" }
+    lock.lock(); defer { lock.unlock() }
+    events.removeAll { $0.t < t - 8 }
+    // a anterior (que deu a lente velha desta) termina de soltar antes desta troca
+    for k in events.indices where events[k].to == from && !events[k].dead { events[k].releaseEnd = t - 0.017 }
+    // ida-e-volta rápida (objeto perto): as duas saem — a tela segura o quadro (LensSwitchHider)
+    if let j = events.lastIndex(where: { !$0.dead && $0.from == to && $0.to == from && t - $0.t <= Self.flash }) { events[j].dead = true; return "ida-e-volta" }
+    guard let pred else { return "sem medida nem previsão" }
+    guard let motion else { return "sem movimento pra esconder" }
+    let room = min(0.03, max(0.006, room > 0 ? room : Self.defaultRoom(pred)))
+    let c = min(1.2, max(0.3, center))
+    let aim = SwitchGeometry(s: pred.s, tx: pred.tx * c, ty: pred.ty * c, exact: true)
+    guard let plan = Self.plan(aim, room: room) else { return "pulo fora da faixa" }
+    events.append(Event(t: t, from: from, to: to, pred: pred, aim: aim, plan: plan, motion: motion, room: room))
+    events.sort { $0.t < $1.t }
+    return String(format: "preparo %.4f %+.4f %+.4f no zoom (%.0f ms, termina %.0f ms antes)", plan.s, plan.tx, plan.ty, (motion.p1 - motion.p0) * 1000, (t - motion.p1) * 1000)
+  }
+  // quanto do preparo o quadro p da lente velha leva: progresso do zoom, a partir do que a tela já mostrava quando soube da troca
+  private static func prepAmount(_ e: Event, _ p: Double) -> Float {
+    guard let fs = e.firstSeen else { return 0 }
+    let x0 = e.motion.progress(fs)
+    guard x0 < 0.5 else { return 0 }   // tarde: a tela já mostrou boa parte do movimento sem preparo
+    return Float(max(0, (e.motion.progress(p) - x0) / (1 - x0)))
+  }
+  private static func applied(_ e: Event) -> SwitchGeometry { e.plan.mix(prepAmount(e, e.t - 0.0005)) }
+  // geometria da lente nova sem a soltura: a última medida até p, senão a previsão
+  private static func composite(_ e: Event, _ p: Double) -> SwitchGeometry {
+    if let g = e.track.last(where: { $0.p <= p + 0.001 })?.g { return g }
+    return SwitchPlan.valid(SwitchPlan.compose(applied(e), e.aim))
+  }
+  private static func newGeo(_ e: Event, _ p: Double) -> SwitchGeometry {
+    if let rp = e.releaseP, p >= rp - 0.001 {
+      var dur = releaseDur
+      if let end = e.releaseEnd { dur = min(dur, max(0.05, end - rp)) }
+      let x = (p - rp) / dur
+      return x >= 1 ? SwitchGeometry(exact: true) : e.held.mix(1 - SwitchPlan.smooth(x))
+    }
+    return composite(e, p)
+  }
+  // a troca da lente `id` em p é desta classe? (aí a chegada assentada não mexe nela)
+  func owns(sensor id: Int, pts p: Double) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    return events.contains { !$0.dead && $0.to == id && p >= $0.t - 0.001 && p - $0.t < 30 }
+  }
+  // cada quadro estabilizado, antes da tela e do arquivo. moving = zoom do conteúdo andando ou celular girando
+  func frame(pts p: Double, sensor id: Int, prev: Int, moving: Bool, zooming: Bool) -> Need {
+    guard Self.on, id != 0 else { return .none }
+    lock.lock(); defer { lock.unlock() }
+    guard let i = events.lastIndex(where: { !$0.dead && $0.to == id && p >= $0.t - 0.001 && p - $0.t < 30 }) else { return .none }
+    if events[i].releaseP != nil { return .none }
+    // o próximo zoom solta (escondido nele); o giro só para de medir (a ampliação parada não aparece andando com o celular)
+    if zooming && p > events[i].t + 0.05 { events[i].held = Self.composite(events[i], p); events[i].releaseP = p; finishLocked(i, p); return .none }
+    if events[i].done { return .none }
+    if moving && p > events[i].t + 0.05 { finishLocked(i, p); return .none }
+    if events[i].ref == nil {
+      if prev == events[i].from && abs(p - events[i].t) < 0.1 { return .ref }
+      finishLocked(i, p); return .none   // a troca chegou na tela antes de a rápida avisar: fica a previsão
+    }
+    guard events[i].badRun < 6 else { finishLocked(i, p); return .none }
+    let age = p - events[i].t
+    if age < Self.posWindow { return .measure }
+    if age < Self.scaleWindow { let n = Int((age * 60).rounded()); return n % 2 == 0 ? .measure : .none }
+    finishLocked(i, p); return .none
+  }
+  // 1º quadro da lente nova: referência = último quadro estabilizado da velha; mede em volta da previsão (síncrono, ~10 ms, só na troca)
+  func begin(pts p: Double, sensor id: Int, ref: [Float], img: [Float]) {
+    lock.lock()
+    guard let i = events.lastIndex(where: { !$0.dead && $0.to == id && abs(p - $0.t) < 0.1 && $0.ref == nil }) else { lock.unlock(); return }
+    events[i].ref = ref
+    let aim = events[i].aim
+    lock.unlock()
+    var m = ZoomImage.switchGeo(ref, img, around: aim).map { $0.g }
+    if let g = m { m = ZoomImage.trackGeo(ref, img, around: g, ds: 0.003, dp: 1.0)?.g ?? g }
+    lock.lock(); defer { lock.unlock() }
+    guard let j = events.lastIndex(where: { !$0.dead && $0.to == id && $0.ref != nil && abs(p - $0.t) < 0.1 }) else { return }
+    events[j].n += 1
+    guard let g = m else { events[j].bad += 1; events[j].badRun = 6; return }   // sem a 1ª medida não se segue nada: fica a previsão
+    events[j].m = g; events[j].mFirst = g
+    events[j].tF = (g.tx, g.ty); events[j].sF = g.s; events[j].sRaw = [g.s]
+    appendLocked(j, p)
+  }
+  // quadros seguintes da lente nova: contra a MESMA referência, em volta da medida anterior (síncrono, ~3 ms)
+  func measure(pts p: Double, sensor id: Int, img: [Float]) {
+    lock.lock()
+    guard let i = events.lastIndex(where: { !$0.dead && $0.to == id && $0.ref != nil && p >= $0.t && $0.releaseP == nil && !$0.done }),
+          let ref = events[i].ref, let around = events[i].m else { lock.unlock(); return }
+    let t = events[i].t
+    lock.unlock()
+    let r = ZoomImage.trackGeo(ref, img, around: around)
+    lock.lock(); defer { lock.unlock() }
+    guard let j = events.lastIndex(where: { $0.t == t && !$0.dead }), events[j].releaseP == nil else { return }
+    events[j].n += 1
+    guard let g = r?.g, abs(g.s / around.s - 1) <= 0.006, abs(g.tx - around.tx) <= Self.maxShiftStep, abs(g.ty - around.ty) <= Self.maxShiftStep else {
+      events[j].bad += 1; events[j].badRun += 1; return
+    }
+    events[j].badRun = 0
+    events[j].m = g
+    // posição: segue a medida (o escorregão anda ~0,3% por quadro), sem mexer abaixo de 0,06% (tremidinha); só na janela de posição
+    if p - t < Self.posWindow {
+      if abs(g.tx - events[j].tF.x) > 0.0006 { events[j].tF.x = g.tx }
+      if abs(g.ty - events[j].tF.y) > 0.0006 { events[j].tF.y = g.ty }
+      if let f = events[j].mFirst { events[j].glide = max(events[j].glide, abs(g.tx - f.tx), abs(g.ty - f.ty)) }
+    }
+    // escala: como a chegada assentada (mediana das 5 últimas, 30% do caminho, nada abaixo de 0,04%, no máximo 0,18% por medida)
+    events[j].sRaw.append(g.s); if events[j].sRaw.count > 5 { events[j].sRaw.removeFirst(events[j].sRaw.count - 5) }
+    let target = ArrivalAnchor.median(events[j].sRaw) ?? g.s, d = target - events[j].sF
+    if abs(d) > 0.0004 { events[j].sF += max(-ArrivalAnchor.maxStep, min(ArrivalAnchor.maxStep, d * 0.3)) }
+    appendLocked(j, p)
+  }
+  private func appendLocked(_ j: Int, _ p: Double) {
+    let e = events[j]
+    let g = SwitchPlan.valid(SwitchPlan.compose(Self.applied(e), SwitchGeometry(s: e.sF, tx: e.tF.x, ty: e.tF.y, exact: true)))
+    events[j].track.append((p, g)); if events[j].track.count > 200 { events[j].track.removeFirst(events[j].track.count - 200) }
+    events[j].lastP = p
+  }
+  private func finishLocked(_ i: Int, _ p: Double) {
+    guard !events[i].done else { return }
+    events[i].done = true
+    let e = events[i]
+    if let f = e.mFirst, e.n >= 8, e.bad * 3 < e.n { learn(e.from, e.to, f, SwitchGeometry(s: e.sF, tx: e.tF.x, ty: e.tF.y, exact: true), e.pred) }
+    func tx(_ g: SwitchGeometry?) -> String { g.map { String(format: "%.4f %+.4f %+.4f", $0.s, $0.tx, $0.ty) } ?? "nada" }
+    let info: [String: String] = ["etapa": "enquadrada", "de": "\(e.from)", "para": "\(e.to)", "previsto": tx(e.pred), "mira": tx(e.aim), "preparo": tx(e.plan),
+      "mostrado": String(format: "%.2f", Self.prepAmount(e, e.t - 0.0005)), "primeira": tx(e.mFirst), "final": tx(e.m),
+      "escorregou": String(format: "%.4f", e.glide), "folga": String(format: "%.4f", e.room), "entrou": tx(e.track.first?.g),
+      "medidos": "\(e.n)", "ruins": "\(e.bad)", "ms": String(format: "%.0f", (p - e.t) * 1000)]
+    let cb = onDone
+    DispatchQueue.global(qos: .utility).async { cb?(info) }
+  }
+  // geometria do quadro estabilizado p da lente `id` (tela e arquivo): preparo nas velhas, entrada medida nas novas
+  func geometry(pts p: Double, sensor id: Int) -> SwitchGeometry {
+    guard Self.on, id != 0 else { return .identity }
+    lock.lock(); defer { lock.unlock() }
+    guard !events.isEmpty else { return .identity }
+    // a tela/arquivo já passou da troca quando a rápida avisou: nada (entrar com geometria no meio da lente nova seria um pulo)
+    for i in events.indices where events[i].firstSeen == nil { events[i].firstSeen = p; if p >= events[i].t - 0.001 { events[i].dead = true } }
+    var out = SwitchGeometry(exact: true)
+    for e in events where !e.dead && abs(p - e.t) < 30 {
+      if id == e.from && p < e.t - 0.0005 {
+        let y = Self.prepAmount(e, p)
+        if y > 0 { out = SwitchPlan.compose(out, e.plan.mix(y)) }
+      } else if id == e.to && p >= e.t - 0.0005 {
+        out = SwitchPlan.compose(out, Self.newGeo(e, p))
+      }
+    }
+    let v = SwitchPlan.valid(out)
+    return v.isIdentity ? .identity : v
+  }
+}
+
+// o que a troca de cada par fez de verdade no quadro estabilizado (pra prever quando a rápida não mede) e quanto escorregou
+enum LockMemory {
+  static func key(_ a: Int, _ b: Int) -> String { "lk1_\(a)_\(b)" }
+  // linha = [escala final, tx final, ty final, centro vs previsto, centro vs final, meia faixa do escorregão]
+  static func record(from a: Int, to b: Int, first: SwitchGeometry, final: SwitchGeometry, pred: SwitchGeometry) {
+    let mx = Double(first.tx + final.tx) / 2, my = Double(first.ty + final.ty) / 2
+    func proj(_ g: SwitchGeometry) -> Double {
+      let n = Double(g.tx * g.tx + g.ty * g.ty)
+      return n < 0.005 * 0.005 ? .nan : (mx * Double(g.tx) + my * Double(g.ty)) / n
+    }
+    let half = Double(max(abs(final.tx - first.tx), abs(final.ty - first.ty))) / 2
+    let d = UserDefaults.standard
+    var s = d.array(forKey: key(a, b)) as? [[Double]] ?? []
+    s.append([Double(final.s), Double(final.tx), Double(final.ty), proj(pred), proj(final), half]); if s.count > 7 { s.removeFirst(s.count - 7) }
+    d.set(s, forKey: key(a, b))
+  }
+  private static func rows(_ a: Int, _ b: Int) -> [[Double]] { (UserDefaults.standard.array(forKey: key(a, b)) as? [[Double]] ?? []).filter { $0.count == 6 } }
+  // previsão quando a saída rápida não mede: o que este par fez nas últimas vezes (enquadramento final)
+  static func pred(from a: Int, to b: Int) -> SwitchGeometry? {
+    let r = rows(a, b)
+    guard r.count >= 2, let s = SwitchMemory.median(r.map { $0[0] }), let x = SwitchMemory.median(r.map { $0[1] }), let y = SwitchMemory.median(r.map { $0[2] }) else { return nil }
+    return SwitchGeometry(s: Float(s), tx: Float(x), ty: Float(y), exact: true)
+  }
+  // onde mirar (fração do deslocamento previsto); fromMemory = a previsão veio de `pred` (enquadramento final)
+  static func center(from a: Int, to b: Int, fromMemory: Bool) -> Float {
+    let v = rows(a, b).map { $0[fromMemory ? 4 : 3] }.filter { $0.isFinite }
+    guard v.count >= 2, let c = SwitchMemory.median(v) else { return FrameLock.defaultCenter }
+    return Float(min(1.2, max(0.3, c)))
+  }
+  // folga aprendida (0 = padrão, pelo tamanho do pulo)
+  static func room(from a: Int, to b: Int) -> Float {
+    let r = rows(a, b)
+    guard r.count >= 2, let h = SwitchMemory.median(r.map { $0[5] }) else { return 0 }
+    return Float(min(0.03, max(0.006, h + 0.004)))
+  }
+}

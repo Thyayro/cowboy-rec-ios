@@ -517,6 +517,106 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     _ = arrivalSim("mão tremendo FORTE + cresce 3%", d0: 0.97, dx0: 0, dy0: 0, dur: 1.5, margin: 1.04, strict: true, shake: 0.0012)
     _ = arrivalSim("cena escura (ruído 3×) + cresce 3%", d0: 0.97, dx0: 0.002, dy0: 0, dur: 1.5, margin: 1.04, strict: false, noise: 0.012)
     _ = arrivalSim("0,5→1→0,5→1 seguidas (1,2 s entre trocas)", d0: 0.98, dx0: 0.003, dy0: 0, dur: 1.2, margin: 1.03, strict: true, switches: [1.0, 2.2, 3.0])
+    // (8) TROCA ENQUADRADA (0.11.7): clique com o iPhone trocando de lente ~90 ms DEPOIS de o zoom chegar, como nos trechos da tela de
+    // 19/10 (0.11.6): a lente nova entra 4,3% maior e 2,4% deslocada e o estabilizador escorrega até 4,5% em 0,35 s. A tela recebe o
+    // quadro estabilizado 0,565 s depois; a saída rápida vê a troca 40 ms depois dela (o pulo inteiro, sem escorregão). Exigido: do fim
+    // do zoom até o zoom seguinte a tela não muda mais que 0,4% de tamanho nem de posição (sem a correção: o pulo inteiro), nenhum passo
+    // entre quadros acima de 0,2%, o zoom do clique só anda pra frente (o preparo nunca volta), nunca borda, e no zoom seguinte solta e
+    // termina na lente pura. Escuro / tarde / sem movimento / sem medida: não piora (sem movimento: não mexe em nada).
+    func lockSim(_ name: String, J: Double, inst: (Double, Double), fin: (Double, Double), glideDur: Double = 0.35, contrast: Double = 1,
+                 L: Double = 0.565, fastOK: Bool = true, memPred: SwitchGeometry? = nil, gap: Double = 0.09, strict: Bool = true,
+                 shake: Double = 0.0001, untouched: Bool = false) {
+      let fps = 60.0, crop = 1.12, lead = 0.025
+      let pa = 1.0, pb = 1.15, ts = pb + gap, tm = 3.4, Z0 = 1.0, Z1 = 2.0
+      func zc(_ p: Double) -> Double {
+        func ramp(_ a: Double, _ b: Double, _ z0: Double, _ z1: Double) -> Double { let x = min(1, max(0, (p - a) / (b - a))); return z0 * pow(z1 / z0, x * x * (3 - 2 * x)) }
+        return p < tm ? ramp(pa, pb, Z0, Z1) : ramp(tm, tm + 0.15, Z1, Z1 * 1.5)
+      }
+      let lk = FrameLock()
+      var learned: (SwitchGeometry, SwitchGeometry)?
+      lk.learn = { _, _, f, l, _ in learned = (f, l) }
+      var hist: [(Double, Double)] = []
+      var w = 0.0; while w < 6 { hist.append((w, zc(w - lead))); w += 1.0 / 120 }
+      struct F { let p: Double; let id: Int; let zs: Double; let x: Double; let y: Double }
+      var frames: [F] = []
+      var jx = 0.0, jy = 0.0
+      for n in 0..<Int(4.2 * fps) {
+        let p = Double(n) / fps
+        jx = jx * 0.95 + rng.normal() * shake; jy = jy * 0.95 + rng.normal() * shake
+        let new = p >= ts - 1e-9, zs = zc(p) * crop * (new ? J : 1)
+        var ox = 0.0, oy = 0.0
+        if new {   // deslocamento em fração do quadro estabilizado → cena (o quadro cobre 0,9/z da cena)
+          let e = Double(SwitchPlan.smooth((p - ts) / glideDur))
+          ox = (inst.0 + (fin.0 - inst.0) * e) * 0.9 / zs; oy = (inst.1 + (fin.1 - inst.1) * e) * 0.9 / zs
+        }
+        frames.append(F(p: p, id: new ? 2 : 1, zs: zs, x: ox + jx, y: oy + jy))
+      }
+      func pic(_ zoom: Double, _ x: Double, _ y: Double) -> [Float] {
+        ZoomImage.prep(scene.thumb(zoom, x, y, noise: 0, &rng).map { Float(0.5) + ($0 - Float(0.5)) * Float(contrast) + Float(rng.normal() * 0.004) })
+      }
+      // saída rápida (sem corte): último quadro velho × 1º novo, o pulo INTEIRO (o mesmo deslocamento de cena do final estabilizado)
+      var pred = memPred
+      if fastOK {
+        let zf = zc(ts) * J, fx = fin.0 * 0.9 / (zc(ts) * crop * J), fy = fin.1 * 0.9 / (zc(ts) * crop * J)
+        if let m = ZoomImage.switchGeo(pic(zc(ts - 1 / fps), 0, 0), pic(zf, fx, fy)) { pred = SwitchGeometry(s: m.g.s, tx: m.g.tx * Float(crop), ty: m.g.ty * Float(crop), exact: true) }
+      }
+      var status = "", added = false, prevId = 1
+      var shown: [(p: Double, z: Double, x: Double, y: Double)] = [], base: [(p: Double, z: Double, x: Double, y: Double)] = []
+      var border = 0.0, endPure = true, anyGeo = false
+      for (k, f) in frames.enumerated() {
+        if !added && f.p + L >= ts + 0.04 {
+          added = true
+          status = lk.add(t: ts, from: 1, to: 2, pred: pred, motion: FrameLock.findMotion(hist.filter { $0.0 <= ts + 0.04 }, switchAt: ts, lead: lead))
+        }
+        let zooming = abs(log(zc(f.p + 1 / 120) / zc(f.p - 1 / 120))) * 60 > 0.05
+        switch lk.frame(pts: f.p, sensor: f.id, prev: prevId, moving: zooming, zooming: zooming) {
+        case .ref: let q = frames[k - 1]; lk.begin(pts: f.p, sensor: f.id, ref: pic(q.zs, q.x, q.y), img: pic(f.zs, f.x, f.y))
+        case .measure: lk.measure(pts: f.p, sensor: f.id, img: pic(f.zs, f.x, f.y))
+        case .none: break
+        }
+        prevId = f.id
+        let g = lk.geometry(pts: f.p, sensor: f.id)
+        if !g.isIdentity { anyGeo = true }
+        border = max(border, Double(max(0, 1 - g.s)), Double(max(abs(g.tx), abs(g.ty)) - (g.s - 1) / 2))
+        if f.p > tm + FrameLock.releaseDur + 0.03 && !g.isIdentity { endPure = false }
+        let zd = f.zs * Double(g.s)
+        shown.append((f.p, zd, f.x - Double(g.tx) * 0.9 / zd, f.y - Double(g.ty) * 0.9 / zd))
+        base.append((f.p, f.zs, f.x, f.y))
+      }
+      func metrics(_ s: [(p: Double, z: Double, x: Double, y: Double)]) -> (vz: Double, vp: Double, sz: Double, sp: Double, back: Double) {
+        let win = s.filter { $0.p >= pb - 1e-9 && $0.p < tm }
+        guard let r0 = win.first else { return (0, 0, 0, 0, 0) }
+        var vz = 0.0, vp = 0.0, sz = 0.0, sp = 0.0, back = 0.0
+        for q in win { vz = max(vz, abs(log(q.z / r0.z))); vp = max(vp, abs(q.x - r0.x) * q.z / 0.9, abs(q.y - r0.y) * q.z / 0.9) }
+        for k in 1..<win.count { let a = win[k - 1], b = win[k]; sz = max(sz, abs(log(b.z / a.z))); sp = max(sp, abs(b.x - a.x) * b.z / 0.9, abs(b.y - a.y) * b.z / 0.9) }
+        let mv = s.filter { $0.p >= pa - 0.02 && $0.p <= pb + 0.001 }
+        for k in 1..<mv.count { back = max(back, log(mv[k - 1].z / mv[k].z)) }   // zoom in voltando
+        return (vz, vp, sz, sp, back)
+      }
+      let a = metrics(shown), b = metrics(base)
+      let txt = String(format: "enquadrada %@: depois do zoom a tela variou %.2f%% de tamanho e %.2f%% de posição (sem: %.2f%% / %.2f%%), maior passo %.2f%% / %.2f%%, zoom voltou %.3f%% [%@]",
+        name, a.vz * 100, a.vp * 100, b.vz * 100, b.vp * 100, a.sz * 100, a.sp * 100, a.back * 100, status)
+      check(border < 1e-4, "enquadrada " + name + ": nunca mostra borda")
+      check(endPure, "enquadrada " + name + ": no zoom seguinte solta e volta à lente pura")
+      check(a.back <= 0.0005, txt + " — o preparo não pode fazer o zoom voltar")
+      if untouched { check(!anyGeo, txt + " — sem movimento pra esconder: não mexe em nada"); return }
+      if strict {
+        check(a.vz <= 0.004 && a.vp <= 0.004 && a.sz <= 0.002 && a.sp <= 0.002, txt)
+        if let l = learned { print(String(format: "     aprendeu: 1ª %.4f %+.4f %+.4f · final %.4f %+.4f %+.4f", l.0.s, l.0.tx, l.0.ty, l.1.s, l.1.tx, l.1.ty)) }
+      } else {
+        check(a.vz <= b.vz + 0.002 && a.vp <= b.vp + 0.002, txt + " (não pode piorar)")
+      }
+    }
+    lockSim("clique 1×→2×: +4,3%, 2,4% → escorrega até 4,5% (medido 19/10)", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003))
+    lockSim("5×: +4,8% e 6,5% de uma vez", J: 1.048, inst: (0.062, -0.004), fin: (0.065, -0.004))
+    lockSim("lente nova mais ABERTA −5%, 1%", J: 1 / 1.05, inst: (-0.006, 0.004), fin: (-0.01, 0.006))
+    lockSim("mão tremendo forte", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), shake: 0.0006, strict: false)
+    lockSim("cena escura (contraste 0,15)", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), contrast: 0.15, strict: false)
+    lockSim("rápida não mediu, previsão aprendida do par", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), fastOK: false,
+            memPred: SwitchGeometry(s: Float(1 / 1.043) * 1.003, tx: 0.043, ty: 0.003, exact: true))
+    lockSim("rápida não mediu e nada aprendido", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), fastOK: false, untouched: true)
+    lockSim("estabilização sem atraso (0,15 s): tarde pra preparar", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), L: 0.15, strict: false)
+    lockSim("troca 1 s depois de o zoom parar (sem movimento pra esconder)", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), gap: 1.0, untouched: true)
     print("TESTE DO ZOOM OK")
   }
 }
