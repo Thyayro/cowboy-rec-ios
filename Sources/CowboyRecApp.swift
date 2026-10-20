@@ -183,8 +183,11 @@ struct RecorderView: View {
       }
       updateAngle()
       updateIconAngle()
+      // conta lembrada: a câmera liga na hora, sem esperar a rede (sem internet a gravação vai pro iPhone)
+      let started = cloud.email != nil
+      if started { camera.start() }
       await cloud.refresh()
-      if let owner = cloud.email { camera.recoverSaved(owner: owner); CloudStream.shared.resume(owner: owner); camera.start() } else { open(.account) }
+      if let owner = cloud.email { camera.recoverSaved(owner: owner); CloudStream.shared.resume(owner: owner); if !started { camera.start() } } else { open(.account) }
     }
     .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
       updateIconAngle()
@@ -281,7 +284,7 @@ struct RecorderView: View {
     var parts = ["v" + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"), "Estab. \(NativeCamera.label(camera.activeMode))"]
     if camera.logEnabled { parts.append(camera.rawLog ? "Apple Log (cru)" : "Apple Log → prévia Rec.709") }
     if !LookPreset.named(camera.lookID).neutral { parts.append("look \(LookPreset.named(camera.lookID).label)") }
-    parts.append(camera.recording ? (stream.line.isEmpty ? "gravando direto na nuvem" : stream.line) : "grava direto na nuvem")
+    parts.append(camera.recording ? (stream.line.isEmpty ? (cloud.offline ? "sem internet — gravando no iPhone" : "gravando direto na nuvem") : stream.line) : (cloud.offline ? "sem internet — grava no iPhone" : "grava direto na nuvem"))
     if camera.bake709 && (camera.logEnabled || camera.hdrEnabled || !LookPreset.named(camera.lookID).neutral) { parts.append("arquivo Rec.709 + look") }
     if camera.droppedFrames > 0 { parts.append("\(camera.droppedFrames) quadros perdidos") }
     return parts.joined(separator: " · ")

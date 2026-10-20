@@ -4,6 +4,7 @@ import SwiftUI
 import WebKit
 import AVFoundation
 import Photos
+import Network
 
 final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
   func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
@@ -14,8 +15,26 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
 @MainActor @Observable final class CowboyCloud {
   static let shared = CowboyCloud()
   static let origin = URL(string: "https://cowboy-editor.ybguyl.easypanel.host")!
-  var email: String?
+  // 0.11.8: a conta confirmada fica lembrada no aparelho. Sem internet o /api/me falha e antes isso zerava o email:
+  // o app abria o login (que não carrega offline) e o botão de gravar não gravava. Agora só sai da conta quando o
+  // SERVIDOR diz que o login acabou; falha de rede mantém a conta e a gravação vai pro armazenamento do iPhone.
+  private static let ownerKey = "cowboyOwnerEmail"
+  var email: String? = UserDefaults.standard.string(forKey: CowboyCloud.ownerKey)
+  var offline = false
   var status = "Entre na conta Cowboy antes de gravar"
+  // a rede voltou com o app aberto: reconfirma a conta e solta a fila guardada no iPhone
+  @ObservationIgnored private let netMonitor = NWPathMonitor()
+  init() {
+    netMonitor.pathUpdateHandler = { path in
+      guard path.status == .satisfied else { return }
+      Task { @MainActor in
+        let cloud = CowboyCloud.shared
+        guard cloud.offline else { return }
+        await cloud.refresh(); CloudStream.shared.kick()
+      }
+    }
+    netMonitor.start(queue: DispatchQueue(label: "cowboy.net"))
+  }
   private var cookie = ""
   var credential: String? { cookie.isEmpty ? nil : cookie }
   private var busy = false
@@ -30,8 +49,8 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     var hasAR: Bool? = nil
   }
   enum CloudError: LocalizedError {
-    case message(String)
-    var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
+    case message(String), auth(String)
+    var errorDescription: String? { switch self { case .message(let text), .auth(let text): return text } }
   }
   func checkCapacity() throws {
     let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
@@ -41,15 +60,27 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
   func refresh() async {
     let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
     cookie = cookies.filter { $0.name == "ce_sess" && $0.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")) == Self.origin.host }.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-    guard !cookie.isEmpty else { email = nil; status = "Entre com a mesma conta usada no Rec web"; return }
+    guard !cookie.isEmpty else { forget(); status = "Entre com a mesma conta usada no Rec web"; return }
     do {
-      let me = try await request("/api/me", cookie: cookie)
-      guard let owner = me["email"] as? String, !owner.isEmpty else { throw CloudError.message("Faça login no Cowboy") }
-      email = owner
+      let me = try await request("/api/me", cookie: cookie, timeout: 10)
+      guard let owner = me["email"] as? String, !owner.isEmpty else { throw CloudError.auth("Faça login no Cowboy") }
+      email = owner; offline = false
+      UserDefaults.standard.set(owner, forKey: Self.ownerKey)
       status = "Conta: \(owner)"
       CloudStream.shared.resume(owner: owner)
       await resume()
-    } catch { email = nil; status = error.localizedDescription }
+    } catch CloudError.auth(let text) { forget(); status = text }
+    catch {
+      // sem internet / servidor fora: continua na conta lembrada, grava no iPhone e sobe quando a rede voltar
+      offline = true
+      if let owner = email { status = "Sem internet — gravando no iPhone (\(owner)); sobe sozinho quando a rede voltar" }
+      else { status = error.localizedDescription }
+      Diag.step("ios-offline-account", ["lembrada": email != nil, "erro": error.localizedDescription])
+    }
+  }
+  private func forget() {
+    email = nil; offline = false
+    UserDefaults.standard.removeObject(forKey: Self.ownerKey)
   }
   func enqueue(_ source: URL, owner: String?) throws {
     guard let owner else { throw CloudError.message("Entre na conta Cowboy antes de gravar") }
@@ -129,8 +160,9 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
       if queueRevision != revision { Task { await resume() } }
     } catch { status = "Envio pendente: \(error.localizedDescription). Toque em Retomar." }
   }
-  private func request(_ path: String, method: String = "GET", json: [String: Any]? = nil, data: Data? = nil, cookie: String) async throws -> [String: Any] {
+  private func request(_ path: String, method: String = "GET", json: [String: Any]? = nil, data: Data? = nil, cookie: String, timeout: TimeInterval? = nil) async throws -> [String: Any] {
     var request = URLRequest(url: URL(string: path, relativeTo: Self.origin)!.absoluteURL)
+    if let timeout { request.timeoutInterval = timeout }
     request.httpMethod = method
     request.setValue(cookie, forHTTPHeaderField: "Cookie")
     request.setValue(json == nil ? "application/octet-stream" : "application/json", forHTTPHeaderField: "Content-Type")
@@ -141,7 +173,7 @@ final class CowboyNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     defer { session.invalidateAndCancel() }
     let (body, response) = try await session.data(for: request)
     guard let http = response as? HTTPURLResponse else { throw CloudError.message("Servidor sem resposta") }
-    if http.statusCode == 401 || (300..<400).contains(http.statusCode) { throw CloudError.message("Entre novamente na conta Cowboy pelo app") }
+    if http.statusCode == 401 || (300..<400).contains(http.statusCode) { throw CloudError.auth("Entre novamente na conta Cowboy pelo app") }
     let result = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
     guard (200..<300).contains(http.statusCode), http.url?.host == Self.origin.host, let result else {
       throw CloudError.message(result?["error"] as? String ?? "Servidor retornou HTTP \(http.statusCode)")
