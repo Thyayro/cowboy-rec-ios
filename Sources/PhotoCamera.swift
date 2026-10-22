@@ -228,6 +228,7 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   private func publish(_ f: @escaping () -> Void) { DispatchQueue.main.async(execute: f) }
 
   func start() {
+    PhotoRelease.begin()
     let want = position
     Task {
       guard await AVCaptureDevice.requestAccess(for: .video) else { publish { self.status = "Libere a câmera nos Ajustes do iPhone" }; return }
@@ -243,6 +244,13 @@ final class PhotoCamera: NSObject, ObservableObject, AVCapturePhotoCaptureDelega
   func stop(_ done: (() -> Void)? = nil) {
     queue.async {
       if self.session.isRunning { self.session.stopRunning() }
+      // 0.11.9: SOLTA a câmera. A sessão de foto ficava com a traseira como entrada depois de parar e, ao fechar, devolvia o
+      // espaço de cor dela (HLG) DEPOIS que o vídeo já tinha posto Apple Log = tela/arquivo com cor e luz distorcidas
+      // (medido 22/10: photo-back cor 2 quando a foto terminou na traseira; cor 3 quando terminou na frontal).
+      self.session.beginConfiguration()
+      self.session.inputs.forEach { self.session.removeInput($0) }
+      self.session.commitConfiguration()
+      PhotoRelease.end()
       DispatchQueue.main.async { self.ready = false; done?() }
     }
   }
@@ -524,4 +532,22 @@ struct PhotoPreview: UIViewRepresentable {
     return v
   }
   func updateUIView(_ uiView: View, context: Context) {}
+}
+
+/// Portão da volta pro vídeo (0.11.9): a câmera de vídeo só reaplica o formato DEPOIS que a sessão de foto parou e soltou
+/// o aparelho (onDisappear/onDismiss do SwiftUI não têm ordem garantida). Reserva: 1,5 s.
+enum PhotoRelease {
+  private static let lock = NSLock()
+  private static var busy = false
+  private static var waiters: [() -> Void] = []
+  static func begin() { lock.lock(); busy = true; lock.unlock() }
+  static func end() { lock.lock(); busy = false; let w = waiters; waiters = []; lock.unlock(); w.forEach { $0() } }
+  static func whenFree(timeout: Double = 1.5, _ f: @escaping () -> Void) {
+    let once = NSLock(); var done = false
+    let run = { once.lock(); let go = !done; done = true; once.unlock(); if go { f() } }
+    lock.lock()
+    if !busy { lock.unlock(); run(); return }
+    waiters.append(run); lock.unlock()
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { run() }
+  }
 }

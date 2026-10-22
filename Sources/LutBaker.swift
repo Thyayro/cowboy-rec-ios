@@ -95,7 +95,7 @@ final class LutBaker: @unchecked Sendable {
                        constant float4 *prm [[buffer(0)]],
                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= lo.get_width() || gid.y >= lo.get_height()) return;
-    constexpr sampler s(filter::linear, address::clamp_to_edge, coord::normalized);
+    constexpr sampler s(filter::linear, address::mirrored_repeat, coord::normalized);
     float4 g = prm[5];
     float2 lsz = float2(lo.get_width(), lo.get_height());
     float3 acc = float3(0.0);
@@ -113,7 +113,7 @@ final class LutBaker: @unchecked Sendable {
                        constant float4 &p [[buffer(0)]],
                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
-    constexpr sampler s(filter::linear, address::clamp_to_edge, coord::normalized);
+    constexpr sampler s(filter::linear, address::mirrored_repeat, coord::normalized);
     float2 sz = float2(dst.get_width(), dst.get_height());
     float2 uv = (float2(gid) + 0.5) / sz;
     float sigma = max(0.5, p.z);

@@ -129,7 +129,23 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // AVCaptureDevice é um só pras duas sessões). Ao voltar, a de vídeo só religava e a tela aplicava a conversão Log→709
   // num quadro que já não era Log = imagem estourada. Com esta marca o start reaplica o formato do vídeo inteiro.
   private var reapplyAfterPhoto = false
-  func resumeFromPhoto() { queue.async { self.reapplyAfterPhoto = true; self.publish { self.start() } } }
+  func resumeFromPhoto() { PhotoRelease.whenFree { self.queue.async { self.reapplyAfterPhoto = true; self.publish { self.start() } } } }
+  /// 0.11.9: confere que o aparelho ficou no espaço de cor pedido (Log/HLG) — se outra sessão devolveu o dela, reaplica.
+  private func ensureColorSpace(_ attempt: Int = 0) {
+    guard let cam = device else { return }
+    let want: AVCaptureColorSpace? = requestedLog ? .appleLog : requestedHDR ? .HLG_BT2020 : nil
+    guard let want, cam.activeColorSpace != want else {
+      if attempt > 0 { Diag.step("photo-back-fix", ["tentativas": attempt, "cor": "\(cam.activeColorSpace.rawValue)"]) }
+      return
+    }
+    if attempt >= 4 { Diag.step("photo-back-fix", ["falhou": true, "cor": "\(cam.activeColorSpace.rawValue)"]); return }
+    if attempt < 2, cam.activeFormat.supportedColorSpaces.contains(want) {
+      session.beginConfiguration()
+      if (try? cam.lockForConfiguration()) != nil { _ = CowboyObjC.catching { cam.activeColorSpace = want }; cam.unlockForConfiguration() }
+      session.commitConfiguration()
+    } else { _ = try? guarded { try self.configure(cameraID: cam.uniqueID, profile: self.selectedProfile) } }
+    queue.asyncAfter(deadline: .now() + 0.3) { self.ensureColorSpace(attempt + 1) }
+  }
   private var zoomObservation: NSKeyValueObservation?
   private var rotationObservation: NSKeyValueObservation?
   private var rotation: AVCaptureDevice.RotationCoordinator?
@@ -347,6 +363,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             try self.guarded { try self.configure(cameraID: self.device?.uniqueID, profile: self.selectedProfile) }
             let cs = self.device.map { "\($0.activeColorSpace.rawValue)" } ?? "?"
             Diag.step("photo-back", ["log": self.requestedLog, "hdr": self.requestedHDR, "cor": cs])
+            self.queue.asyncAfter(deadline: .now() + 0.4) { self.ensureColorSpace() }
           }
           if !self.session.isRunning { self.session.startRunning() }
           if !self.session.isRunning { self.retryRunning(0) }
