@@ -894,9 +894,9 @@ final class FrameLock: @unchecked Sendable {
     var t: Double; let from: Int; var to: Int
     var pred: SwitchGeometry        // pulo previsto (nova → velha, quadro estabilizado): o da saída rápida = o pulo INTEIRO
     var aim: SwitchGeometry         // meio do caminho esperado (o estabilizado mostra parte na hora e escorrega o resto)
-    let plan: SwitchGeometry        // preparo completo da lente velha
+    var plan: SwitchGeometry        // preparo completo da lente velha
     let motion: ZoomMotion
-    let room: Float
+    var room: Float
     var firstSeen: Double?
     var dead = false
     var ref: [Float]?
@@ -917,6 +917,7 @@ final class FrameLock: @unchecked Sendable {
   }
   private let lock = NSLock()
   private var events: [Event] = []
+  private var screenP = -Double.infinity   // último quadro estabilizado que já pediu geometria (onde a tela está)
   var onDone: (([String: String]) -> Void)?
   var learn: (Int, Int, _ first: SwitchGeometry, _ final: SwitchGeometry, _ pred: SwitchGeometry) -> Void = { a, b, f, l, p in LockMemory.record(from: a, to: b, first: f, final: l, pred: p) }
   static let defaultCenter: Float = 0.75   // 19/10: o estabilizado mostrou 53–70% do pulo na hora e escorregou o resto
@@ -988,6 +989,12 @@ final class FrameLock: @unchecked Sendable {
         for k in events.indices where k != j && events[k].to == from && !events[k].dead { events[k].releaseEnd = t - 0.017 }
         let p = pred ?? events[j].pred
         let c = min(1.2, max(0.3, center))
+        // troca no tempo de sempre (fim do movimento) e a tela ainda no movimento: o preparo passa a ser o da MEDIDA (o resto do
+        // movimento esconde a diferença); tarde = fica a folga que já está na tela
+        let rm = min(0.03, max(0.006, room > 0 ? room : Self.defaultRoom(p)))
+        if motion != nil, screenP < events[j].motion.p1 - 0.03, let np = Self.plan(SwitchGeometry(s: p.s, tx: p.tx * c, ty: p.ty * c, exact: true), room: rm) {
+          events[j].plan = np; events[j].room = rm
+        }
         events[j].pending = false; events[j].t = t; events[j].to = to; events[j].pred = p
         events[j].aim = SwitchGeometry(s: p.s, tx: p.tx * c, ty: p.ty * c, exact: true)
         let e = events[j]
@@ -1129,6 +1136,7 @@ final class FrameLock: @unchecked Sendable {
     guard Self.on, id != 0 else { return .identity }
     lock.lock(); defer { lock.unlock() }
     guard !events.isEmpty else { return .identity }
+    screenP = max(screenP, p)
     // a tela/arquivo já passou da troca quando a rápida avisou: nada (entrar com geometria no meio da lente nova seria um pulo)
     for i in events.indices where events[i].firstSeen == nil { events[i].firstSeen = p; if !events[i].pending && p >= events[i].t - 0.001 { events[i].dead = true } }
     for i in events.indices where events[i].pending && !events[i].dead { if let d = events[i].dropP, p - d > Self.releaseDur { events[i].dead = true } }
