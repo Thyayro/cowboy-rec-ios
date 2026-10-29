@@ -1,0 +1,31 @@
+name: Fonte AltStore/SideStore
+# A cada release publicado (ou na mão), regenera source.json no ramo `altstore`:
+#   https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/source.json
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: altstore-source
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gerar source.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 tools/altstore_source.py "${{ github.repository }}" /tmp/fonte/source.json
+          cp Sources/Assets.xcassets/AppIcon.appiconset/CowboyRec.png /tmp/fonte/icon.png
+      - name: Publicar no ramo altstore
+        run: |
+          cd /tmp/fonte
+          git init -q -b altstore
+          git config user.name "cowboy-rec-ci"; git config user.email "ci@users.noreply.github.com"
+          git add source.json icon.png
+          git commit -q -m "fonte: $(python3 -c 'import json;print(json.load(open("source.json"))["apps"][0].get("version","?"))')"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" altstore
+        env:
+          GH_TOKEN: ${{ github.token }}
