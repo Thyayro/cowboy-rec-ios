@@ -884,11 +884,16 @@ final class FrameLock: @unchecked Sendable {
   static let maxPrep: Float = 1.18
   static let posWindow = 0.8, scaleWindow = 2.6, releaseDur = 0.35, flash = 0.2
   static let maxShiftStep: Float = 0.012   // fração do quadro que a posição pode andar entre duas medidas (o escorregão anda ~0,3%)
+  // TROCA ESPERADA (0.11.10): no clique pra tele o iPhone troca ~0,5 s DEPOIS de o zoom parar (medido 29/10, 0,5→5): tarde pra
+  // esconder o preparo e a tele entrava 2–3% fora de esquadro. O clique avisa no fim do movimento; o preparo (folga pra posição
+  // desconhecida — muda com a distância, paralaxe) entra DENTRO do zoom e fica parado até a troca chegar, aí a lente nova entra
+  // medida contra a velha. Sem troca: o próximo zoom solta escondido nele.
+  static let expectRoom: Float = 0.035
   enum Need { case none, ref, measure }
   struct Event {
-    let t: Double; let from: Int; let to: Int
-    let pred: SwitchGeometry        // pulo previsto (nova → velha, quadro estabilizado): o da saída rápida = o pulo INTEIRO
-    let aim: SwitchGeometry         // meio do caminho esperado (o estabilizado mostra parte na hora e escorrega o resto)
+    var t: Double; let from: Int; var to: Int
+    var pred: SwitchGeometry        // pulo previsto (nova → velha, quadro estabilizado): o da saída rápida = o pulo INTEIRO
+    var aim: SwitchGeometry         // meio do caminho esperado (o estabilizado mostra parte na hora e escorrega o resto)
     let plan: SwitchGeometry        // preparo completo da lente velha
     let motion: ZoomMotion
     let room: Float
@@ -907,6 +912,8 @@ final class FrameLock: @unchecked Sendable {
     var held = SwitchGeometry(exact: true)
     var done = false
     var lastP = 0.0
+    var pending = false             // troca esperada (clique), ainda não aconteceu: só o preparo da velha
+    var dropP: Double?              // esperada que não veio: soltando no próximo zoom
   }
   private let lock = NSLock()
   private var events: [Event] = []
@@ -951,13 +958,43 @@ final class FrameLock: @unchecked Sendable {
     return SwitchGeometry(s: sP, tx: axis(g.tx), ty: axis(g.ty), exact: true)
   }
 
+  // clique terminando onde a lente deve trocar (saída rápida, fim do movimento): preparo da lente `from` dentro do movimento, sem
+  // saber ainda a posição (guess = escala esperada; a folga cobre a posição). Devolve o que fez (diag)
+  @discardableResult func expect(from: Int, to: Int, guess: SwitchGeometry?, motion: ZoomMotion, room: Float = FrameLock.expectRoom) -> String {
+    guard Self.on else { return "desligada" }
+    lock.lock(); defer { lock.unlock() }
+    events.removeAll { $0.pending && $0.dropP != nil }
+    guard !events.contains(where: { $0.pending && !$0.dead }) else { return "já esperando" }
+    let s = guess.map { min(1.1, max(0.92, $0.s)) } ?? 1
+    let aim = SwitchGeometry(s: s, tx: 0, ty: 0, exact: true)
+    guard let plan = Self.plan(aim, room: room) else { return "pulo fora da faixa" }
+    var e = Event(t: motion.p1, from: from, to: to, pred: aim, aim: aim, plan: plan, motion: motion, room: room)
+    e.pending = true
+    events.append(e)
+    events.sort { $0.t < $1.t }
+    return String(format: "preparo %.4f no zoom, esperando a troca (%.0f ms de movimento)", plan.s, (motion.p1 - motion.p0) * 1000)
+  }
   // saída rápida: troca de `from` pra `to` no pts t, com o pulo previsto pro quadro estabilizado e o movimento que acabou antes dela.
   // Devolve o que fez (diag).
   // center = fração do deslocamento previsto onde mirar; room ≤ 0 = folga padrão
   @discardableResult func add(t: Double, from: Int, to: Int, pred: SwitchGeometry?, motion: ZoomMotion?, room: Float = 0, center: Float = FrameLock.defaultCenter) -> String {
     guard Self.on else { return "desligada" }
     lock.lock(); defer { lock.unlock() }
-    events.removeAll { $0.t < t - 8 }
+    events.removeAll { !$0.pending && $0.t < t - 8 }
+    // troca esperada pelo clique: o preparo já está na tela (dentro do movimento); a lente nova entra medida contra a velha
+    if let j = events.lastIndex(where: { $0.pending && !$0.dead && $0.dropP == nil && $0.from == from }) {
+      if events[j].firstSeen != nil && Self.prepAmount(events[j], t) <= 0 { events[j].dead = true }   // a tela não mostrou o preparo
+      else {
+        for k in events.indices where k != j && events[k].to == from && !events[k].dead { events[k].releaseEnd = t - 0.017 }
+        let p = pred ?? events[j].pred
+        let c = min(1.2, max(0.3, center))
+        events[j].pending = false; events[j].t = t; events[j].to = to; events[j].pred = p
+        events[j].aim = SwitchGeometry(s: p.s, tx: p.tx * c, ty: p.ty * c, exact: true)
+        let e = events[j]
+        events.sort { $0.t < $1.t }
+        return String(format: "esperada: preparo %.4f %+.4f %+.4f já no zoom (%.0f ms depois de parar)", e.plan.s, e.plan.tx, e.plan.ty, (t - e.motion.p1) * 1000)
+      }
+    }
     // a anterior (que deu a lente velha desta) termina de soltar antes desta troca
     for k in events.indices where events[k].to == from && !events[k].dead { events[k].releaseEnd = t - 0.017 }
     // ida-e-volta rápida (objeto perto): as duas saem — a tela segura o quadro (LensSwitchHider)
@@ -997,13 +1034,17 @@ final class FrameLock: @unchecked Sendable {
   // a troca da lente `id` em p é desta classe? (aí a chegada assentada não mexe nela)
   func owns(sensor id: Int, pts p: Double) -> Bool {
     lock.lock(); defer { lock.unlock() }
-    return events.contains { !$0.dead && $0.to == id && p >= $0.t - 0.001 && p - $0.t < 30 }
+    return events.contains { !$0.dead && !$0.pending && $0.to == id && p >= $0.t - 0.001 && p - $0.t < 30 }
   }
   // cada quadro estabilizado, antes da tela e do arquivo. moving = zoom do conteúdo andando ou celular girando
   func frame(pts p: Double, sensor id: Int, prev: Int, moving: Bool, zooming: Bool) -> Need {
     guard Self.on, id != 0 else { return .none }
     lock.lock(); defer { lock.unlock() }
-    guard let i = events.lastIndex(where: { !$0.dead && $0.to == id && p >= $0.t - 0.001 && p - $0.t < 30 }) else { return .none }
+    // esperada que não veio: o próximo zoom solta o preparo (escondido nele)
+    for k in events.indices where events[k].pending && !events[k].dead && events[k].dropP == nil && events[k].from == id && zooming && p > events[k].motion.p1 + 0.1 {
+      events[k].dropP = p
+    }
+    guard let i = events.lastIndex(where: { !$0.dead && !$0.pending && $0.to == id && p >= $0.t - 0.001 && p - $0.t < 30 }) else { return .none }
     if events[i].releaseP != nil { return .none }
     // o próximo zoom solta (escondido nele); o giro só para de medir (a ampliação parada não aparece andando com o celular)
     if zooming && p > events[i].t + 0.05 { events[i].held = Self.composite(events[i], p); events[i].releaseP = p; finishLocked(i, p); return .none }
@@ -1022,7 +1063,7 @@ final class FrameLock: @unchecked Sendable {
   // 1º quadro da lente nova: referência = último quadro estabilizado da velha; mede em volta da previsão (síncrono, ~10 ms, só na troca)
   func begin(pts p: Double, sensor id: Int, ref: [Float], img: [Float]) {
     lock.lock()
-    guard let i = events.lastIndex(where: { !$0.dead && $0.to == id && abs(p - $0.t) < 0.1 && $0.ref == nil }) else { lock.unlock(); return }
+    guard let i = events.lastIndex(where: { !$0.dead && !$0.pending && $0.to == id && abs(p - $0.t) < 0.1 && $0.ref == nil }) else { lock.unlock(); return }
     events[i].ref = ref
     let aim = events[i].aim
     lock.unlock()
@@ -1039,7 +1080,7 @@ final class FrameLock: @unchecked Sendable {
   // quadros seguintes da lente nova: contra a MESMA referência, em volta da medida anterior (síncrono, ~3 ms)
   func measure(pts p: Double, sensor id: Int, img: [Float]) {
     lock.lock()
-    guard let i = events.lastIndex(where: { !$0.dead && $0.to == id && $0.ref != nil && p >= $0.t && $0.releaseP == nil && !$0.done }),
+    guard let i = events.lastIndex(where: { !$0.dead && !$0.pending && $0.to == id && $0.ref != nil && p >= $0.t && $0.releaseP == nil && !$0.done }),
           let ref = events[i].ref, let around = events[i].m else { lock.unlock(); return }
     let t = events[i].t
     lock.unlock()
@@ -1089,9 +1130,15 @@ final class FrameLock: @unchecked Sendable {
     lock.lock(); defer { lock.unlock() }
     guard !events.isEmpty else { return .identity }
     // a tela/arquivo já passou da troca quando a rápida avisou: nada (entrar com geometria no meio da lente nova seria um pulo)
-    for i in events.indices where events[i].firstSeen == nil { events[i].firstSeen = p; if p >= events[i].t - 0.001 { events[i].dead = true } }
+    for i in events.indices where events[i].firstSeen == nil { events[i].firstSeen = p; if !events[i].pending && p >= events[i].t - 0.001 { events[i].dead = true } }
+    for i in events.indices where events[i].pending && !events[i].dead { if let d = events[i].dropP, p - d > Self.releaseDur { events[i].dead = true } }
     var out = SwitchGeometry(exact: true)
-    for e in events where !e.dead && abs(p - e.t) < 30 {
+    for e in events where !e.dead && e.pending && id == e.from {
+      var y = Self.prepAmount(e, p)
+      if let d = e.dropP { y *= 1 - SwitchPlan.smooth((p - d) / Self.releaseDur) }
+      if y > 0 { out = SwitchPlan.compose(out, e.plan.mix(y)) }
+    }
+    for e in events where !e.dead && !e.pending && abs(p - e.t) < 30 {
       if id == e.from && p < e.t - 0.0005 {
         let y = Self.prepAmount(e, p)
         if y > 0 { out = SwitchPlan.compose(out, e.plan.mix(y)) }

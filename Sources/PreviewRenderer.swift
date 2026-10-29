@@ -99,6 +99,11 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   // da 0.9.0: 5×→1× pôs a tela em 1,52→2,11→1,96× por 0,5 s; 1×→2× e 2×→5× com 2–4%) = o "pulo no clique".
   func tapStart(z: Double, dz: Double) { lock.lock(); tapRef = CACurrentMediaTime(); tapDZ = max(1, dz); tapZ = z > 0 ? z : nil; lock.unlock() }
   func tapEnd() { lock.lock(); if tapRef != nil { tapRef = nil }; lock.unlock() }
+  // troca esperada (0.11.10): zoom do aparelho onde a principal passa pra tele (0 = sem tele) e o alvo do clique em andamento
+  var teleSwitchRaw: Double = 0
+  private var tapTarget: (raw: Double, at: Double)?
+  private var fastLens: (sid: Int, name: String?, since: Double) = (0, nil, 0)
+  func expectTap(raw: Double) { lock.lock(); tapTarget = (raw, CACurrentMediaTime()); lock.unlock() }
   // troca de lente com o zoom parado (0.9.0): dissolve curto do último quadro da lente velha, sem ampliar/desampliar
   private var prevShown: (image: CIImage, sid: Int)?
   private var xfade: (image: CIImage, t0: Double)?
@@ -204,6 +209,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let trackMoving = CACurrentMediaTime() - lastZoomMove < 0.15, zHistFast = zoomAt(pts + Self.contentLead) ?? 0
     // troca de lente (0.8.0): sensor deste quadro rápido × o do anterior, com o zoom PARADO nos dois
     let prevFast = lastFast; lastFast = (buffer, sid, pts)
+    var lensNamed: String?
+    if sid != 0 && sid != fastLens.sid { fastLens = (sid, LensID.name(buffer), pts); lensNamed = fastLens.name }
     // troca enquadrada: a 1ª medida da troca falhou → tenta de novo no próximo quadro da lente nova (até 6)
     var retryJob: FastRetry?, retryStep = 1.0, retryLost: FastRetry?
     if let r = fastRetry, sid != 0 {
@@ -225,6 +232,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if still && !switchBusy { switchBusy = true; switchJob = true }
     }
     let cropNow = crop; lock.unlock()
+    if lensNamed == "tele" { UserDefaults.standard.set(sid, forKey: "sidTele") }
+    expectFrame(pts: pts, sid: sid)
     if let pf = prevFast, pf.id != sid, pf.id != 0, sid != 0 {
       lensColorSwitch(pf.buffer, buffer, pts: pts)   // cor/luz: em TODA troca (parado ou andando)
       if switchJob { measureFastSwitch(pf.buffer, buffer, pts: pts, from: pf.id, to: sid, crop: cropNow, step: switchStep, refPTS: pf.pts) }
@@ -308,6 +317,29 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if let lpred, m == nil { info["memoria"] = Self.geoText(lpred) }
     onSwitch?(info)
     if releaseBusy { lock.lock(); switchBusy = false; lock.unlock() }
+  }
+  // troca esperada: o clique pra zona da tele terminou e a lente ainda é a principal → o preparo entra no movimento (a saída
+  // rápida chega ~0,45 s antes da tela: o fim do movimento ainda não foi mostrado)
+  private func expectFrame(pts: Double, sid: Int) {
+    guard FrameLock.on else { return }
+    lock.lock()
+    guard let tt = tapTarget else { lock.unlock(); return }
+    let lens = fastLens, tele = teleSwitchRaw, zNow = zoomAt(pts + Self.contentLead) ?? 0, hist = zoomHistory
+    let old = CACurrentMediaTime() - tt.at > 3
+    let finished = tele <= 0 || tt.raw < tele * 0.999 || lens.name == "tele" || old
+    if finished { tapTarget = nil }
+    lock.unlock()
+    guard !finished, lens.name == "wide", sid == lens.sid, zNow > 0, abs(log(zNow / tt.raw)) < 0.01 else { return }
+    lock.lock(); tapTarget = nil; lock.unlock()
+    let teleSid = UserDefaults.standard.integer(forKey: "sidTele")
+    guard teleSid != 0 else { onSwitch?(["etapa": "esperada", "status": "tele ainda não vista"]); return }
+    guard var motion = FrameLock.findMotion(hist, switchAt: pts, lead: Self.contentLead) else { onSwitch?(["etapa": "esperada", "status": "sem movimento"]); return }
+    // só o trecho já na principal (a parte na ultra não leva preparo: a troca do meio do movimento já se esconde)
+    let cut = motion.curve.filter { $0.p >= lens.since - 0.02 }
+    if cut.count >= 2 && cut.count < motion.curve.count { motion = ZoomMotion(curve: cut) }
+    let guess = LockMemory.pred(from: lens.sid, to: teleSid) ?? SwitchMemory.scale(from: lens.sid, to: teleSid).map { SwitchGeometry(s: $0, tx: 0, ty: 0, exact: true) }
+    let st = frameLock.expect(from: lens.sid, to: teleSid, guess: guess, motion: motion)
+    onSwitch?(["etapa": "esperada", "de": "\(lens.sid)", "para": "\(teleSid)", "status": st])
   }
   // troca enquadrada: decide e mede no quadro estabilizado (síncrono, antes da tela e do arquivo; só perto de uma troca)
   private func lockFrame(_ buffer: CVPixelBuffer, pts: Double, sensor: Int, prev: (buffer: CVPixelBuffer, id: Int)?) {

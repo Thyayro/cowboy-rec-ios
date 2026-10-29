@@ -525,7 +525,7 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     // termina na lente pura. Escuro / tarde / sem movimento / sem medida: não piora (sem movimento: não mexe em nada).
     func lockSim(_ name: String, J: Double, inst: (Double, Double), fin: (Double, Double), glideDur: Double = 0.35, contrast: Double = 1,
                  L: Double = 0.565, fastOK: Bool = true, memPred: SwitchGeometry? = nil, gap: Double = 0.09, strict: Bool = true,
-                 shake: Double = 0.0001, untouched: Bool = false) {
+                 shake: Double = 0.0001, untouched: Bool = false, expect: Bool = false) {
       let fps = 60.0, crop = 1.12, lead = 0.025
       let pa = 1.0, pb = 1.15, ts = pb + gap, tm = 3.4, Z0 = 1.0, Z1 = 2.0
       func zc(_ p: Double) -> Double {
@@ -560,13 +560,18 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
         let zf = zc(ts) * J, fx = fin.0 * 0.9 / (zc(ts) * crop * J), fy = fin.1 * 0.9 / (zc(ts) * crop * J)
         if let m = ZoomImage.switchGeo(pic(zc(ts - 1 / fps), 0, 0), pic(zf, fx, fy)) { pred = SwitchGeometry(s: m.g.s, tx: m.g.tx * Float(crop), ty: m.g.ty * Float(crop), exact: true) }
       }
-      var status = "", added = false, prevId = 1
+      var status = "", added = false, prevId = 1, expected = false
       var shown: [(p: Double, z: Double, x: Double, y: Double)] = [], base: [(p: Double, z: Double, x: Double, y: Double)] = []
       var border = 0.0, endPure = true, anyGeo = false
       for (k, f) in frames.enumerated() {
-        if !added && f.p + L >= ts + 0.04 {
+        // clique: a rápida vê o fim do movimento (L antes da tela) e avisa a troca esperada
+        if expect && !expected && f.p + L >= pb + 0.03, let mo = FrameLock.findMotion(hist.filter { $0.0 <= pb + 0.03 + lead }, switchAt: pb + 0.03, lead: lead) {
+          expected = true
+          status = lk.expect(from: 1, to: 2, guess: nil, motion: mo) + " · "
+        }
+        if !added && ts < 4.2 && f.p + L >= ts + 0.04 {
           added = true
-          status = lk.add(t: ts, from: 1, to: 2, pred: pred, motion: FrameLock.findMotion(hist.filter { $0.0 <= ts + 0.04 }, switchAt: ts, lead: lead))
+          status += lk.add(t: ts, from: 1, to: 2, pred: pred, motion: FrameLock.findMotion(hist.filter { $0.0 <= ts + 0.04 }, switchAt: ts, lead: lead))
         }
         let zooming = abs(log(zc(f.p + 1 / 120) / zc(f.p - 1 / 120))) * 60 > 0.05
         switch lk.frame(pts: f.p, sensor: f.id, prev: prevId, moving: zooming, zooming: zooming) {
@@ -617,6 +622,11 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     lockSim("rápida não mediu e nada aprendido", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), fastOK: false, untouched: true)
     lockSim("estabilização sem atraso (0,15 s): tarde pra preparar", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), L: 0.15, strict: false)
     lockSim("troca 1 s depois de o zoom parar (sem movimento pra esconder)", J: 1.043, inst: (0.024, 0.002), fin: (0.045, 0.003), gap: 1.0, untouched: true)
+    // 0.11.10: clique 0,5→5 medido 29/10 — tele entra 0,5 s depois de parar, +0,7%, −2,5%/+3,0% e escorrega mais um pouco
+    lockSim("ESPERADA: tele 0,5 s depois de parar, −2,5%/+3,0% (medido 29/10)", J: 1.007, inst: (-0.020, 0.025), fin: (-0.025, 0.030), gap: 0.5, expect: true)
+    lockSim("ESPERADA: tele 1,5 s depois, lado oposto", J: 0.995, inst: (0.012, -0.010), fin: (0.018, -0.014), gap: 1.5, expect: true)
+    lockSim("ESPERADA: troca no fim do movimento (como antes)", J: 1.043, inst: (0.012, 0.002), fin: (0.02, 0.003), expect: true)
+    lockSim("ESPERADA que não veio: o próximo zoom solta", J: 1.0, inst: (0, 0), fin: (0, 0), gap: 5.0, expect: true)
     print("TESTE DO ZOOM OK")
   }
 }

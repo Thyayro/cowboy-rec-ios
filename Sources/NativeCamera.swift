@@ -704,7 +704,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
       let low = Double(cam.minAvailableVideoZoomFactor / nativeBase), high = Double(min(cam.maxAvailableVideoZoomFactor / nativeBase, 25))
       let switches = cam.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue }
-      let presets = cam.isVirtualDevice ? ZoomMath.presets(base: Double(nativeBase), switchOvers: switches, minDisplay: low, maxDisplay: high) : [low, 1, 2].filter { $0 >= low - 0.01 && $0 <= high + 0.01 }
+      // 0.11.10: a frontal tem mínimo 1× — [mínimo, 1, 2] mostrava "1× 1× 2"; casas a menos de 5% uma da outra viram uma só
+      let rawPresets = cam.isVirtualDevice ? ZoomMath.presets(base: Double(nativeBase), switchOvers: switches, minDisplay: low, maxDisplay: high) : [abs(low - 1) < 0.05 ? 1 : low, 1, 2].filter { $0 >= low - 0.01 && $0 <= high + 0.01 }
+      var presets: [Double] = []
+      for v in rawPresets.sorted() where !presets.contains(where: { abs($0 - v) < 0.05 * max(1, v) }) { presets.append(v) }
+      renderer.teleSwitchRaw = cam.isVirtualDevice && switches.count >= 2 ? (switches.last ?? 0) : 0
       let options = NativeCapturePolicy.profiles(catalog, hdr: wantsHDR, log: wantsLog)
       let hdrOK = catalog.contains { $0.supports(chosen, hdr: true) }
       let logOK = catalog.contains { $0.supports(chosen, hdr: false, log: true) }
@@ -1042,6 +1046,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
       DispatchQueue.main.async {
         let sp = Self.zoomSpeeds[max(0, min(2, self.zoomSpeed))]
+        self.renderer.expectTap(raw: value * Double(self.base))
         let dur = self.zoomDriver.glide(to: CGFloat(value) * self.base, seconds: sp.seconds, floor: sp.floor)
         self.contentModeUntil = CACurrentMediaTime() + dur + 0.7   // pinça logo depois do toque: continua "quadro como é"
         self.zoomDriver.leaveDigital(toRaw: value * Double(self.base), dur: dur)
