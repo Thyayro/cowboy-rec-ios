@@ -1,0 +1,7 @@
+{
+  "servers": [
+    { "name": "StikStore ani3", "address": "https://ani3.stikstore.app", "kind": 2 },
+    { "name": "jkcoxson (Mac)", "address": "https://mac-ani.jkcoxson.com", "kind": 2 },
+    { "name": "SideStore (New)", "address": "https://new.ani.sidestore.io", "kind": 2 }
+  ]
+}
