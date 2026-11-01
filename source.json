@@ -1,0 +1,109 @@
+{
+  "name": "Cowboy Rec",
+  "identifier": "com.cowboy.rec.source",
+  "subtitle": "Versões do Cowboy Rec",
+  "sourceURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/source.json",
+  "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+  "tintColor": "#F5C518",
+  "apps": [
+    {
+      "name": "Cowboy Rec",
+      "bundleIdentifier": "com.cowboy.rec.personal",
+      "developerName": "Cowboy do Consórcio",
+      "subtitle": "Apple Log direto na nuvem",
+      "localizedDescription": "Câmera Apple Log que grava direto na nuvem Cowboy.",
+      "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+      "tintColor": "#F5C518",
+      "category": "photo-video",
+      "versions": [
+        {
+          "version": "0.11.11",
+          "date": "2026-11-01T21:50:44Z",
+          "localizedDescription": "Cowboy Rec 0.11.11 — nunca perder filmagem\n\n- Cada segundo gravado é salvo no iPhone na hora (antes ficava só na memória até subir).\n- Nuvem sem espaço (507): espera e tenta de novo — não apaga mais a tomada do iPhone (a 0.11.10 apagava).\n- Tomada recusada pela nuvem fica em Ajustes → Guardadas no iPhone, com Reenviar e Apagar (só manual, com confirmação).\n- Pedaço só sai do iPhone depois do recibo da nuvem.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.11-test/CowboyRec-0.11.11-unsigned.ipa",
+          "size": 2317820,
+          "minOSVersion": "17.2",
+          "buildVersion": "74"
+        },
+        {
+          "version": "0.11.10",
+          "date": "2026-10-29T23:43:26Z",
+          "localizedDescription": "Cowboy Rec 0.11.10 (teste) — frontal com um 1× só + clique pra tele sem ajuste de posição\n\nFrontal: some o 1× repetido. Clique 0,5→5 (ou qualquer clique pra tele): o enquadramento é preparado dentro do movimento do zoom e a tele entra medida contra a última imagem da principal — sem ajuste de posição depois de estacionar. Simulador do CI: posição após o clique 3,05% → 0,26%.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.10-test/CowboyRec-0.11.10.ipa",
+          "size": 2299257,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.11.9",
+          "date": "2026-10-22T14:31:04Z",
+          "localizedDescription": "Cowboy Rec 0.11.9 (teste) — volta da foto sem filtro na cor + névoa sem borda comida\n\n- Voltar da FOTO pro VÍDEO: a câmera de foto agora solta a traseira ao fechar; o vídeo só volta depois disso e confere se ficou em Apple Log (antes voltava em HLG com a conversão Log por cima = cor/luz distorcidas).\n- Névoa (principalmente a Pesada): a imagem continua espelhada além da borda antes do desfoque, na tela e no arquivo — sem a moldura de fumaça nas bordas.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.9-test/CowboyRec-0.11.9.ipa",
+          "size": 2294746,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.11.8",
+          "date": "2026-10-20T20:01:19Z",
+          "localizedDescription": "Cowboy Rec 0.11.8 (teste) — grava sem internet no iPhone\n\nSem internet: a conta fica lembrada, a câmera liga na hora e a gravação vai pro armazenamento do iPhone. Sobe sozinha pra nuvem quando a rede voltar.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.8-test/CowboyRec-unsigned.ipa",
+          "size": 2288827,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.11.7",
+          "date": "2026-10-19T22:46:00Z",
+          "localizedDescription": "Cowboy Rec 0.11.7 (teste) — troca de lente enquadrada na chegada do zoom\n\nNa chegada do clique (1×→2×, 5×) o iPhone troca de lente ~90 ms depois de o zoom parar e a lente nova entrava ~4% maior e 2–6% deslocada (medido nos trechos de 19/10). Agora: o ajuste de escala e posição entra DENTRO do movimento do zoom (o zoom pousa direto onde a lente nova vai estar) e cada quadro da lente nova é medido contra o último da velha e entra exatamente no enquadramento dela, inclusive o escorregão do estabilizador. A folga fica até o próximo zoom. Inclui tudo da 0.11.6 (volta da foto sem prévia estourada) e 0.11.5 (frontal na foto).",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.7-test/CowboyRec-0.11.7.ipa",
+          "size": 2284648,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.11.6",
+          "date": "2026-10-19T21:43:19Z",
+          "localizedDescription": "Cowboy Rec 0.11.6 (teste) — volta da foto sem prévia estourada + frontal na foto\n\nInclui tudo da 0.11.5 (câmera de foto frontal, apagar fotos, IA voltar/avançar). Novo: ao voltar da FOTO pro VÍDEO a sessão de vídeo reaplica o próprio formato (Apple Log/HDR/709) — antes ficava com o formato de foto e a prévia saía estourada.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.6-test/CowboyRec-0.11.6.ipa",
+          "size": 2263081,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.11.5",
+          "date": "2026-10-18T22:58:25Z",
+          "localizedDescription": "Cowboy Rec 0.11.5 (teste) — foto frontal + apagar + IA voltar/avançar\n\n- Câmera de FOTO com frontal: botão de virar no canto de baixo à direita (como no iPhone). A frontal abre na melhor configuração: maior resolução que ela tem, qualidade máxima (fusão de quadros/HDR), HEIF 10 bits e flash de tela (Retina Flash) quando o aparelho tem.\n- A resolução fica guardada por câmera (a frontal não apaga os 24/48 MP da traseira). ProRAW escolhido na traseira continua guardado; na frontal sem RAW a foto sai em HEIF.\n- \"Espelhar a frontal\" no menu (desligado = igual ao iPhone).\n- \"Revelar a última foto\" subiu pra barra de cima; qualidade máxima × disparo rápido ficou no menu (lebre no rótulo = disparo rápido).\n- APAGAR fotos: segurar a foto → Apagar; \"Selecionar\" → várias ou Tudo → Apagar; lixeira dentro da revelação. Pergunta: \"do app e da Fototeca\" (o iOS confirma e guarda 30 dias em Apagados Recentemente) ou \"só do app\". Fotos tiradas antes desta versão só saem do app.\n- Edição com IA: Voltar e Avançar (no topo e na aba IA). Cada imagem que a IA gera fica na galeria do app (seção \"Geradas pela IA\"), salva na Fototeca ou não, e pode ser apagada ali ou pelo botão \"Apagar a gerada\".\n- Mantém tudo da 0.11.4.\n",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.5-test/CowboyRec-0.11.5.ipa",
+          "size": 2261579,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.11.4",
+          "date": "2026-10-18T01:31:38Z",
+          "localizedDescription": "Cowboy Rec 0.11.4 (teste) — chegada assentada sem tremer\n\n- Chegada assentada de volta, refeita: só corrige a ESCALA (a respiração da lente depois da troca); posição é mão/estabilização e não é mais mexida.\n- Sem tremor: medida filtrada (mediana + suavização + zona morta), a tela anda no máximo 0,2%/quadro e nunca vai-e-volta mais que ~0,2% (a 0.11.2 pulava 0,5–1,5% por quadro).\n- Sobra entra num degrau só no quadro da troca (escondida pelo dissolve), nada de pulso depois.\n- Trocas seguidas: medida que estava em andamento da lente anterior não vira referência da nova (era parte do 'medidor perdido').\n- Teste do build agora inclui mão tremendo forte, cena escura e trocas seguidas ida-e-volta.\n- Mantém fotos (1:1, 4:5, 9:16, ProRAW, filtros, IA) e as reduções de calor.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.4-test/CowboyRec-0.11.4.ipa",
+          "size": 2200615,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSCameraUsageDescription": "Gravar vídeo.",
+          "NSMicrophoneUsageDescription": "Gravar o som do vídeo.",
+          "NSPhotoLibraryUsageDescription": "Mandar vídeos da galeria.",
+          "NSPhotoLibraryAddUsageDescription": "Salvar na galeria."
+        }
+      },
+      "version": "0.11.11",
+      "versionDate": "2026-11-01T21:50:44Z",
+      "versionDescription": "Cowboy Rec 0.11.11 — nunca perder filmagem\n\n- Cada segundo gravado é salvo no iPhone na hora (antes ficava só na memória até subir).\n- Nuvem sem espaço (507): espera e tenta de novo — não apaga mais a tomada do iPhone (a 0.11.10 apagava).\n- Tomada recusada pela nuvem fica em Ajustes → Guardadas no iPhone, com Reenviar e Apagar (só manual, com confirmação).\n- Pedaço só sai do iPhone depois do recibo da nuvem.",
+      "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.11-test/CowboyRec-0.11.11-unsigned.ipa",
+      "size": 2317820
+    }
+  ],
+  "news": []
+}
