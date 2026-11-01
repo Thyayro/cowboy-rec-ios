@@ -68,6 +68,7 @@ struct RecorderView: View {
   @State private var noisePanel = false
   @State private var askSelfTest = false
   @State private var fxOpen = false
+  @State private var discardKept: CloudStream.Kept?   // 0.11.11: apagar gravação guardada no iPhone só com confirmação
   @State private var controlsTop: CGFloat = .infinity   // topo dos controles de baixo (coordenada da tela)
   @State private var toolsFrame: CGRect = .zero          // coluna de ferramentas (coordenada da tela)
   @Environment(\.scenePhase) private var phase
@@ -557,10 +558,23 @@ struct RecorderView: View {
           Picker("Taxa de gravação", selection: Binding(get: { camera.bitrateChoice }, set: { camera.setBitrate($0) })) {
             ForEach(NativeCamera.bitrates.indices, id: \.self) { i in Text(NativeCamera.bitrates[i].label).tag(i) }
           }.disabled(camera.recording)
-          Text("Cada segundo gravado sobe na hora pra biblioteca da VPS (MP4 fragmentado com recibo). O iPhone só segura o que a internet não acompanhar e apaga assim que sobe. 4K 60 em HEVC ≈ 50–80 Mb/s: no 4G, use 35 ou 20 Mb/s pra não acumular fila.").font(.caption2)
+          Text("Cada segundo gravado é salvo no iPhone na hora e sobe pra biblioteca da VPS (MP4 fragmentado com recibo). Um pedaço só sai do iPhone depois do recibo da nuvem; se a nuvem recusar, a gravação fica guardada aqui e só você apaga. 4K 60 em HEVC ≈ 50–80 Mb/s: no 4G, use 35 ou 20 Mb/s pra não acumular fila.").font(.caption2)
           Text(stream.line.isEmpty ? "Sem envios pendentes" : stream.line).font(.caption)
           if stream.pendingMB > 0.5 { Text(String(format: "Na fila: %.0f MB (%.0f MB guardados no iPhone)", stream.pendingMB, stream.diskMB)).font(.caption) }
           Button("Retomar envios") { Task { await cloud.refresh(); CloudStream.shared.kick() } }
+          if !stream.kept.isEmpty {
+            Text("Guardadas no iPhone (a nuvem recusou)").font(.caption.bold()).foregroundStyle(rec)
+            ForEach(stream.kept) { k in
+              VStack(alignment: .leading, spacing: 4) {
+                Text("\(k.title) · \(String(format: "%.0f MB", k.mb))").font(.caption)
+                Text(k.why).font(.caption2).foregroundStyle(.secondary)
+                HStack {
+                  Button("Reenviar") { if let owner = cloud.email { CloudStream.shared.retry(k.id, owner: owner) } }.buttonStyle(.bordered).disabled(cloud.email == nil)
+                  Button("Apagar do iPhone", role: .destructive) { discardKept = k }.buttonStyle(.bordered)
+                }
+              }
+            }
+          }
           Button("Calibrar o zoom (45 s, celular parado)") { settings = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { camera.runZoomCalibration() } }.disabled(camera.recording)
         }
         Section("Conta e biblioteca") {
@@ -582,6 +596,10 @@ struct RecorderView: View {
           Text("O botão 3D da câmera é o guia pelo giroscópio (gira em volta). Este modo rastreia também o deslocamento (ARKit) e manda as poses pro Blender; usa os formatos do ARKit, sem Apple Log nem estabilização.").font(.caption2)
         }
       }.navigationTitle("Câmera").toolbar { Button("OK") { settings = false } }
+      .alert("Apagar do iPhone?", isPresented: Binding(get: { discardKept != nil }, set: { if !$0 { discardKept = nil } }), presenting: discardKept) { k in
+        Button("Apagar de vez", role: .destructive) { CloudStream.shared.discard(k.id); discardKept = nil }
+        Button("Cancelar", role: .cancel) { discardKept = nil }
+      } message: { k in Text("\(k.title) (\(String(format: "%.0f MB", k.mb))) não está na nuvem. Apagando aqui, essa gravação some pra sempre.") }
     }.presentationDetents([.medium, .large])
   }
 
