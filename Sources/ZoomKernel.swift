@@ -1195,3 +1195,56 @@ enum LockMemory {
     return Float(min(0.03, max(0.006, h + 0.004)))
   }
 }
+
+// CLIQUE QUE CRUZA LENTE NUMA TIRADA SÓ (0.11.12). Medido 02/11 (0.11.10, trecho 15:47): no clique "rápido" (160 ms) o
+// zoom passa pela troca de lente antes de a lente nova estar pronta — o iPhone só entra com ela DEPOIS de o zoom parar:
+// IN 0,5→5 = pousa no recorte borrado da ultra, a principal entra ~200 ms depois (dissolve com fantasma) e a tele ~450 ms
+// depois = 3 encaixes; OUT 5→0,5 = a ultra entra ~270 ms depois de parar, a tela segura quadro e o zoom aparece em 2–3
+// saltos. Aqui o caminho continua no ritmo pedido até PERTO da última troca e termina numa CAUDA que desacelera (velocidade
+// contínua, chega parada): a lente de destino acorda e entra DENTRO do movimento (que esconde). Sem troca no caminho = a
+// rampa de sempre (smoothstep, mesma duração).
+struct GlideCurve {
+  static let tailIn = 0.38, tailOut = 0.36     // s da cauda (tempo pra lente de destino ficar pronta)
+  static let leadIn = 0.8, leadOut = 0.5      // stops antes da troca (IN) / acima dela (OUT) onde a cauda começa
+  let x0: Double, x1: Double, xa: Double, ta: Double, tb: Double, vj: Double
+  let crossAt: Double?                         // zoom da última troca cruzada (nil = sem troca no caminho)
+  var total: Double { ta + tb }
+  init(from: Double, to: Double, dur: Double, switches: [Double]) {
+    x0 = log(from); x1 = log(to); ta = max(0.001, dur)
+    let up = to > from
+    // só a troca que ATRASA (medido 02/11): subindo, a da tele (a maior); descendo, a da ultra (a menor). As outras entram
+    // no tempo do movimento e o clique fica na velocidade de sempre.
+    let last = up ? switches.max() : switches.min()
+    let cross = last.flatMap { s in (up ? (s > from * 1.001 && s <= to * 1.001) : (s < from * 0.999 && s > to * 1.001)) ? s : nil }
+    guard let s = cross else { xa = x1; tb = 0; vj = 0; crossAt = nil; return }
+    crossAt = s
+    let ls = log(s), mid = (x0 + ls) / 2
+    var a = up ? max(ls - Self.leadIn * M_LN2, mid) : min(ls + Self.leadOut * M_LN2, mid)
+    if up ? a >= x1 : a <= x1 { a = (x0 + x1) / 2 }
+    xa = a; tb = up ? Self.tailIn : Self.tailOut
+    let da = a - x0, db = x1 - a
+    // velocidade na emenda: a cauda só desacelera (≤ 1,5× a média dela) e a 1ª fase não passa de 2× a média = monótono
+    let v = min(abs(1.5 * db / tb), abs(2.0 * da / ta))
+    vj = up ? v : -v
+  }
+  private static func hermite(_ p0: Double, _ p1: Double, _ m0: Double, _ m1: Double, _ T: Double, _ s: Double) -> Double {
+    let s2 = s * s, s3 = s2 * s
+    return (2 * s3 - 3 * s2 + 1) * p0 + (s3 - 2 * s2 + s) * T * m0 + (-2 * s3 + 3 * s2) * p1 + (s3 - s2) * T * m1
+  }
+  // zoom (bruto) no tempo t desde o começo do deslizamento
+  func z(at t: Double) -> Double {
+    if t <= 0 { return exp(x0) }
+    if t >= total { return exp(x1) }
+    if tb == 0 { let k = t / ta; return exp(x0 + (x1 - x0) * k * k * (3 - 2 * k)) }
+    if t < ta { return exp(Self.hermite(x0, xa, 0, vj, ta, t / ta)) }
+    return exp(Self.hermite(xa, x1, vj, 0, tb, (t - ta) / tb))
+  }
+  // quando o caminho cruza a última troca (s desde o começo) — diag e teste
+  var crossT: Double? {
+    guard let s = crossAt else { return nil }
+    let up = x1 > x0
+    var lo = 0.0, hi = total
+    for _ in 0..<50 { let m = (lo + hi) / 2; if (z(at: m) < s) == up { lo = m } else { hi = m } }
+    return hi
+  }
+}

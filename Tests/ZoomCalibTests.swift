@@ -627,6 +627,38 @@ func check(_ ok: Bool, _ msg: String) { if ok { print("OK   " + msg) } else { pr
     lockSim("ESPERADA: tele 1,5 s depois, lado oposto", J: 0.995, inst: (0.012, -0.010), fin: (0.018, -0.014), gap: 1.5, expect: true)
     lockSim("ESPERADA: troca no fim do movimento (como antes)", J: 1.043, inst: (0.012, 0.002), fin: (0.02, 0.003), expect: true)
     lockSim("ESPERADA que não veio: o próximo zoom solta", J: 1.0, inst: (0, 0), fin: (0, 0), gap: 5.0, expect: true)
+    // 0.11.12: clique que cruza lente numa tirada só (GlideCurve) — medido 02/11: tele entra ~450 ms depois de parar no IN,
+    // ultra ~270 ms depois de parar no OUT
+    print("== clique que cruza lente (cauda até a lente de destino entrar)")
+    func glideSim(_ name: String, _ from: Double, _ to: Double, tail: Bool, minAfter: Double = 0) {
+      let c = GlideCurve(from: from, to: to, dur: 0.16, switches: [2, 10])
+      var zs: [Double] = []; var t = 0.0
+      while t <= c.total + 1.0 / 60 { zs.append(c.z(at: t)); t += 1.0 / 60 }
+      let up = to > from
+      var mono = true, maxStep = 0.0, maxJerk = 0.0, prevStep = 0.0
+      for k in 1..<zs.count {
+        let st = log(zs[k] / zs[k - 1]) * (up ? 1 : -1)
+        if st < -1e-9 { mono = false }
+        maxStep = max(maxStep, st); if k > 1 { maxJerk = max(maxJerk, abs(st - prevStep)) }; prevStep = st
+      }
+      let lastStep = abs(log(zs[zs.count - 1] / zs[zs.count - 3]))
+      let txt = String(format: "%@: %.0f ms (cauda %.0f ms), troca cruzada %@ antes do fim, maior passo %.1f%%, maior mudança de passo %.1f%%, últimos 2 quadros %.2f%%",
+        name, c.total * 1000, c.tb * 1000, c.crossT.map { String(format: "%.0f ms", (c.total - $0) * 1000) } ?? "—", maxStep * 100, maxJerk * 100, lastStep * 100)
+      check(abs(zs.first! - from) < 1e-9 && abs(zs.last! - to) < 1e-9, txt + " — começa e termina no lugar")
+      check(mono, txt + " — nunca volta")
+      if tail { check(lastStep < 0.006, txt + " — chega parado") }
+      check(maxJerk < 0.12, txt + " — sem degrau na emenda da cauda")
+      check(tail == (c.tb > 0), txt + (tail ? " — tem cauda" : " — sem troca atrasada: velocidade de sempre"))
+      if tail, let x = c.crossT, !up { check(c.total - x >= minAfter, txt + " — a ultra tem tempo de entrar ANDANDO") }
+    }
+    glideSim("IN 0,5→5 (tele atrasa)", 1, 10, tail: true)
+    glideSim("IN 1→5", 2, 10, tail: true)
+    glideSim("OUT 5→0,5 (ultra atrasa)", 10, 1, tail: true, minAfter: 0.25)
+    glideSim("OUT 2→0,5", 4, 1, tail: true, minAfter: 0.25)
+    glideSim("IN 0,5→1 (sem atraso)", 1, 2, tail: false)
+    glideSim("OUT 1→0,5 (começa na troca: rampa de sempre)", 2, 1, tail: false)
+    glideSim("OUT 5→1 (principal entra na hora)", 10, 2, tail: false)
+    glideSim("IN 0,5→2", 1, 4, tail: false)
     print("TESTE DO ZOOM OK")
   }
 }

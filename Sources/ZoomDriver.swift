@@ -20,7 +20,7 @@ final class ZoomDriver: @unchecked Sendable {
   private var gestureDir: Double = 0
   private var gestureRef: CGFloat = 0
   // deslizamento do toque (por quadro)
-  private var glidePlan: (from: CGFloat, to: CGFloat, dur: Double, t0: Double?)?
+  private var glidePlan: (from: CGFloat, to: CGFloat, dur: Double, t0: Double?, curve: GlideCurve)?
   // REGISTRO DE CADA VALOR POSTO (hora exata, valor) — o zoom que um quadro carrega é o último valor posto até a hora de
   // captura dele menos a "trava" do aparelho (calibrada; ver ZoomCalibration)
   private var setLog: [(Double, Double)] = []
@@ -112,15 +112,22 @@ final class ZoomDriver: @unchecked Sendable {
     let stops = abs(log2(Double(to / from)))
     guard stops > 0.003 else { return 0 }
     let dur = max(minDur, seconds * (0.7 + 0.3 * min(1, stops / 3.3)))
+    // cruza troca de lente: cauda que desacelera até a lente de destino entrar (GlideCurve, 0.11.12)
+    let sw = d.isVirtualDevice ? d.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue } : []
+    let curve = GlideCurve(from: Double(from), to: Double(to), dur: dur, switches: sw)
     // IN e OUT usam a MESMA curva por quadro e a MESMA duração do modo.
     // A rampa nativa do OUT impunha ~0,6 s mesmo com alvo rápido (~0,15 s).
     // Nenhum recorte da prévia simula o avanço: cada passo vai à câmera real.
     configure(d) { if d.isRampingVideoZoom { d.cancelVideoZoomRamp() } }
-    lock.lock(); glidePlan = (from, to, dur, nil); let direct = CACurrentMediaTime() - lastTickWall > 0.25; lock.unlock()
+    lock.lock(); glidePlan = (from, to, curve.total, nil, curve); let direct = CACurrentMediaTime() - lastTickWall > 0.25; lock.unlock()
     // OUT não salta ao alvo se a saída estiver temporariamente sem quadros.
     // O plano começa no primeiro quadro disponível; o IN conserva seu caminho.
     if direct && to >= from { put(d, to) }
-    return dur
+    if let s = curve.crossAt {
+      Diag.step("zoom-glide-lente", ["de": Double(from), "para": Double(to), "troca": s, "rapido_ms": Int(dur * 1000),
+        "cauda_ms": Int(curve.tb * 1000), "cauda_de": exp(curve.xa), "cruza_ms": Int((curve.crossT ?? 0) * 1000)])
+    }
+    return curve.total
   }
   // degrau direto (calibração)
   func jump(to factor: CGFloat) {
@@ -148,12 +155,13 @@ final class ZoomDriver: @unchecked Sendable {
     if dNew != digitalNow { digitalNow = dNew; digitalLog.append((t, dNew)); if digitalLog.count > 1200 { digitalLog.removeFirst(digitalLog.count - 1200) } }
     if var g = glidePlan {
       if g.t0 == nil { g.t0 = t; glidePlan = g }
-      let k = min(1, max(0, (t - g.t0!) / max(0.001, g.dur)))
-      // o 1º quadro do deslizamento já anda um passo (igual à rampa nativa)
-      let kk = min(1, k + 1.0 / 60 / max(0.001, g.dur))
-      let e = kk * kk * (3 - 2 * kk)   // rampa de edição: acelera do parado e desacelera até parar
-      let z = CGFloat(exp(log(Double(g.from)) + (log(Double(g.to)) - log(Double(g.from))) * e))
-      if kk >= 1 { glidePlan = nil }
+      // o 1º quadro do deslizamento já anda um passo (igual à rampa nativa); rampa de edição: acelera do parado e
+      // desacelera até parar — cruzando lente, com a cauda da GlideCurve
+      let tt = t - g.t0! + 1.0 / 60
+      let done = tt >= g.dur
+      let z = CGFloat(g.curve.z(at: tt))
+      if done { glidePlan = nil }
+      let kk = done ? 1.0 : 0.0
       lock.unlock()
       put(d, clamp(d, z))
       if kk >= 1 {
