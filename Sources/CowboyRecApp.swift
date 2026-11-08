@@ -56,6 +56,7 @@ struct RecorderView: View {
   @State private var settings = false
   @State private var arPresentation = false
   @State private var photoMode = false   // área de fotografia (0.11.0): sessão própria, a de vídeo fecha antes
+  @State private var scanMode = false    // SCAN 3D (0.12.0): ARKit + fotos automáticas → malha no PC (fila scanner3d)
   @State private var panel: CameraTool?
   @State private var interfaceAngle: Double = 90
   @State private var pinchStart: Double?
@@ -166,6 +167,7 @@ struct RecorderView: View {
     }
     .fullScreenCover(isPresented: $arPresentation, onDismiss: { camera.start() }) { NativeARRecorderView() }
     .fullScreenCover(isPresented: $photoMode, onDismiss: { camera.renderer.paused = false; camera.resumeFromPhoto() }) { PhotoCameraView { photoMode = false } }
+    .fullScreenCover(isPresented: $scanMode, onDismiss: { camera.renderer.paused = false; camera.resumeFromPhoto() }) { Scan3DView { scanMode = false } }
     .task {
       Diag.install(); Diag.step("open")
       UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -195,7 +197,7 @@ struct RecorderView: View {
     }
     .onChange(of: phase) { _, value in
       if value == .background { camera.close(); CloudStream.shared.enterBackground(); MotionHub.shared.stop() }
-      else if value == .active && portal == nil && !arPresentation && !photoMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick() } }
+      else if value == .active && portal == nil && !arPresentation && !photoMode && !scanMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick() } }
     }
   }
 
@@ -511,6 +513,9 @@ struct RecorderView: View {
       Button { panel = nil; fxOpen = false; camera.renderer.paused = true; MotionHub.shared.stop(); camera.close { Task { @MainActor in photoMode = true } } } label: {
         Text("FOTO").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.85)).padding(.vertical, 6).padding(.horizontal, 8).contentShape(Rectangle())
       }.buttonStyle(.plain).disabled(!camera.ready).accessibilityLabel("Modo foto")
+      Button { panel = nil; fxOpen = false; camera.renderer.paused = true; MotionHub.shared.stop(); camera.close { Task { @MainActor in scanMode = true } } } label: {
+        Text("SCAN 3D").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.85)).padding(.vertical, 6).padding(.horizontal, 8).contentShape(Rectangle())
+      }.buttonStyle(.plain).disabled(!camera.ready || camera.recording).accessibilityLabel("Scanner 3D")
     }
   }
   private var bottomRow: some View {
