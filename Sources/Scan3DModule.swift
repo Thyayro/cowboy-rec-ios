@@ -496,78 +496,20 @@ struct Scan3DView: View {
   @State private var quality = "ultra"
   @State private var list = false
   @State private var confirmFinish = false
+  @State private var startedAt: Date?
   private let gold = Color(red: 1, green: 0.8, blue: 0)
+  private let red = Color(red: 1, green: 0.23, blue: 0.19)
 
   var body: some View {
     ZStack {
       Scan3DPreview(camera: camera).ignoresSafeArea()
-      if !camera.scanning {
-        Image(systemName: "plus.viewfinder").font(.system(size: 44, weight: .light)).foregroundStyle(gold).allowsHitTesting(false)
-      }
-      VStack(spacing: 10) {
-        HStack {
-          Button { camera.close { Task { @MainActor in close() } } } label: { Label("Câmera", systemImage: "chevron.left") }.disabled(camera.scanning)
-          Spacer()
-          VStack(alignment: .trailing, spacing: 2) {
-            Text("SCAN 3D").font(.system(size: 13, weight: .heavy)).foregroundStyle(gold)
-            Text("\(camera.formatLabel) · \(camera.tracking)").font(.caption2).foregroundStyle(.white.opacity(0.8))
-          }
-        }.padding(.horizontal, 16).padding(.vertical, 10).background(.black.opacity(0.55))
+      if !camera.scanning && !camera.centerSet { reticle }
+      VStack(spacing: 0) {
+        topBar
         Spacer()
-        Text(camera.hint).font(.footnote.weight(.semibold)).multilineTextAlignment(.center).padding(.horizontal, 14).padding(.vertical, 8)
-          .background(.black.opacity(0.7), in: Capsule()).padding(.horizontal, 20)
-        HStack(alignment: .bottom) {
-          VStack(spacing: 6) {
-            ZStack {
-              Scan3DCoverage(coverage: camera.coverage).frame(width: 118, height: 118)
-              Text("\(camera.shots)").font(.system(size: 22, weight: .bold)).monospacedDigit()
-            }
-            if camera.scanning {
-              HStack(spacing: 6) {
-                Circle().fill(camera.sharpOK ? Color.green : Color.orange).frame(width: 9, height: 9)
-                Text(camera.distanceCM < 20 ? "\(camera.distanceCM) cm · muito perto" : "\(camera.distanceCM) cm")
-                  .font(.caption.weight(.semibold)).monospacedDigit().foregroundStyle(camera.distanceCM < 20 ? .orange : .white)
-              }.padding(.horizontal, 8).padding(.vertical, 4).background(.black.opacity(0.6), in: Capsule())
-            }
-          }
-          Spacer()
-          VStack(spacing: 8) {
-            if camera.scanning {
-              Button { if camera.ringFill.contains(where: { $0 < 0.66 }) { confirmFinish = true } else { finishScan() } } label: {
-                Text("CONCLUIR").font(.headline).frame(width: 150, height: 54).background(Color(red: 1, green: 0.23, blue: 0.19), in: Capsule())
-              }.foregroundStyle(.white)
-            } else if !camera.centerSet {
-              Button { camera.setCenter(from: nil) } label: {
-                Text("MARCAR OBJETO").font(.headline).frame(width: 170, height: 54).background(gold, in: Capsule())
-              }.foregroundStyle(.black).disabled(!camera.ready)
-            } else {
-              Button { camera.mode = mode; camera.quality = quality; camera.begin() } label: {
-                Text("INICIAR").font(.headline).frame(width: 150, height: 54).background(gold, in: Capsule())
-              }.foregroundStyle(.black).disabled(!camera.ready)
-              Button("remarcar objeto") { camera.setCenter(from: nil) }.font(.caption)
-            }
-          }
-        }.padding(.horizontal, 18)
-        if !camera.scanning {
-          HStack(spacing: 8) {
-            Picker("", selection: $mode) { Text("Objeto").tag("objeto"); Text("Pessoa").tag("pessoa"); Text("Ambiente").tag("ambiente") }.pickerStyle(.segmented)
-            Picker("", selection: $quality) { Text("Ultra").tag("ultra"); Text("Alta").tag("alta") }.pickerStyle(.segmented).frame(width: 120)
-          }.padding(.horizontal, 16)
-          Picker("", selection: Binding(get: { camera.videoMode }, set: { v in camera.videoMode = v; camera.start() })) {
-            Text("Filmagem 4K").tag(true); Text("Fotos").tag(false)
-          }.pickerStyle(.segmented).padding(.horizontal, 16)
-          Button { list = true; Task { await up.refresh() } } label: {
-            HStack { Image(systemName: "cube.transparent"); Text("Meus scans"); if up.pending > 0 { Text("· \(up.pending) a enviar") } }
-              .font(.subheadline.weight(.semibold)).padding(.horizontal, 16).padding(.vertical, 8).background(.black.opacity(0.6), in: Capsule())
-          }
-        }
-        if !up.status.isEmpty {
-          VStack(spacing: 4) {
-            ProgressView(value: up.progress).tint(gold)
-            Text(up.status).font(.caption2)
-          }.padding(.horizontal, 20)
-        }
-      }.padding(.bottom, 18)
+        hintPill.padding(.bottom, 10)
+        bottomPanel
+      }
     }
     .preferredColorScheme(.dark).tint(gold)
     .sheet(isPresented: $list) { Scan3DList() }
@@ -585,50 +527,337 @@ struct Scan3DView: View {
       else if p == .active { camera.start(); up.kick() }
     }
   }
+
+  // mira no centro antes de marcar o objeto
+  private var reticle: some View {
+    ZStack {
+      Circle().stroke(gold.opacity(0.9), lineWidth: 1.5).frame(width: 66, height: 66)
+      Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundStyle(gold)
+    }.allowsHitTesting(false)
+  }
+
+  private var topBar: some View {
+    HStack(spacing: 10) {
+      Button { camera.close { Task { @MainActor in close() } } } label: {
+        Image(systemName: "chevron.left").font(.system(size: 17, weight: .semibold)).frame(width: 42, height: 42)
+          .background(.ultraThinMaterial, in: Circle())
+      }.disabled(camera.scanning).opacity(camera.scanning ? 0.35 : 1).accessibilityLabel("Voltar à câmera")
+      Spacer(minLength: 8)
+      if camera.scanning {
+        HStack(spacing: 8) {
+          Circle().fill(red).frame(width: 8, height: 8)
+          TimelineView(.periodic(from: .now, by: 1)) { ctx in Text(elapsed(ctx.date)).monospacedDigit() }
+          Divider().frame(height: 14)
+          Image(systemName: "ruler").font(.caption)
+          Text("\(camera.distanceCM) cm").monospacedDigit().foregroundStyle(camera.distanceCM < 20 ? .orange : .white)
+          Circle().fill(camera.sharpOK ? Color.green : Color.orange).frame(width: 8, height: 8).accessibilityLabel(camera.sharpOK ? "foco ok" : "focando")
+        }
+        .font(.subheadline.weight(.semibold)).padding(.horizontal, 14).padding(.vertical, 9)
+        .background(.ultraThinMaterial, in: Capsule())
+      } else {
+        VStack(alignment: .trailing, spacing: 1) {
+          Text("SCAN 3D").font(.system(size: 12, weight: .heavy)).foregroundStyle(gold)
+          Text(camera.formatLabel).font(.caption2).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+      }
+    }
+    .padding(.horizontal, 16).padding(.top, 6)
+  }
+
+  private var hintPill: some View {
+    VStack(spacing: 4) {
+      Text(camera.hint).font(.footnote.weight(.semibold)).multilineTextAlignment(.center).lineLimit(2)
+      if !camera.ready && !camera.tracking.isEmpty {
+        Text(camera.tracking).font(.caption2).foregroundStyle(.orange)
+      }
+    }
+    .padding(.horizontal, 16).padding(.vertical, 9)
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    .padding(.horizontal, 24)
+  }
+
+  private var bottomPanel: some View {
+    VStack(spacing: 14) {
+      if !camera.scanning { chips }
+      HStack(alignment: .center, spacing: 0) {
+        // cobertura das 3 voltas + contagem
+        ZStack {
+          Scan3DCoverage(coverage: camera.coverage).frame(width: 86, height: 86)
+          VStack(spacing: 0) {
+            Text(countText).font(.system(size: 15, weight: .bold)).monospacedDigit()
+            Text(camera.videoMode ? "quadros" : "fotos").font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine).accessibilityLabel("Cobertura")
+        VStack(spacing: 6) {
+          shutter
+          if camera.centerSet && !camera.scanning {
+            Button("Remarcar") { camera.setCenter(from: nil) }.font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.85))
+          } else {
+            Text(shutterCaption).font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.85))
+          }
+        }
+        Button { list = true; Task { await up.refresh() } } label: {
+          ZStack(alignment: .topTrailing) {
+            Image(systemName: "square.stack.3d.up.fill").font(.system(size: 22)).foregroundStyle(.white)
+              .frame(width: 58, height: 58).background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            if up.pending > 0 {
+              Text("\(up.pending)").font(.caption2.bold()).foregroundStyle(.white).frame(minWidth: 18, minHeight: 18)
+                .background(red, in: Circle()).offset(x: 6, y: -6)
+            }
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing).accessibilityLabel("Meus scans")
+      }
+      if !up.status.isEmpty {
+        VStack(spacing: 4) {
+          ProgressView(value: up.progress).tint(gold)
+          Text(up.status).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+        }
+      }
+    }
+    .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 16)
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+    .padding(.horizontal, 10).padding(.bottom, 4)
+  }
+
+  // tipo / qualidade / filmagem x fotos: chips compactos com menu (cabe numa linha no iPhone)
+  private var chips: some View {
+    HStack(spacing: 8) {
+      Menu {
+        Picker("Tipo", selection: $mode) {
+          Label("Objeto", systemImage: "cube").tag("objeto")
+          Label("Pessoa / busto", systemImage: "person.crop.circle").tag("pessoa")
+          Label("Ambiente", systemImage: "house").tag("ambiente")
+        }
+      } label: { chip(icon: mode == "pessoa" ? "person.crop.circle" : mode == "ambiente" ? "house" : "cube", text: mode == "pessoa" ? "Pessoa" : mode == "ambiente" ? "Ambiente" : "Objeto") }
+      Menu {
+        Picker("Qualidade", selection: $quality) {
+          Label("Ultra — detalhe máximo", systemImage: "sparkles").tag("ultra")
+          Label("Alta — mais rápido", systemImage: "hare").tag("alta")
+        }
+      } label: { chip(icon: "sparkles", text: quality == "ultra" ? "Ultra" : "Alta") }
+      Menu {
+        Picker("Captura", selection: Binding(get: { camera.videoMode }, set: { v in camera.videoMode = v; camera.start() })) {
+          Label("Filmagem 4K (recomendado)", systemImage: "video").tag(true)
+          Label("Fotos automáticas", systemImage: "camera").tag(false)
+        }
+      } label: { chip(icon: camera.videoMode ? "video" : "camera", text: camera.videoMode ? "4K" : "Fotos") }
+    }
+    .frame(maxWidth: .infinity)
+  }
+
+  private func chip(icon: String, text: String) -> some View {
+    HStack(spacing: 5) {
+      Image(systemName: icon).font(.caption)
+      Text(text).lineLimit(1)
+      Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).opacity(0.7)
+    }
+    .font(.footnote.weight(.semibold)).foregroundStyle(.white)
+    .padding(.horizontal, 12).padding(.vertical, 8)
+    .background(.white.opacity(0.12), in: Capsule())
+    .fixedSize()
+  }
+
+  private var shutter: some View {
+    Button(action: shutterTap) {
+      ZStack {
+        Circle().stroke(.white, lineWidth: 4).frame(width: 76, height: 76)
+        if camera.scanning {
+          RoundedRectangle(cornerRadius: 8, style: .continuous).fill(red).frame(width: 30, height: 30)
+        } else if camera.centerSet {
+          Circle().fill(red).frame(width: 62, height: 62)
+        } else {
+          Circle().fill(gold).frame(width: 62, height: 62)
+          Image(systemName: "scope").font(.system(size: 26, weight: .semibold)).foregroundStyle(.black)
+        }
+      }
+      .frame(width: 84, height: 84).contentShape(Circle())
+    }
+    .buttonStyle(.plain)
+    .disabled(!camera.ready && !camera.scanning).opacity(!camera.ready && !camera.scanning ? 0.45 : 1)
+    .accessibilityLabel(camera.scanning ? "Concluir scan" : camera.centerSet ? "Iniciar scan" : "Marcar objeto")
+  }
+
+  private var shutterCaption: String { camera.scanning ? "Concluir" : camera.centerSet ? "Iniciar" : "Marcar objeto" }
+  private var countText: String {
+    let n = camera.shots
+    return camera.videoMode && n >= 1000 ? String(format: "%.1fk", Double(n) / 1000) : "\(n)"
+  }
+  private func elapsed(_ now: Date) -> String {
+    let s = Int(now.timeIntervalSince(startedAt ?? now)); return String(format: "%d:%02d", s / 60, s % 60)
+  }
+  private func shutterTap() {
+    if camera.scanning {
+      if camera.ringFill.contains(where: { $0 < 0.66 }) { confirmFinish = true } else { finishScan() }
+    } else if !camera.centerSet {
+      camera.setCenter(from: nil)
+    } else {
+      camera.mode = mode; camera.quality = quality; startedAt = Date(); camera.begin()
+    }
+  }
 }
 
 extension Scan3DView {
   func finishScan() { camera.finish { dir in Task { @MainActor in if dir != nil { Scan3DUploader.shared.kick() } } } }
 }
 
+// ------------------------------------------------------------------ Meus scans
 struct Scan3DList: View {
   @ObservedObject private var up = Scan3DUploader.shared
   @State private var preview: URL?
   @State private var loading: String?
   var body: some View {
     NavigationStack {
-      List {
-        Section {
-          Label(up.pcOnline ? "PC ligado: processando a fila" : "PC desligado: os scans esperam na fila", systemImage: up.pcOnline ? "bolt.fill" : "moon.zzz")
-            .foregroundStyle(up.pcOnline ? .green : .orange)
-          if up.pending > 0 { Text("\(up.pending) scan(s) no iPhone aguardando envio. Mantenha o app aberto até subir.").font(.caption) }
-        }
-        ForEach(up.jobs.indices, id: \.self) { i in
-          let j = up.jobs[i]
-          let id = j["id"] as? String ?? "", st = j["status"] as? String ?? ""
-          let results = j["results"] as? [String] ?? []
-          VStack(alignment: .leading, spacing: 4) {
-            HStack { Text(j["title"] as? String ?? "Scan").font(.headline); Spacer(); Text(st).font(.caption.weight(.bold)).foregroundStyle(st == "pronto" ? .green : st == "erro" ? .red : .yellow) }
-            Text(j["stage"] as? String ?? "").font(.caption).foregroundStyle(.secondary)
-            if st == "processando" { ProgressView(value: Double(j["pct"] as? Int ?? 0) / 100) }
-            if let s = j["stats"] as? [String: Any], let dims = s["size_cm"] as? String { Text("Tamanho real: \(dims)").font(.caption) }
-            if st == "pronto" {
-              HStack(spacing: 14) {
-                if results.contains("model.usdz") {
-                  Button(loading == id ? "baixando…" : "Ver em 3D/AR") { Task { loading = id; preview = await up.download(job: id, name: "model.usdz"); loading = nil } }
-                }
-                ForEach(["model.stl", "model_full.zip", "model.glb"].filter { results.contains($0) }, id: \.self) { n in
-                  if let u = URL(string: "/r/\(id)/\(n)", relativeTo: Scan3DAPI.origin)?.absoluteURL { ShareLink(n.replacingOccurrences(of: "model_full.zip", with: "OBJ"), item: u) }
-                }
-              }.font(.caption.weight(.semibold)).buttonStyle(.borderless)
+      ScrollView {
+        LazyVStack(spacing: 12) {
+          HStack(spacing: 10) {
+            Image(systemName: up.pcOnline ? "bolt.fill" : "moon.zzz.fill").foregroundStyle(up.pcOnline ? .green : .orange)
+            Text(up.pcOnline ? "PC ligado: processando a fila" : "PC desligado: os scans esperam na fila").font(.subheadline.weight(.semibold))
+            Spacer(minLength: 0)
+          }
+          .padding(14).background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+          if up.pending > 0 {
+            HStack(spacing: 10) {
+              ProgressView(value: up.progress).frame(width: 60)
+              Text("\(up.pending) scan(s) subindo do iPhone. Deixe o app aberto.").font(.footnote).foregroundStyle(.secondary)
+              Spacer(minLength: 0)
             }
-          }.padding(.vertical, 4)
+            .padding(14).background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+          }
+          ForEach(up.jobs.indices, id: \.self) { i in Scan3DCard(job: up.jobs[i], loading: $loading, preview: $preview) }
+          if up.jobs.isEmpty {
+            VStack(spacing: 8) {
+              Image(systemName: "cube.transparent").font(.system(size: 40)).foregroundStyle(.secondary)
+              Text("Nenhum scan ainda").font(.headline)
+              Text("Marque o objeto, toque em iniciar e ande em volta dele.").font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }.padding(.top, 60)
+          }
         }
+        .padding(16)
       }
-      .navigationTitle("Scans 3D").navigationBarTitleDisplayMode(.inline)
+      .navigationTitle("Meus scans").navigationBarTitleDisplayMode(.inline)
       .refreshable { await up.refresh() }
       .quickLookPreview($preview)
       .task { while !Task.isCancelled { await up.refresh(); try? await Task.sleep(nanoseconds: 6_000_000_000) } }
-    }.preferredColorScheme(.dark)
+    }
+    .preferredColorScheme(.dark).tint(Color(red: 1, green: 0.8, blue: 0))
+  }
+}
+
+struct Scan3DCard: View {
+  let job: [String: Any]
+  @Binding var loading: String?
+  @Binding var preview: URL?
+  private let gold = Color(red: 1, green: 0.8, blue: 0)
+  private var id: String { job["id"] as? String ?? "" }
+  private var status: String { job["status"] as? String ?? "" }
+  private var results: [String] { job["results"] as? [String] ?? [] }
+  private var stats: [String: Any] { job["stats"] as? [String: Any] ?? [:] }
+  private var hasIA: Bool { results.contains("ia_model.usdz") || results.contains("ia_preview.glb") }
+  private func url(_ n: String) -> URL { URL(string: "/r/\(id)/\(n)", relativeTo: Scan3DAPI.origin)!.absoluteURL }
+  private var mostruario: URL { URL(string: "/p/\(id)", relativeTo: Scan3DAPI.origin)!.absoluteURL }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(alignment: .top, spacing: 12) {
+        thumb
+        VStack(alignment: .leading, spacing: 5) {
+          HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(job["title"] as? String ?? "Scan").font(.headline).lineLimit(1)
+            Spacer(minLength: 4)
+            pill
+          }
+          Text(subtitle).font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+          if status == "processando" {
+            ProgressView(value: Double(job["pct"] as? Int ?? 0) / 100).tint(gold)
+          }
+        }
+      }
+      if status == "pronto" {
+        HStack(spacing: 8) {
+          Button {
+            Task { loading = id; preview = await Scan3DUploader.shared.download(job: id, name: hasIA ? "ia_model.usdz" : "model.usdz"); loading = nil }
+          } label: {
+            HStack(spacing: 6) {
+              if loading == id { ProgressView().tint(.black) } else { Image(systemName: "arkit") }
+              Text(loading == id ? "Abrindo…" : "Ver em 3D / AR").lineLimit(1)
+            }
+            .font(.subheadline.weight(.semibold)).foregroundStyle(.black)
+            .frame(maxWidth: .infinity).frame(height: 44)
+            .background(gold, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+          }
+          .buttonStyle(.plain).disabled(loading != nil)
+          Link(destination: mostruario) { iconButton("safari") }.accessibilityLabel("Abrir mostruário")
+          Menu { downloads } label: { iconButton("square.and.arrow.down") }.accessibilityLabel("Baixar arquivos")
+        }
+      }
+    }
+    .padding(14)
+    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+  }
+
+  @ViewBuilder private var downloads: some View {
+    if hasIA {
+      Section("Forma limpa (IA)") {
+        if results.contains("ia_model.stl") { ShareLink("STL p/ imprimir (mm)", item: url("ia_model.stl")) }
+        if results.contains("ia_model_full.zip") { ShareLink("OBJ + textura", item: url("ia_model_full.zip")) }
+        if results.contains("ia_model.glb") { ShareLink("GLB", item: url("ia_model.glb")) }
+      }
+    }
+    Section(hasIA ? "Fiel ao scan" : "Arquivos") {
+      if results.contains("model.stl") { ShareLink("STL p/ imprimir (mm)", item: url("model.stl")) }
+      if results.contains("model_full.zip") { ShareLink("OBJ + textura", item: url("model_full.zip")) }
+      if results.contains("model.glb") { ShareLink("GLB", item: url("model.glb")) }
+    }
+    Section { ShareLink("Link do mostruário", item: mostruario) }
+  }
+
+  private func iconButton(_ name: String) -> some View {
+    Image(systemName: name).font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
+      .frame(width: 48, height: 44).background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+  }
+
+  private var thumb: some View {
+    Group {
+      if results.contains("thumb.jpg") {
+        AsyncImage(url: url("thumb.jpg")) { img in img.resizable().scaledToFill() } placeholder: { Color.white.opacity(0.08) }
+      } else {
+        ZStack {
+          Color.white.opacity(0.08)
+          Image(systemName: status == "erro" ? "exclamationmark.triangle" : "cube.transparent").font(.system(size: 22)).foregroundStyle(.secondary)
+        }
+      }
+    }
+    .frame(width: 64, height: 64).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+  }
+
+  private var pill: some View {
+    let (t, c): (String, Color) = {
+      switch status {
+      case "pronto": return ("pronto", .green)
+      case "processando": return ("\(job["pct"] as? Int ?? 0)%", .yellow)
+      case "pendente": return ("na fila", .orange)
+      case "enviando": return ("enviando", .blue)
+      case "pausado": return ("pausado", .purple)
+      case "erro": return ("erro", .red)
+      default: return (status, .secondary)
+      }
+    }()
+    return Text(t).font(.caption.weight(.bold)).foregroundStyle(c)
+      .padding(.horizontal, 8).padding(.vertical, 3).background(c.opacity(0.15), in: Capsule()).fixedSize()
+  }
+
+  private var subtitle: String {
+    switch status {
+    case "pronto":
+      if let s = (hasIA ? stats["ia_size_cm"] : nil) as? String ?? stats["size_cm"] as? String { return "Tamanho real: \(s)" }
+      return "Malha pronta"
+    case "pendente": return "Na fila: o PC processa assim que estiver ligado"
+    default: return job["stage"] as? String ?? ""
+    }
   }
 }
