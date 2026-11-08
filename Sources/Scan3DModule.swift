@@ -53,6 +53,15 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   private var lastUI = 0.0
   private var highRes = false
   var mode = "objeto", quality = "ultra", title = ""
+  // 0.12.2: FILMAGEM 4K (padrao) -- o PC escolhe o quadro mais nitido de cada direcao; fotos automaticas viram opcao
+  @Published var videoMode = true
+  private var writer: AVAssetWriter?
+  private var vin: AVAssetWriterInput?
+  private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+  private var vt0: Double?
+  private var vfps = 30
+  private var covBuf: [(Int, Int)] = []
+  private var closing = false
 
   private func publish(_ f: @escaping @Sendable () -> Void) { DispatchQueue.main.async(execute: f) }
 
@@ -62,15 +71,19 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
         publish { self.hint = "Libere a câmera nos Ajustes" }; return
       }
       queue.async {
-        let cfg = ARWorldTrackingConfiguration()
-        // foto em alta resolução sob demanda (iOS 16): o formato recomendado pra isso; senão 4K; senão o maior
-        if let f = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing { cfg.videoFormat = f; self.highRes = true }
+        let cfg = ARWorldTrackingConfiguration(); self.highRes = false
+        let maior = ARWorldTrackingConfiguration.supportedVideoFormats.max { $0.imageResolution.width * $0.imageResolution.height < $1.imageResolution.width * $1.imageResolution.height }
+        if self.videoMode {
+          // filmagem: 4K (o maior formato de video do ARKit)
+          if let f = ARWorldTrackingConfiguration.recommendedVideoFormatFor4KResolution ?? maior { cfg.videoFormat = f }
+        } else if let f = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing { cfg.videoFormat = f; self.highRes = true }
         else if let f = ARWorldTrackingConfiguration.recommendedVideoFormatFor4KResolution { cfg.videoFormat = f }
+        self.vfps = cfg.videoFormat.framesPerSecond
         cfg.planeDetection = [.horizontal]; cfg.videoHDRAllowed = false; cfg.isAutoFocusEnabled = true
         self.session.delegate = self; self.session.delegateQueue = self.queue
         self.session.run(cfg, options: [.resetTracking, .removeExistingAnchors])
         let r = cfg.videoFormat.imageResolution
-        self.publish { self.formatLabel = "\(Int(r.width))×\(Int(r.height))\(self.highRes ? " + foto alta" : "") · \(cfg.videoFormat.framesPerSecond) qps" }
+        self.publish { self.formatLabel = (self.videoMode ? "Vídeo " : "Fotos ") + "\(Int(r.width))×\(Int(r.height))\(self.highRes ? " + foto alta" : "") · \(cfg.videoFormat.framesPerSecond) qps" }
       }
     }
   }
@@ -103,11 +116,32 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Scan3D", isDirectory: true)
       let d = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
       do { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) } catch { self.publish { self.hint = error.localizedDescription }; return }
-      self.dir = d; self.frames = []; self.lastShot = nil
+      self.dir = d; self.frames = []; self.lastShot = nil; self.vt0 = nil; self.closing = false
+      if self.videoMode {
+        guard let f = self.session.currentFrame else { return }
+        let w = CVPixelBufferGetWidth(f.capturedImage), h = CVPixelBufferGetHeight(f.capturedImage)
+        var falha: String?
+        let ex = CowboyObjC.catching {
+          do {
+            let wr = try AVAssetWriter(outputURL: d.appendingPathComponent("scan.mov"), fileType: .mov)
+            let set: [String: Any] = [AVVideoCodecKey: AVVideoCodecType.hevc, AVVideoWidthKey: w, AVVideoHeightKey: h,
+                                      AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 60_000_000, AVVideoMaxKeyFrameIntervalKey: 30,
+                                                                        AVVideoAllowFrameReorderingKey: false]]   // sem reordenar: quadro i = pose i
+            let inp = AVAssetWriterInput(mediaType: .video, outputSettings: set); inp.expectsMediaDataInRealTime = true
+            guard wr.canAdd(inp) else { falha = "Gravador de vídeo indisponível"; return }
+            wr.add(inp)
+            let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: inp, sourcePixelBufferAttributes: nil)
+            guard wr.startWriting() else { falha = wr.error?.localizedDescription ?? "Falha ao gravar"; return }
+            wr.startSession(atSourceTime: .zero)
+            self.writer = wr; self.vin = inp; self.adaptor = ad
+          } catch { falha = error.localizedDescription }
+        }
+        if let m = falha ?? ex { self.publish { self.hint = m }; return }
+      }
       self.lockCamera()
       self.publish {
         self.scanning = true; self.shots = 0; self.coverage = Array(repeating: Array(repeating: false, count: 36), count: 3)
-        self.hint = "Ande em volta, devagar. 3 voltas: baixa, meio, alta"
+        self.hint = self.videoMode ? "Filmando: ande em volta devagar. 3 voltas: baixa, meio, alta" : "Ande em volta, devagar. 3 voltas: baixa, meio, alta"
       }
     }
   }
@@ -115,15 +149,24 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   func finish(_ done: @escaping @Sendable (URL?) -> Void) {
     queue.async {
       guard self.scanning, let d = self.dir else { done(nil); return }
-      self.writePoses(final: true)
       self.unlockCamera()
-      let n = self.frames.count
-      self.dir = nil
-      self.publish { self.scanning = false; self.hint = n >= 20 ? "Scan salvo: enviando pra fila" : "Poucas fotos (\(n)): scan descartado" }
-      if n < 20 { try? FileManager.default.removeItem(at: d); done(nil); return }
-      let meta: [String: Any] = ["title": self.title.isEmpty ? "Scan \(Self.stamp())" : self.title, "mode": self.mode, "quality": self.quality]
-      try? JSONSerialization.data(withJSONObject: meta).write(to: d.appendingPathComponent("meta.json"), options: .atomic)
-      done(d)
+      let n = self.frames.count, minimo = self.videoMode ? 60 : 20
+      let fecha: @Sendable () -> Void = {
+        self.queue.async {
+          self.writePoses(final: true); self.dir = nil
+          self.publish { self.scanning = false; self.hint = n >= minimo ? "Scan salvo: enviando pra fila" : "Muito curto (\(n)): scan descartado" }
+          if n < minimo { try? FileManager.default.removeItem(at: d); done(nil); return }
+          let meta: [String: Any] = ["title": self.title.isEmpty ? "Scan \(Self.stamp())" : self.title, "mode": self.mode, "quality": self.quality]
+          try? JSONSerialization.data(withJSONObject: meta).write(to: d.appendingPathComponent("meta.json"), options: .atomic)
+          done(d)
+        }
+      }
+      if let wr = self.writer {
+        self.writer = nil; let inp = self.vin; self.vin = nil; self.adaptor = nil
+        self.publish { self.hint = "Fechando o vídeo…" }
+        _ = CowboyObjC.catching { inp?.markAsFinished() }
+        wr.finishWriting { fecha() }
+      } else { fecha() }
     }
   }
   static func stamp() -> String { let f = DateFormatter(); f.dateFormat = "dd/MM HH:mm"; return f.string(from: Date()) }
@@ -137,7 +180,12 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
         try dev.lockForConfiguration()
         // 0.12.1: foco NUNCA trava (a distancia muda andando em volta: foco travado = foto borrada, medido no 1o scan)
         if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
-        if dev.isExposureModeSupported(.locked) { dev.exposureMode = .locked }
+        let alvo = CMTime(value: 1, timescale: 250)          // video: obturador curto contra borrao de movimento
+        if self.videoMode, dev.isExposureModeSupported(.custom), CMTimeCompare(dev.exposureDuration, alvo) > 0 {
+          let ganho = Float(dev.exposureDuration.seconds / alvo.seconds)
+          let iso = min(dev.activeFormat.maxISO, max(dev.activeFormat.minISO, dev.iso * ganho))
+          dev.setExposureModeCustom(duration: CMTimeMaximum(alvo, dev.activeFormat.minExposureDuration), iso: iso, completionHandler: nil)
+        } else if dev.isExposureModeSupported(.locked) { dev.exposureMode = .locked }
         if dev.isWhiteBalanceModeSupported(.locked) { dev.whiteBalanceMode = .locked }
         dev.unlockForConfiguration()
       } catch {}
@@ -179,12 +227,13 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     }
     prev = (t, m)
     if t - lastUI > 0.25 { lastUI = t; publish { self.tracking = label; self.ready = ok } }
-    guard scanning, ok, !busy, let c = center else { return }
+    guard scanning, ok || (videoMode && writer != nil), !busy, let c = center else { return }
     let pos = simd_make_float3(m.columns.3)
     let fromC = pos - c, dist = simd_length(fromC)
     guard dist > 0.05 else { return }
     let dirC = fromC / dist
     if t - lastUI < 0.02 { let cm = Int(dist * 100); publish { self.distanceCM = cm } }
+    if videoMode { recordVideo(frame, center: c, label: label, fast: rotSpeed > 30 || linSpeed > 0.35); return }
     if rotSpeed > 18 || linSpeed > 0.25 {
       if t - lastUI < 0.05 { publish { self.hint = "Mais devagar: foto só com o celular firme" } }
       return
@@ -210,6 +259,33 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
         self.queue.async { if let f { shot(f) } else { shot(frame) }; self.busy = false }
       }
     } else { shot(frame); busy = false }
+  }
+
+  private func recordVideo(_ frame: ARFrame, center c: simd_float3, label: String, fast: Bool) {
+    guard let wr = writer, wr.status == .writing, let inp = vin, let ad = adaptor, inp.isReadyForMoreMediaData else { return }
+    if vt0 == nil { vt0 = frame.timestamp }
+    let pts = CMTime(seconds: frame.timestamp - (vt0 ?? 0), preferredTimescale: 600000)
+    guard ad.append(frame.capturedImage, withPresentationTime: pts) else { return }
+    let m = frame.camera.transform, k = frame.camera.intrinsics
+    frames.append(["i": frames.count, "t": frame.timestamp - (vt0 ?? 0), "tracking": label == "rastreio ok" ? "normal" : label,
+                   "transform": (0..<4).flatMap { col in (0..<4).map { row in Double(m[col][row]) } },
+                   "intrinsics": (0..<3).flatMap { col in (0..<3).map { row in Double(k[col][row]) } }])
+    let v = simd_make_float3(m.columns.3) - c, el = asin(max(-1, min(1, v.y / max(1e-4, simd_length(v))))) * 180 / .pi
+    var az = atan2(v.z, v.x) * 180 / .pi; if az < 0 { az += 360 }
+    covBuf.append((el < 15 ? 0 : (el < 45 ? 1 : 2), min(35, Int(az / 10))))
+    let n = frames.count
+    if n % 6 == 0 {                                       // tela: 5x por segundo
+      let buf = covBuf; covBuf = []
+      let seg = Double(n) / Double(max(1, vfps))
+      publish {
+        for (r, sct) in buf { self.coverage[r][sct] = true }
+        self.shots = n
+        let names = ["baixa", "do meio", "alta"]
+        let missing = (0..<3).filter { r in self.coverage[r].filter { $0 }.count < 30 }
+        self.hint = fast ? "Mais devagar: assim borra" : (missing.isEmpty ? "Cobertura completa! Pode concluir" : "Falta a volta \(names[missing[0]]) · \(Int(seg)) s")
+      }
+    }
+    if n >= vfps * 240 && !closing { closing = true; finish { d in Task { @MainActor in if d != nil { Scan3DUploader.shared.kick() } } } }   // 4 min: fecha sozinho
   }
 
   static func centerSharpness(_ pb: CVPixelBuffer) -> Float {
@@ -263,6 +339,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     guard let d = dir, let c = center else { return }
     var doc: [String: Any] = ["schema": "cowboy-scan3d/v1", "units": "meters", "coordinate_system": "ARKit: y para cima, transform câmera→mundo column-major, câmera olha -Z",
                               "center": [c.x, c.y, c.z], "frames": frames, "complete": final]
+    if videoMode { doc["video"] = "scan.mov"; doc["fps"] = vfps }
     if let floorY { doc["floor_y"] = floorY }
     try? JSONSerialization.data(withJSONObject: doc).write(to: d.appendingPathComponent("poses.json"), options: .atomic)
   }
@@ -308,7 +385,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   private func upload(_ d: URL) async throws {
     let metaURL = d.appendingPathComponent("meta.json")
     var meta = (try JSONSerialization.jsonObject(with: Data(contentsOf: metaURL)) as? [String: Any]) ?? [:]
-    let names = try FileManager.default.contentsOfDirectory(atPath: d.path).filter { $0.hasSuffix(".jpg") || $0 == "poses.json" }.sorted()
+    let names = try FileManager.default.contentsOfDirectory(atPath: d.path).filter { $0.hasSuffix(".jpg") || $0 == "poses.json" || $0 == "scan.mov" }.sorted()
     let sizes = try names.map { ((try FileManager.default.attributesOfItem(atPath: d.appendingPathComponent($0).path)[.size] as? NSNumber)?.intValue) ?? 0 }
     let total = Double(max(1, sizes.reduce(0, +)))
     var job = meta["job"] as? String
@@ -476,6 +553,9 @@ struct Scan3DView: View {
             Picker("", selection: $mode) { Text("Objeto").tag("objeto"); Text("Pessoa").tag("pessoa"); Text("Ambiente").tag("ambiente") }.pickerStyle(.segmented)
             Picker("", selection: $quality) { Text("Ultra").tag("ultra"); Text("Alta").tag("alta") }.pickerStyle(.segmented).frame(width: 120)
           }.padding(.horizontal, 16)
+          Picker("", selection: Binding(get: { camera.videoMode }, set: { v in camera.videoMode = v; camera.start() })) {
+            Text("Filmagem 4K").tag(true); Text("Fotos").tag(false)
+          }.pickerStyle(.segmented).padding(.horizontal, 16)
           Button { list = true; Task { await up.refresh() } } label: {
             HStack { Image(systemName: "cube.transparent"); Text("Meus scans"); if up.pending > 0 { Text("· \(up.pending) a enviar") } }
               .font(.subheadline.weight(.semibold)).padding(.horizontal, 16).padding(.vertical, 8).background(.black.opacity(0.6), in: Capsule())
