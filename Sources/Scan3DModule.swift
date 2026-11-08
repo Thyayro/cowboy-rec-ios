@@ -39,6 +39,9 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   @Published var formatLabel = "ARKit…"
   @Published var tracking = ""
   @Published var centerSet = false
+  @Published var distanceCM = 0
+  @Published var sharpOK = true
+  private var sharpHist: [Float] = []
   var onCenter: ((simd_float3) -> Void)?
   private var dir: URL?
   private var frames: [[String: Any]] = []
@@ -87,7 +90,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
         let ys = f.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }.map { $0.transform.columns.3.y }.filter { $0 <= c.y + 0.02 }
         self.floorY = ys.max()
       }
-      self.publish { self.centerSet = true; self.onCenter?(c); self.hint = "Centro marcado. Toque INICIAR e ande em volta devagar" }
+      self.publish { self.centerSet = true; self.onCenter?(c); self.hint = "Centro marcado. INICIAR e ande em volta devagar, a 20–35 cm, com o objeto grande na tela" }
     }
   }
 
@@ -132,7 +135,8 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     let err = CowboyObjC.catching {
       do {
         try dev.lockForConfiguration()
-        if dev.isFocusModeSupported(.locked) { dev.focusMode = .locked }
+        // 0.12.1: foco NUNCA trava (a distancia muda andando em volta: foco travado = foto borrada, medido no 1o scan)
+        if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
         if dev.isExposureModeSupported(.locked) { dev.exposureMode = .locked }
         if dev.isWhiteBalanceModeSupported(.locked) { dev.whiteBalanceMode = .locked }
         dev.unlockForConfiguration()
@@ -180,7 +184,8 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     let fromC = pos - c, dist = simd_length(fromC)
     guard dist > 0.05 else { return }
     let dirC = fromC / dist
-    if rotSpeed > 30 || linSpeed > 0.45 {
+    if t - lastUI < 0.02 { let cm = Int(dist * 100); publish { self.distanceCM = cm } }
+    if rotSpeed > 18 || linSpeed > 0.25 {
       if t - lastUI < 0.05 { publish { self.hint = "Mais devagar: foto só com o celular firme" } }
       return
     }
@@ -188,6 +193,15 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       let ang = acos(max(-1, min(1, simd_dot(dirC, l.dir)))) * 180 / .pi
       guard (ang >= 5 || simd_distance(pos, l.p) >= 0.08), t - l.t >= 0.35 else { return }
     }
+    // portao de nitidez (centro do quadro, onde esta o objeto): abaixo de 60% da mediana recente = foco ainda andando
+    let sh = Self.centerSharpness(frame.capturedImage)
+    let ref = sharpHist.count >= 5 ? sharpHist.sorted()[sharpHist.count / 2] : 0
+    if ref > 0 && sh < 0.6 * ref {
+      if t - lastUI < 0.05 { publish { self.sharpOK = false; self.hint = "Esperando o foco: segure firme" } }
+      return
+    }
+    sharpHist.append(sh); if sharpHist.count > 25 { sharpHist.removeFirst() }
+    if !sharpOK { publish { self.sharpOK = true } }
     busy = true
     let shot: (ARFrame) -> Void = { [weak self] f in self?.save(f, center: c) }
     if highRes {
@@ -197,6 +211,26 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       }
     } else { shot(frame); busy = false }
   }
+
+  static func centerSharpness(_ pb: CVPixelBuffer) -> Float {
+    CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return 0 }
+    let w = CVPixelBufferGetWidthOfPlane(pb, 0), h = CVPixelBufferGetHeightOfPlane(pb, 0), row = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+    let p = base.assumingMemoryBound(to: UInt8.self)
+    let n = 192, x0 = w / 2 - n, y0 = h / 2 - n      // 384x384 px do centro, passo 2
+    var sum: Float = 0, sum2: Float = 0, cnt: Float = 0
+    for j in stride(from: 2, to: 2 * n - 2, by: 2) {
+      for i in stride(from: 2, to: 2 * n - 2, by: 2) {
+        let o = (y0 + j) * row + x0 + i
+        let l = 4 * Float(p[o]) - Float(p[o - 2]) - Float(p[o + 2]) - Float(p[o - 2 * row]) - Float(p[o + 2 * row])
+        sum += l; sum2 += l * l; cnt += 1
+      }
+    }
+    let m = sum / max(1, cnt); return sum2 / max(1, cnt) - m * m
+  }
+
+  /// fração coberta de cada volta (baixa, meio, alta)
+  var ringFill: [Double] { coverage.map { Double($0.filter { $0 }.count) / 36 } }
 
   private func save(_ f: ARFrame, center c: simd_float3) {
     guard let d = dir else { return }
@@ -384,6 +418,7 @@ struct Scan3DView: View {
   @State private var mode = "objeto"
   @State private var quality = "ultra"
   @State private var list = false
+  @State private var confirmFinish = false
   private let gold = Color(red: 1, green: 0.8, blue: 0)
 
   var body: some View {
@@ -405,14 +440,23 @@ struct Scan3DView: View {
         Text(camera.hint).font(.footnote.weight(.semibold)).multilineTextAlignment(.center).padding(.horizontal, 14).padding(.vertical, 8)
           .background(.black.opacity(0.7), in: Capsule()).padding(.horizontal, 20)
         HStack(alignment: .bottom) {
-          ZStack {
-            Scan3DCoverage(coverage: camera.coverage).frame(width: 118, height: 118)
-            Text("\(camera.shots)").font(.system(size: 22, weight: .bold)).monospacedDigit()
+          VStack(spacing: 6) {
+            ZStack {
+              Scan3DCoverage(coverage: camera.coverage).frame(width: 118, height: 118)
+              Text("\(camera.shots)").font(.system(size: 22, weight: .bold)).monospacedDigit()
+            }
+            if camera.scanning {
+              HStack(spacing: 6) {
+                Circle().fill(camera.sharpOK ? Color.green : Color.orange).frame(width: 9, height: 9)
+                Text(camera.distanceCM < 20 ? "\(camera.distanceCM) cm · muito perto" : "\(camera.distanceCM) cm")
+                  .font(.caption.weight(.semibold)).monospacedDigit().foregroundStyle(camera.distanceCM < 20 ? .orange : .white)
+              }.padding(.horizontal, 8).padding(.vertical, 4).background(.black.opacity(0.6), in: Capsule())
+            }
           }
           Spacer()
           VStack(spacing: 8) {
             if camera.scanning {
-              Button { camera.finish { dir in Task { @MainActor in if dir != nil { up.kick() } } } } label: {
+              Button { if camera.ringFill.contains(where: { $0 < 0.66 }) { confirmFinish = true } else { finishScan() } } label: {
                 Text("CONCLUIR").font(.headline).frame(width: 150, height: 54).background(Color(red: 1, green: 0.23, blue: 0.19), in: Capsule())
               }.foregroundStyle(.white)
             } else if !camera.centerSet {
@@ -447,6 +491,13 @@ struct Scan3DView: View {
     }
     .preferredColorScheme(.dark).tint(gold)
     .sheet(isPresented: $list) { Scan3DList() }
+    .alert("Cobertura incompleta", isPresented: $confirmFinish) {
+      Button("Continuar escaneando", role: .cancel) {}
+      Button("Concluir assim mesmo") { finishScan() }
+    } message: {
+      let f = camera.ringFill.map { Int($0 * 100) }
+      Text("Voltas: baixa \(f[0])%, meio \(f[1])%, alta \(f[2])%. Cada volta incompleta vira buraco na malha. O ideal é passar de 70% nas três.")
+    }
     .task { camera.start(); up.kick() }
     .onDisappear { camera.close() }
     .onChange(of: phase) { _, p in
@@ -454,6 +505,10 @@ struct Scan3DView: View {
       else if p == .active { camera.start(); up.kick() }
     }
   }
+}
+
+extension Scan3DView {
+  func finishScan() { camera.finish { dir in Task { @MainActor in if dir != nil { Scan3DUploader.shared.kick() } } } }
 }
 
 struct Scan3DList: View {
