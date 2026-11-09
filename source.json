@@ -1,0 +1,109 @@
+{
+  "name": "Cowboy Rec",
+  "identifier": "com.cowboy.rec.source",
+  "subtitle": "Versões do Cowboy Rec",
+  "sourceURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/source.json",
+  "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+  "tintColor": "#F5C518",
+  "apps": [
+    {
+      "name": "Cowboy Rec",
+      "bundleIdentifier": "com.cowboy.rec.personal",
+      "developerName": "Cowboy do Consórcio",
+      "subtitle": "Apple Log direto na nuvem",
+      "localizedDescription": "Câmera Apple Log que grava direto na nuvem Cowboy.",
+      "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+      "tintColor": "#F5C518",
+      "category": "photo-video",
+      "versions": [
+        {
+          "version": "0.12.6",
+          "date": "2026-11-09T13:49:37Z",
+          "localizedDescription": "Cowboy Rec 0.12.6 (teste)\n\nSCAN 3D: prévia do volume segue a mira da câmera quando a marca cai fora do objeto.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.6-test/CowboyRec-0.12.6-unsigned.ipa",
+          "size": 2563335,
+          "minOSVersion": "17.2",
+          "buildVersion": "82"
+        },
+        {
+          "version": "0.12.5",
+          "date": "2026-11-09T13:14:07Z",
+          "localizedDescription": "Cowboy Rec 0.12.5 (teste)\n\nSCAN 3D: layout cabe na tela; pausar/continuar/descartar na gravação; pausar/continuar/excluir em Meus scans; prévia só do objeto (sem a mesa) e raio/eixo pro PC.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.5-test/CowboyRec-0.12.5-unsigned.ipa",
+          "size": 2561347,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.4",
+          "date": "2026-11-09T05:33:44Z",
+          "localizedDescription": "Cowboy Rec 0.12.4 (teste)\n\nSCAN 3D: nota prevista durante a captura com dica do que melhorar, prévia do volume captado em cinza, opção de apoio Mesa/Suporte.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.4-test/CowboyRec-0.12.4-unsigned.ipa",
+          "size": 2527507,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.3",
+          "date": "2026-11-08T23:55:24Z",
+          "localizedDescription": "Cowboy Rec 0.12.3 (teste) — SCAN 3D com UX nova\n\nSCAN 3D: obturador redondo (marcar/iniciar/concluir), chips de tipo/qualidade/captura numa linha, painel com material, chip de tempo/distância/foco durante a filmagem. Meus scans em cartões com miniatura, Ver em 3D/AR (forma limpa), mostruário e menu Baixar — sem quebra de linha.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.3-test/CowboyRec-0.12.3-unsigned.ipa",
+          "size": 2506403,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.2",
+          "date": "2026-11-08T23:12:40Z",
+          "localizedDescription": "Cowboy Rec 0.12.2 (teste) — SCAN 3D por filmagem 4K\n\nSCAN 3D agora FILMA em 4K por padrão (HEVC 60 Mbps, pose do ARKit em cada quadro, obturador 1/250 contra borrão, foco contínuo, cor travada). O PC escolhe o quadro mais nítido de cada direção em volta do objeto — centenas de pontos de vista em vez de ~50 fotos. Modo Fotos continua como opção.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.2-test/CowboyRec-0.12.2-unsigned.ipa",
+          "size": 2451105,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.1",
+          "date": "2026-11-08T20:39:55Z",
+          "localizedDescription": "Cowboy Rec 0.12.1 (teste) — SCAN 3D nítido\n\nSCAN 3D: foco contínuo durante o scan (só luz/branco travam — o foco travado borrava as fotos), portão de nitidez no centro do quadro (espera o foco assentar), firmeza mais exigente, distância ao vivo na tela (aviso abaixo de 20 cm), CONCLUIR pede confirmação se alguma volta estiver abaixo de 66%.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.1-test/CowboyRec-0.12.1-unsigned.ipa",
+          "size": 2436657,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.0",
+          "date": "2026-11-08T17:55:02Z",
+          "localizedDescription": "Cowboy Rec 0.12.0 (teste) — SCAN 3D\n\nNovo modo **SCAN 3D** (ao lado de VÍDEO | FOTO): ARKit + foto em alta resolução automática a cada ~5° com o celular firme, foco/luz/branco travados no início, anel de cobertura das 3 voltas, envio pra fila do Scanner 3D com o login do Rec. O PC (RTX) monta a malha em escala real (STL em mm), sem chão nem fundo. Lista \"Meus scans\" com visualização 3D/AR.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.0-test/CowboyRec-0.12.0-unsigned.ipa",
+          "size": 2428425,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.11.12",
+          "date": "2026-11-02T16:06:39Z",
+          "localizedDescription": "Cowboy Rec 0.11.12 (teste) — clique que cruza lente numa tirada só\n\nClique 0,5→5 e 5→0,5: o zoom anda no ritmo pedido até perto da troca da tele (in) / ultra (out) e termina numa cauda que desacelera (~0,35 s), pra lente de destino entrar DENTRO do movimento em vez de 200–450 ms depois de parar (3 encaixes no in, saltos no out — medido 02/11 na 0.11.10). Outros cliques: velocidade de sempre. Inclui a 0.11.11 (nunca perder filmagem). Diag novo: zoom-glide-lente.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.11.12-test/CowboyRec-0.11.12-unsigned.ipa",
+          "size": 2319803,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSCameraUsageDescription": "Gravar vídeo.",
+          "NSMicrophoneUsageDescription": "Gravar o som do vídeo.",
+          "NSPhotoLibraryUsageDescription": "Mandar vídeos da galeria.",
+          "NSPhotoLibraryAddUsageDescription": "Salvar na galeria."
+        }
+      },
+      "version": "0.12.6",
+      "versionDate": "2026-11-09T13:49:37Z",
+      "versionDescription": "Cowboy Rec 0.12.6 (teste)\n\nSCAN 3D: prévia do volume segue a mira da câmera quando a marca cai fora do objeto.",
+      "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.6-test/CowboyRec-0.12.6-unsigned.ipa",
+      "size": 2563335
+    }
+  ],
+  "news": []
+}
