@@ -62,6 +62,16 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   private var vfps = 30
   private var covBuf: [(Int, Int)] = []
   private var closing = false
+  // 0.12.4: NOTA prevista + previa do VOLUME (pontos do ARKit em voxels de 6 mm) + objeto em suporte
+  static let voxel: Float = 0.006
+  @Published var score: Double = 0
+  @Published var scoreTip = ""
+  @Published var volume: [simd_float3] = []
+  var suporte = false
+  private var vox: [Int32: UInt8] = [:]
+  private var voxFrame = 0, lastVol = 0.0
+  private var nTotal = 0, nFast = 0, nBadTrack = 0, nBadDist = 0, luxN = 0
+  private var luxSum = 0.0
 
   private func publish(_ f: @escaping @Sendable () -> Void) { DispatchQueue.main.async(execute: f) }
 
@@ -97,13 +107,13 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       guard !self.scanning, let q = query ?? self.session.currentFrame?.raycastQuery(from: CGPoint(x: 0.5, y: 0.5), allowing: .estimatedPlane, alignment: .any),
             let hit = self.session.raycast(q).first else { self.publish { self.hint = "Não achei o objeto na mira: chegue mais perto, com luz" }; return }
       let c = simd_make_float3(hit.worldTransform.columns.3)
-      self.center = c
+      self.center = c; self.vox = [:]
       // chão = plano horizontal logo abaixo do centro (objeto em cima da mesa/piso)
       if let f = self.session.currentFrame {
         let ys = f.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }.map { $0.transform.columns.3.y }.filter { $0 <= c.y + 0.02 }
         self.floorY = ys.max()
       }
-      self.publish { self.centerSet = true; self.onCenter?(c); self.hint = "Centro marcado. INICIAR e ande em volta devagar, a 20–35 cm, com o objeto grande na tela" }
+      self.publish { self.centerSet = true; self.onCenter?(c); self.hint = "Centro marcado. INICIAR e ande em volta a 20–35 cm. Dica: apoiado num copo menor que ele, a base sai limpa" }
     }
   }
 
@@ -117,6 +127,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       let d = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
       do { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) } catch { self.publish { self.hint = error.localizedDescription }; return }
       self.dir = d; self.frames = []; self.lastShot = nil; self.vt0 = nil; self.closing = false
+      self.nTotal = 0; self.nFast = 0; self.nBadTrack = 0; self.nBadDist = 0; self.luxN = 0; self.luxSum = 0
       if self.videoMode {
         guard let f = self.session.currentFrame else { return }
         let w = CVPixelBufferGetWidth(f.capturedImage), h = CVPixelBufferGetHeight(f.capturedImage)
@@ -156,7 +167,9 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
           self.writePoses(final: true); self.dir = nil
           self.publish { self.scanning = false; self.hint = n >= minimo ? "Scan salvo: enviando pra fila" : "Muito curto (\(n)): scan descartado" }
           if n < minimo { try? FileManager.default.removeItem(at: d); done(nil); return }
-          let meta: [String: Any] = ["title": self.title.isEmpty ? "Scan \(Self.stamp())" : self.title, "mode": self.mode, "quality": self.quality]
+          let nota = DispatchQueue.main.sync { self.score }
+          let meta: [String: Any] = ["title": self.title.isEmpty ? "Scan \(Self.stamp())" : self.title, "mode": self.mode, "quality": self.quality,
+                                     "nota_prevista": (nota * 10).rounded() / 10]
           try? JSONSerialization.data(withJSONObject: meta).write(to: d.appendingPathComponent("meta.json"), options: .atomic)
           done(d)
         }
@@ -227,6 +240,18 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     }
     prev = (t, m)
     if t - lastUI > 0.25 { lastUI = t; publish { self.tracking = label; self.ready = ok } }
+    if let c = center {
+      if scanning {
+        let d = simd_distance(simd_make_float3(m.columns.3), c)
+        nTotal += 1
+        if rotSpeed > 30 || linSpeed > 0.35 { nFast += 1 }
+        if !ok { nBadTrack += 1 }
+        if d < 0.15 || d > 0.6 { nBadDist += 1 }
+        if let le = frame.lightEstimate { luxSum += Double(le.ambientIntensity); luxN += 1 }
+      }
+      accumulatePoints(frame, center: c)
+      if t - lastVol > 1.0 { lastVol = t; publishQuality() }
+    }
     guard scanning, ok || (videoMode && writer != nil), !busy, let c = center else { return }
     let pos = simd_make_float3(m.columns.3)
     let fromC = pos - c, dist = simd_length(fromC)
@@ -260,6 +285,47 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       }
     } else { shot(frame); busy = false }
   }
+
+  /// pontos que o ARKit acha no objeto viram voxels de 6 mm (so dentro de 30 cm do centro e acima da mesa)
+  private func accumulatePoints(_ frame: ARFrame, center c: simd_float3) {
+    voxFrame += 1
+    guard voxFrame % 3 == 0, let pts = frame.rawFeaturePoints?.points else { return }
+    let chao = (floorY ?? (c.y - 0.45)) + 0.004
+    for p in pts {
+      let d = p - c
+      guard p.y > chao, d.y < 0.45, d.x * d.x + d.z * d.z < 0.09 else { continue }
+      let ix = Int32((d.x / Self.voxel).rounded()) + 64, iy = Int32((d.y / Self.voxel).rounded()) + 128, iz = Int32((d.z / Self.voxel).rounded()) + 64
+      guard ix >= 0, ix < 128, iy >= 0, iy < 256, iz >= 0, iz < 128 else { continue }
+      let k = (ix << 16) | (iy << 8) | iz
+      vox[k] = min(250, (vox[k] ?? 0) + 1)
+    }
+  }
+
+  private func publishQuality() {
+    var pts: [simd_float3] = []
+    for (k, n) in vox where n >= 2 {
+      pts.append(simd_float3(Float((k >> 16) & 0xff) - 64, Float((k >> 8) & 0xff) - 128, Float(k & 0xff) - 64) * Self.voxel)
+      if pts.count >= 5000 { break }
+    }
+    let st = (nTotal, nFast, nBadTrack, nBadDist, luxN > 0 ? luxSum / Double(luxN) : 0.0)
+    publish { self.volume = pts; if self.scanning { self.updateScore(st, voxels: pts.count) } }
+  }
+
+  /// nota 0-10 do modelo que vai sair: cobertura, firmeza, rastreio, distancia, luz e textura (pontos achados)
+  func updateScore(_ s: (Int, Int, Int, Int, Double), voxels nv: Int) {
+    let n = Double(max(1, s.0)), f = ringFill
+    let parts: [(peso: Double, nota: Double, dica: String)] = [
+      (0.40, 0.3 * min(1, f[0] / 0.8) + 0.45 * min(1, f[1] / 0.8) + 0.25 * min(1, f[2] / 0.7), "complete as voltas que faltam no anel"),
+      (0.20, pow(1 - Double(s.1) / n, 2), "ande mais devagar: tem quadro borrado"),
+      (0.15, 1 - Double(s.2) / n, "o rastreio caiu: mais luz e fundo com detalhe"),
+      (0.10, 1 - Double(s.3) / n, "fique entre 15 e 50 cm do objeto"),
+      (0.10, s.4 <= 0 ? 1 : min(1, s.4 / 700), "pouca luz: acenda a luz ou vá pra perto da janela"),
+      (0.05, min(1, Double(nv) / 400), "objeto liso ou brilhante: pouca textura, a malha pode falhar")]
+    score = 10 * parts.reduce(0) { $0 + $1.peso * $1.nota }
+    let pior = parts.max { $0.peso * (1 - $0.nota) < $1.peso * (1 - $1.nota) }!
+    scoreTip = pior.peso * (1 - pior.nota) >= 0.03 ? "Pra subir a nota: " + pior.dica : "Excelente: pode concluir"
+  }
+  var scoreText: String { String(format: "%.1f", score).replacingOccurrences(of: ".", with: ",") }
 
   private func recordVideo(_ frame: ARFrame, center c: simd_float3, label: String, fast: Bool) {
     guard let wr = writer, wr.status == .writing, let inp = vin, let ad = adaptor, inp.isReadyForMoreMediaData else { return }
@@ -341,6 +407,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
                               "center": [c.x, c.y, c.z], "frames": frames, "complete": final]
     if videoMode { doc["video"] = "scan.mov"; doc["fps"] = vfps }
     if let floorY { doc["floor_y"] = floorY }
+    if suporte { doc["suporte"] = true }                  // objeto em cima de algo MENOR que ele: o PC corta no degrau
     try? JSONSerialization.data(withJSONObject: doc).write(to: d.appendingPathComponent("poses.json"), options: .atomic)
   }
 }
@@ -469,6 +536,54 @@ struct Scan3DPreview: UIViewRepresentable {
   }
 }
 
+/// 0.12.4: mostruario do que ja foi captado -- voxels cinza girando (o volume da forma, antes do PC montar a malha)
+struct Scan3DVolume: UIViewRepresentable {
+  let points: [simd_float3]
+  func makeUIView(context: Context) -> SCNView {
+    let v = SCNView(); v.backgroundColor = .clear; v.scene = SCNScene(); v.autoenablesDefaultLighting = true
+    v.antialiasingMode = .multisampling2X; v.isUserInteractionEnabled = false
+    let holder = SCNNode(); holder.name = "holder"; v.scene?.rootNode.addChildNode(holder)
+    holder.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 12)))
+    let cam = SCNNode(); cam.name = "cam"; cam.camera = SCNCamera(); cam.camera?.fieldOfView = 35; cam.camera?.zNear = 0.005
+    v.scene?.rootNode.addChildNode(cam); v.pointOfView = cam
+    return v
+  }
+  func updateUIView(_ v: SCNView, context: Context) {
+    guard let root = v.scene?.rootNode, let holder = root.childNode(withName: "holder", recursively: false) else { return }
+    holder.childNodes.forEach { $0.removeFromParentNode() }
+    guard let p0 = points.first else { return }
+    var lo = p0, hi = p0
+    for p in points { lo = simd_min(lo, p); hi = simd_max(hi, p) }
+    let n = SCNNode(geometry: Self.cubes(points, size: Scan3DCamera.voxel)); n.simdPosition = -(lo + hi) / 2
+    holder.addChildNode(n)
+    let r = max(0.04, simd_length(hi - lo) / 2)
+    if let cam = root.childNode(withName: "cam", recursively: false) { cam.simdPosition = simd_float3(0, r * 0.8, r * 3.2); cam.simdLook(at: .zero) }
+  }
+  static func cubes(_ ps: [simd_float3], size s: Float) -> SCNGeometry {
+    let h = s * 0.48
+    let faces: [(simd_float3, [simd_float3])] = [
+      (simd_float3(1, 0, 0), [simd_float3(1, -1, -1), simd_float3(1, 1, -1), simd_float3(1, 1, 1), simd_float3(1, -1, 1)]),
+      (simd_float3(-1, 0, 0), [simd_float3(-1, -1, -1), simd_float3(-1, -1, 1), simd_float3(-1, 1, 1), simd_float3(-1, 1, -1)]),
+      (simd_float3(0, 1, 0), [simd_float3(-1, 1, -1), simd_float3(-1, 1, 1), simd_float3(1, 1, 1), simd_float3(1, 1, -1)]),
+      (simd_float3(0, -1, 0), [simd_float3(-1, -1, -1), simd_float3(1, -1, -1), simd_float3(1, -1, 1), simd_float3(-1, -1, 1)]),
+      (simd_float3(0, 0, 1), [simd_float3(-1, -1, 1), simd_float3(1, -1, 1), simd_float3(1, 1, 1), simd_float3(-1, 1, 1)]),
+      (simd_float3(0, 0, -1), [simd_float3(-1, -1, -1), simd_float3(-1, 1, -1), simd_float3(1, 1, -1), simd_float3(1, -1, -1)])]
+    var vs: [SCNVector3] = [], ns: [SCNVector3] = [], idx: [Int32] = []
+    vs.reserveCapacity(ps.count * 24); ns.reserveCapacity(ps.count * 24); idx.reserveCapacity(ps.count * 36)
+    for p in ps {
+      for (nrm, cs) in faces {
+        let b = Int32(vs.count)
+        for c in cs { let q = p + c * h; vs.append(SCNVector3(q.x, q.y, q.z)); ns.append(SCNVector3(nrm.x, nrm.y, nrm.z)) }
+        idx += [b, b + 1, b + 2, b, b + 2, b + 3]
+      }
+    }
+    let g = SCNGeometry(sources: [SCNGeometrySource(vertices: vs), SCNGeometrySource(normals: ns)],
+                        elements: [SCNGeometryElement(indices: idx, primitiveType: .triangles)])
+    let m = SCNMaterial(); m.diffuse.contents = UIColor(white: 0.74, alpha: 1); m.lightingModel = .lambert; m.isDoubleSided = true
+    g.materials = [m]; return g
+  }
+}
+
 /// 3 anéis (volta baixa por fora, alta por dentro), 36 fatias de 10°: dourado = coberto
 struct Scan3DCoverage: View {
   let coverage: [[Bool]]
@@ -497,6 +612,8 @@ struct Scan3DView: View {
   @State private var list = false
   @State private var confirmFinish = false
   @State private var startedAt: Date?
+  @State private var suporte = false
+  @State private var bigVolume = false
   private let gold = Color(red: 1, green: 0.8, blue: 0)
   private let red = Color(red: 1, green: 0.23, blue: 0.19)
 
@@ -506,6 +623,7 @@ struct Scan3DView: View {
       if !camera.scanning && !camera.centerSet { reticle }
       VStack(spacing: 0) {
         topBar
+        if camera.centerSet && !camera.volume.isEmpty { HStack { Spacer(); volumeCard }.padding(.horizontal, 16).padding(.top, 10) }
         Spacer()
         hintPill.padding(.bottom, 10)
         bottomPanel
@@ -513,12 +631,12 @@ struct Scan3DView: View {
     }
     .preferredColorScheme(.dark).tint(gold)
     .sheet(isPresented: $list) { Scan3DList() }
-    .alert("Cobertura incompleta", isPresented: $confirmFinish) {
+    .alert("Nota prevista \(camera.scoreText) de 10", isPresented: $confirmFinish) {
       Button("Continuar escaneando", role: .cancel) {}
       Button("Concluir assim mesmo") { finishScan() }
     } message: {
       let f = camera.ringFill.map { Int($0 * 100) }
-      Text("Voltas: baixa \(f[0])%, meio \(f[1])%, alta \(f[2])%. Cada volta incompleta vira buraco na malha. O ideal é passar de 70% nas três.")
+      Text("\(camera.scoreTip).\nVoltas: baixa \(f[0])%, meio \(f[1])%, alta \(f[2])%. Volta incompleta vira buraco na malha; o ideal é passar de 70% nas três e nota 7 ou mais.")
     }
     .task { camera.start(); up.kick() }
     .onDisappear { camera.close() }
@@ -551,6 +669,9 @@ struct Scan3DView: View {
           Image(systemName: "ruler").font(.caption)
           Text("\(camera.distanceCM) cm").monospacedDigit().foregroundStyle(camera.distanceCM < 20 ? .orange : .white)
           Circle().fill(camera.sharpOK ? Color.green : Color.orange).frame(width: 8, height: 8).accessibilityLabel(camera.sharpOK ? "foco ok" : "focando")
+          Divider().frame(height: 14)
+          Image(systemName: "star.fill").font(.caption).foregroundStyle(scoreColor)
+          Text(camera.scoreText).monospacedDigit().foregroundStyle(scoreColor).accessibilityLabel("nota prevista \(camera.scoreText)")
         }
         .font(.subheadline.weight(.semibold)).padding(.horizontal, 14).padding(.vertical, 9)
         .background(.ultraThinMaterial, in: Capsule())
@@ -571,6 +692,8 @@ struct Scan3DView: View {
       Text(camera.hint).font(.footnote.weight(.semibold)).multilineTextAlignment(.center).lineLimit(2)
       if !camera.ready && !camera.tracking.isEmpty {
         Text(camera.tracking).font(.caption2).foregroundStyle(.orange)
+      } else if camera.scanning && !camera.scoreTip.isEmpty {
+        Text(camera.scoreTip).font(.caption2.weight(.semibold)).foregroundStyle(scoreColor).multilineTextAlignment(.center).lineLimit(2)
       }
     }
     .padding(.horizontal, 16).padding(.vertical, 9)
@@ -646,6 +769,12 @@ struct Scan3DView: View {
           Label("Fotos automáticas", systemImage: "camera").tag(false)
         }
       } label: { chip(icon: camera.videoMode ? "video" : "camera", text: camera.videoMode ? "4K" : "Fotos") }
+      Menu {
+        Picker("Apoio", selection: $suporte) {
+          Label("Na mesa", systemImage: "rectangle.portrait.bottomhalf.filled").tag(false)
+          Label("Num suporte menor que ele (base limpa)", systemImage: "cup.and.saucer").tag(true)
+        }
+      } label: { chip(icon: suporte ? "cup.and.saucer" : "rectangle.portrait.bottomhalf.filled", text: suporte ? "Suporte" : "Mesa") }
     }
     .frame(maxWidth: .infinity)
   }
@@ -682,6 +811,17 @@ struct Scan3DView: View {
     .accessibilityLabel(camera.scanning ? "Concluir scan" : camera.centerSet ? "Iniciar scan" : "Marcar objeto")
   }
 
+  private var volumeCard: some View {
+    ZStack(alignment: .bottomLeading) {
+      Scan3DVolume(points: camera.volume).frame(width: bigVolume ? 240 : 112, height: bigVolume ? 240 : 112)
+      Text("volume captado").font(.system(size: 9, weight: .semibold)).foregroundStyle(.white.opacity(0.7)).padding(7)
+    }
+    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    .contentShape(RoundedRectangle(cornerRadius: 18))
+    .onTapGesture { withAnimation(.spring(duration: 0.3)) { bigVolume.toggle() } }
+    .accessibilityLabel("Prévia do volume captado; toque pra ampliar")
+  }
+  private var scoreColor: Color { camera.score >= 8 ? .green : camera.score >= 6 ? gold : .orange }
   private var shutterCaption: String { camera.scanning ? "Concluir" : camera.centerSet ? "Iniciar" : "Marcar objeto" }
   private var countText: String {
     let n = camera.shots
@@ -692,11 +832,11 @@ struct Scan3DView: View {
   }
   private func shutterTap() {
     if camera.scanning {
-      if camera.ringFill.contains(where: { $0 < 0.66 }) { confirmFinish = true } else { finishScan() }
+      if camera.ringFill.contains(where: { $0 < 0.66 }) || camera.score < 7 { confirmFinish = true } else { finishScan() }
     } else if !camera.centerSet {
       camera.setCenter(from: nil)
     } else {
-      camera.mode = mode; camera.quality = quality; startedAt = Date(); camera.begin()
+      camera.mode = mode; camera.quality = quality; camera.suporte = suporte; startedAt = Date(); camera.begin()
     }
   }
 }
