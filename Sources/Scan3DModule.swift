@@ -68,6 +68,10 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   @Published var scoreTip = ""
   @Published var volume: [simd_float3] = []
   var suporte = false
+  // 0.12.5: pausar/descartar no meio da gravacao + o OBJETO separado da mesa na previa (e o raio dele vai pro PC)
+  @Published var paused = false
+  private var isPaused = false, pauseAt: Double?, pausedTotal = 0.0
+  private var objRadius: Float?, objAxis: simd_float2?
   private var vox: [Int32: UInt8] = [:]
   private var voxFrame = 0, lastVol = 0.0
   private var nTotal = 0, nFast = 0, nBadTrack = 0, nBadDist = 0, luxN = 0
@@ -107,7 +111,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       guard !self.scanning, let q = query ?? self.session.currentFrame?.raycastQuery(from: CGPoint(x: 0.5, y: 0.5), allowing: .estimatedPlane, alignment: .any),
             let hit = self.session.raycast(q).first else { self.publish { self.hint = "Não achei o objeto na mira: chegue mais perto, com luz" }; return }
       let c = simd_make_float3(hit.worldTransform.columns.3)
-      self.center = c; self.vox = [:]
+      self.center = c; self.vox = [:]; self.objRadius = nil; self.objAxis = nil
       // chão = plano horizontal logo abaixo do centro (objeto em cima da mesa/piso)
       if let f = self.session.currentFrame {
         let ys = f.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }.map { $0.transform.columns.3.y }.filter { $0 <= c.y + 0.02 }
@@ -128,6 +132,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       do { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) } catch { self.publish { self.hint = error.localizedDescription }; return }
       self.dir = d; self.frames = []; self.lastShot = nil; self.vt0 = nil; self.closing = false
       self.nTotal = 0; self.nFast = 0; self.nBadTrack = 0; self.nBadDist = 0; self.luxN = 0; self.luxSum = 0
+      self.isPaused = false; self.pauseAt = nil; self.pausedTotal = 0
       if self.videoMode {
         guard let f = self.session.currentFrame else { return }
         let w = CVPixelBufferGetWidth(f.capturedImage), h = CVPixelBufferGetHeight(f.capturedImage)
@@ -157,15 +162,34 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     }
   }
 
+  func setPaused(_ p: Bool) {
+    queue.async {
+      guard self.scanning else { return }
+      self.isPaused = p
+      self.publish { self.paused = p; self.hint = p ? "Pausado: toque em ▶ pra continuar de onde parou" : "Continuando: ande em volta devagar" }
+    }
+  }
+  /// joga fora o scan em andamento (video, fotos e poses) sem enviar nada
+  func discard() {
+    queue.async {
+      guard self.scanning, let d = self.dir else { return }
+      self.unlockCamera()
+      if let wr = self.writer { self.writer = nil; self.vin = nil; self.adaptor = nil; _ = CowboyObjC.catching { wr.cancelWriting() } }
+      self.dir = nil; self.frames = []; self.isPaused = false; self.pauseAt = nil
+      try? FileManager.default.removeItem(at: d)
+      self.publish { self.scanning = false; self.paused = false; self.hint = "Scan descartado. Marque o objeto e comece de novo" }
+    }
+  }
+
   func finish(_ done: @escaping @Sendable (URL?) -> Void) {
     queue.async {
       guard self.scanning, let d = self.dir else { done(nil); return }
-      self.unlockCamera()
+      self.unlockCamera(); self.isPaused = false
       let n = self.frames.count, minimo = self.videoMode ? 60 : 20
       let fecha: @Sendable () -> Void = {
         self.queue.async {
           self.writePoses(final: true); self.dir = nil
-          self.publish { self.scanning = false; self.hint = n >= minimo ? "Scan salvo: enviando pra fila" : "Muito curto (\(n)): scan descartado" }
+          self.publish { self.scanning = false; self.paused = false; self.hint = n >= minimo ? "Scan salvo: enviando pra fila" : "Muito curto (\(n)): scan descartado" }
           if n < minimo { try? FileManager.default.removeItem(at: d); done(nil); return }
           let nota = DispatchQueue.main.sync { self.score }
           let meta: [String: Any] = ["title": self.title.isEmpty ? "Scan \(Self.stamp())" : self.title, "mode": self.mode, "quality": self.quality,
@@ -240,6 +264,8 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     }
     prev = (t, m)
     if t - lastUI > 0.25 { lastUI = t; publish { self.tracking = label; self.ready = ok } }
+    if scanning && isPaused { if pauseAt == nil { pauseAt = t }; return }
+    if let pa = pauseAt { pausedTotal += t - pa; pauseAt = nil }
     if let c = center {
       if scanning {
         let d = simd_distance(simd_make_float3(m.columns.3), c)
@@ -290,7 +316,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   private func accumulatePoints(_ frame: ARFrame, center c: simd_float3) {
     voxFrame += 1
     guard voxFrame % 3 == 0, let pts = frame.rawFeaturePoints?.points else { return }
-    let chao = (floorY ?? (c.y - 0.45)) + 0.004
+    let chao = (floorY ?? (c.y - 0.45)) + 0.010
     for p in pts {
       let d = p - c
       guard p.y > chao, d.y < 0.45, d.x * d.x + d.z * d.z < 0.09 else { continue }
@@ -302,13 +328,49 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   }
 
   private func publishQuality() {
+    if let c = center, let f = session.currentFrame {           // o plano da mesa costuma aparecer depois de marcar
+      let ys = f.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }.map { $0.transform.columns.3.y }.filter { $0 <= c.y + 0.02 }
+      if let y = ys.max(), y > (floorY ?? -.infinity) { floorY = y }
+    }
+    let obj = objectVoxels()
     var pts: [simd_float3] = []
-    for (k, n) in vox where n >= 2 {
+    for k in obj {
       pts.append(simd_float3(Float((k >> 16) & 0xff) - 64, Float((k >> 8) & 0xff) - 128, Float(k & 0xff) - 64) * Self.voxel)
       if pts.count >= 5000 { break }
     }
+    if pts.count >= 30 {                                         // raio do objeto (eixo = centro das colunas) vai pro PC cortar a mesa
+      let cx = pts.reduce(Float(0)) { $0 + $1.x } / Float(pts.count), cz = pts.reduce(Float(0)) { $0 + $1.z } / Float(pts.count)
+      let r = pts.map { simd_length(simd_float2($0.x - cx, $0.z - cz)) }.sorted()
+      objRadius = r[min(r.count - 1, Int(Float(r.count) * 0.95))]
+      if let c = center { objAxis = simd_float2(c.x + cx, c.z + cz) }
+    }
     let st = (nTotal, nFast, nBadTrack, nBadDist, luxN > 0 ? luxSum / Double(luxN) : 0.0)
     publish { self.volume = pts; if self.scanning { self.updateScore(st, voxels: pts.count) } }
+  }
+
+  /// voxels do objeto: o grupo ligado ao ponto marcado (vizinhos ate 2 voxels = 12 mm). O resto e mesa/fundo.
+  private func objectVoxels() -> [Int32] {
+    let occ = Set(vox.filter { $0.value >= 2 }.keys)
+    guard !occ.isEmpty else { return [] }
+    func dec(_ k: Int32) -> (Int32, Int32, Int32) { ((k >> 16) & 0xff, (k >> 8) & 0xff, k & 0xff) }
+    func enc(_ x: Int32, _ y: Int32, _ z: Int32) -> Int32 { (x << 16) | (y << 8) | z }
+    var seed: Int32?, best = Int32.max
+    for k in occ {                                               // o voxel mais perto do ponto marcado (64,128,64)
+      let (x, y, z) = dec(k); let d = (x - 64) * (x - 64) + (y - 128) * (y - 128) + (z - 64) * (z - 64)
+      if d < best { best = d; seed = k }
+    }
+    guard let s0 = seed, best <= 64 else { return Array(occ) }   // mais de 8 voxels (5 cm) do ponto: sem objeto claro ainda
+    var seen: Set<Int32> = [s0], fila = [s0], i = 0
+    while i < fila.count {
+      let (x, y, z) = dec(fila[i]); i += 1
+      for dx in -2...2 { for dy in -2...2 { for dz in -2...2 {
+        let nx = x + Int32(dx), ny = y + Int32(dy), nz = z + Int32(dz)
+        guard nx >= 0, nx < 128, ny >= 0, ny < 256, nz >= 0, nz < 128 else { continue }
+        let k = enc(nx, ny, nz)
+        if occ.contains(k) && !seen.contains(k) { seen.insert(k); fila.append(k) }
+      } } }
+    }
+    return fila.count >= 20 ? fila : Array(occ)
   }
 
   /// nota 0-10 do modelo que vai sair: cobertura, firmeza, rastreio, distancia, luz e textura (pontos achados)
@@ -330,7 +392,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   private func recordVideo(_ frame: ARFrame, center c: simd_float3, label: String, fast: Bool) {
     guard let wr = writer, wr.status == .writing, let inp = vin, let ad = adaptor, inp.isReadyForMoreMediaData else { return }
     if vt0 == nil { vt0 = frame.timestamp }
-    let pts = CMTime(seconds: frame.timestamp - (vt0 ?? 0), preferredTimescale: 600000)
+    let pts = CMTime(seconds: frame.timestamp - (vt0 ?? 0) - pausedTotal, preferredTimescale: 600000)
     guard ad.append(frame.capturedImage, withPresentationTime: pts) else { return }
     let m = frame.camera.transform, k = frame.camera.intrinsics
     frames.append(["i": frames.count, "t": frame.timestamp - (vt0 ?? 0), "tracking": label == "rastreio ok" ? "normal" : label,
@@ -408,6 +470,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     if videoMode { doc["video"] = "scan.mov"; doc["fps"] = vfps }
     if let floorY { doc["floor_y"] = floorY }
     if suporte { doc["suporte"] = true }                  // objeto em cima de algo MENOR que ele: o PC corta no degrau
+    if let objRadius, let objAxis { doc["objeto_raio"] = objRadius; doc["objeto_eixo"] = [objAxis.x, objAxis.y] }   // objeto achado na previa: o PC corta a mesa em volta
     try? JSONSerialization.data(withJSONObject: doc).write(to: d.appendingPathComponent("poses.json"), options: .atomic)
   }
 }
@@ -420,7 +483,9 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   @Published var pending = 0
   @Published var jobs: [[String: Any]] = []
   @Published var pcOnline = false
+  @Published var localPaused: Set<String> = []
   private var running = false
+  private var removed: Set<String> = []
   private var base: URL { FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Scan3D", isDirectory: true) }
 
   func scans() -> [URL] {
@@ -436,9 +501,11 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     Task {
       defer { running = false; pending = scans().count }
       for d in scans() {
+        if let j = jobOf(d), localPaused.contains(j) || removed.contains(j) { continue }
         var tries = 0
         while true {
           do { try await upload(d); break } catch {
+            if (error as? Scan3DError)?.msg == "parado" { break }
             tries += 1; status = "Envio parado: \(error.localizedDescription). Tentando de novo…"
             if tries > 20 { return }
             try? await Task.sleep(nanoseconds: UInt64(min(60, 3 * tries)) * 1_000_000_000)
@@ -468,12 +535,14 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     for (i, name) in names.enumerated() {
       let file = d.appendingPathComponent(name)
       let (c0, o0) = try await Scan3DAPI.request("/api/jobs/\(job)/files/\(i)")
+      if c0 == 404 && removed.contains(job) { try? FileManager.default.removeItem(at: d); throw Scan3DError("parado") }
       if c0 == 404 { meta["job"] = nil; try JSONSerialization.data(withJSONObject: meta).write(to: metaURL, options: .atomic); throw Scan3DError("job sumiu da fila, recriando") }
       var off = ((o0 as? [String: Any])?["got"] as? Int) ?? 0
       let h = try FileHandle(forReadingFrom: file); defer { try? h.close() }
       while off < sizes[i] {
         try h.seek(toOffset: UInt64(off))
         let chunk = h.readData(ofLength: 8 << 20)
+        if localPaused.contains(job) || removed.contains(job) { status = ""; throw Scan3DError("parado") }
         let (c, o) = try await Scan3DAPI.request("/api/jobs/\(job)/files/\(i)?offset=\(off)", method: "PUT", body: chunk)
         guard c == 200 || c == 409, let got = (o as? [String: Any])?["got"] as? Int else { throw Scan3DError("pedaço recusado (\(c))") }
         off = got
@@ -486,6 +555,31 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     guard c == 200 else { throw Scan3DError("fechar o envio falhou (\(c))") }
     try? FileManager.default.removeItem(at: d)
     status = "Scan na fila: o PC processa assim que estiver ligado"
+  }
+
+  private func jobOf(_ d: URL) -> String? {
+    guard let data = try? Data(contentsOf: d.appendingPathComponent("meta.json")),
+          let m = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return m["job"] as? String
+  }
+  private func localDir(_ job: String) -> URL? { scans().first { jobOf($0) == job } }
+  /// pausa: o que ainda sobe do iPhone para aqui; o que esta na fila/no PC para la (o PC guarda as etapas prontas)
+  func pause(_ job: String) async {
+    if localDir(job) != nil { localPaused.insert(job) }
+    else { _ = try? await Scan3DAPI.request("/api/jobs/\(job)/pause", method: "POST") }
+    await refresh()
+  }
+  func resume(_ job: String) async {
+    if localPaused.remove(job) != nil { kick() }
+    else { _ = try? await Scan3DAPI.request("/api/jobs/\(job)/retry", method: "POST") }
+    await refresh()
+  }
+  func delete(_ job: String) async {
+    removed.insert(job); localPaused.remove(job)
+    if let d = localDir(job) { try? FileManager.default.removeItem(at: d) }
+    _ = try? await Scan3DAPI.request("/api/jobs/\(job)", method: "DELETE")
+    pending = scans().count; jobs.removeAll { ($0["id"] as? String) == job }
+    await refresh()
   }
 
   func refresh() async {
@@ -614,6 +708,7 @@ struct Scan3DView: View {
   @State private var startedAt: Date?
   @State private var suporte = false
   @State private var bigVolume = false
+  @State private var confirmDiscard = false
   private let gold = Color(red: 1, green: 0.8, blue: 0)
   private let red = Color(red: 1, green: 0.23, blue: 0.19)
 
@@ -638,6 +733,10 @@ struct Scan3DView: View {
       let f = camera.ringFill.map { Int($0 * 100) }
       Text("\(camera.scoreTip).\nVoltas: baixa \(f[0])%, meio \(f[1])%, alta \(f[2])%. Volta incompleta vira buraco na malha; o ideal é passar de 70% nas três e nota 7 ou mais.")
     }
+    .confirmationDialog("Descartar este scan?", isPresented: $confirmDiscard, titleVisibility: .visible) {
+      Button("Descartar scan", role: .destructive) { camera.discard() }
+      Button("Continuar escaneando", role: .cancel) {}
+    } message: { Text("O que foi filmado até agora é apagado e nada é enviado.") }
     .task { camera.start(); up.kick() }
     .onDisappear { camera.close() }
     .onChange(of: phase) { _, p in
@@ -656,24 +755,32 @@ struct Scan3DView: View {
 
   private var topBar: some View {
     HStack(spacing: 10) {
-      Button { camera.close { Task { @MainActor in close() } } } label: {
-        Image(systemName: "chevron.left").font(.system(size: 17, weight: .semibold)).frame(width: 42, height: 42)
-          .background(.ultraThinMaterial, in: Circle())
-      }.disabled(camera.scanning).opacity(camera.scanning ? 0.35 : 1).accessibilityLabel("Voltar à câmera")
-      Spacer(minLength: 8)
       if camera.scanning {
-        HStack(spacing: 8) {
-          Circle().fill(red).frame(width: 8, height: 8)
-          TimelineView(.periodic(from: .now, by: 1)) { ctx in Text(elapsed(ctx.date)).monospacedDigit() }
-          Divider().frame(height: 14)
-          Image(systemName: "ruler").font(.caption)
-          Text("\(camera.distanceCM) cm").monospacedDigit().foregroundStyle(camera.distanceCM < 20 ? .orange : .white)
-          Circle().fill(camera.sharpOK ? Color.green : Color.orange).frame(width: 8, height: 8).accessibilityLabel(camera.sharpOK ? "foco ok" : "focando")
-          Divider().frame(height: 14)
-          Image(systemName: "star.fill").font(.caption).foregroundStyle(scoreColor)
-          Text(camera.scoreText).monospacedDigit().foregroundStyle(scoreColor).accessibilityLabel("nota prevista \(camera.scoreText)")
+        Button { confirmDiscard = true } label: {
+          Image(systemName: "trash").font(.system(size: 16, weight: .semibold)).foregroundStyle(red).frame(width: 42, height: 42)
+            .background(.ultraThinMaterial, in: Circle())
+        }.accessibilityLabel("Descartar scan")
+        Button { camera.setPaused(!camera.paused) } label: {
+          Image(systemName: camera.paused ? "play.fill" : "pause.fill").font(.system(size: 16, weight: .semibold)).frame(width: 42, height: 42)
+            .background(.ultraThinMaterial, in: Circle())
+        }.accessibilityLabel(camera.paused ? "Continuar gravação" : "Pausar gravação")
+      } else {
+        Button { camera.close { Task { @MainActor in close() } } } label: {
+          Image(systemName: "chevron.left").font(.system(size: 17, weight: .semibold)).frame(width: 42, height: 42)
+            .background(.ultraThinMaterial, in: Circle())
+        }.accessibilityLabel("Voltar à câmera")
+      }
+      Spacer(minLength: 6)
+      if camera.scanning {
+        HStack(spacing: 6) {
+          Circle().fill(camera.paused ? Color.gray : red).frame(width: 7, height: 7)
+          TimelineView(.periodic(from: .now, by: 1)) { ctx in Text(camera.paused ? "pausa" : elapsed(ctx.date)).monospacedDigit() }
+          Text("\(camera.distanceCM)cm").monospacedDigit().foregroundStyle(camera.distanceCM < 20 ? .orange : .white)
+          Circle().fill(camera.sharpOK ? Color.green : Color.orange).frame(width: 7, height: 7).accessibilityLabel(camera.sharpOK ? "foco ok" : "focando")
+          Text("★ " + camera.scoreText).monospacedDigit().foregroundStyle(scoreColor).accessibilityLabel("nota prevista \(camera.scoreText)")
         }
-        .font(.subheadline.weight(.semibold)).padding(.horizontal, 14).padding(.vertical, 9)
+        .font(.footnote.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.75)
+        .padding(.horizontal, 11).padding(.vertical, 8)
         .background(.ultraThinMaterial, in: Capsule())
       } else {
         VStack(alignment: .trailing, spacing: 1) {
@@ -707,9 +814,9 @@ struct Scan3DView: View {
       HStack(alignment: .center, spacing: 0) {
         // cobertura das 3 voltas + contagem
         ZStack {
-          Scan3DCoverage(coverage: camera.coverage).frame(width: 86, height: 86)
+          Scan3DCoverage(coverage: camera.coverage).frame(width: 80, height: 80)
           VStack(spacing: 0) {
-            Text(countText).font(.system(size: 15, weight: .bold)).monospacedDigit()
+            Text(countText).font(.system(size: 15, weight: .bold)).monospacedDigit().minimumScaleFactor(0.6).lineLimit(1)
             Text(camera.videoMode ? "quadros" : "fotos").font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
           }
         }
@@ -749,6 +856,7 @@ struct Scan3DView: View {
 
   // tipo / qualidade / filmagem x fotos: chips compactos com menu (cabe numa linha no iPhone)
   private var chips: some View {
+    ScrollView(.horizontal, showsIndicators: false) {
     HStack(spacing: 8) {
       Menu {
         Picker("Tipo", selection: $mode) {
@@ -776,7 +884,9 @@ struct Scan3DView: View {
         }
       } label: { chip(icon: suporte ? "cup.and.saucer" : "rectangle.portrait.bottomhalf.filled", text: suporte ? "Suporte" : "Mesa") }
     }
-    .frame(maxWidth: .infinity)
+    .padding(.horizontal, 2)
+    }
+    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
   }
 
   private func chip(icon: String, text: String) -> some View {
@@ -813,7 +923,7 @@ struct Scan3DView: View {
 
   private var volumeCard: some View {
     ZStack(alignment: .bottomLeading) {
-      Scan3DVolume(points: camera.volume).frame(width: bigVolume ? 240 : 112, height: bigVolume ? 240 : 112)
+      Scan3DVolume(points: camera.volume).frame(width: bigVolume ? 220 : 96, height: bigVolume ? 220 : 96)
       Text("volume captado").font(.system(size: 9, weight: .semibold)).foregroundStyle(.white.opacity(0.7)).padding(7)
     }
     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -892,9 +1002,11 @@ struct Scan3DCard: View {
   let job: [String: Any]
   @Binding var loading: String?
   @Binding var preview: URL?
+  @ObservedObject private var up = Scan3DUploader.shared
+  @State private var confirmDelete = false
   private let gold = Color(red: 1, green: 0.8, blue: 0)
   private var id: String { job["id"] as? String ?? "" }
-  private var status: String { job["status"] as? String ?? "" }
+  private var status: String { up.localPaused.contains(id) ? "pausado" : (job["status"] as? String ?? "") }
   private var results: [String] { job["results"] as? [String] ?? [] }
   private var stats: [String: Any] { job["stats"] as? [String: Any] ?? [:] }
   private var hasIA: Bool { results.contains("ia_model.usdz") || results.contains("ia_preview.glb") }
@@ -933,9 +1045,24 @@ struct Scan3DCard: View {
           .buttonStyle(.plain).disabled(loading != nil)
           Link(destination: mostruario) { iconButton("safari") }.accessibilityLabel("Abrir mostruário")
           Menu { downloads } label: { iconButton("square.and.arrow.down") }.accessibilityLabel("Baixar arquivos")
+          Button { confirmDelete = true } label: { iconButton("trash") }.accessibilityLabel("Excluir scan")
+        }
+      } else {
+        HStack(spacing: 8) {
+          if ["pendente", "processando", "enviando", "erro"].contains(status) {
+            actionButton(status == "erro" ? "Tentar de novo" : "Pausar", icon: status == "erro" ? "arrow.clockwise" : "pause.fill") {
+              if status == "erro" { await up.resume(id) } else { await up.pause(id) }
+            }
+          }
+          if status == "pausado" { actionButton("Continuar", icon: "play.fill") { await up.resume(id) } }
+          Button { confirmDelete = true } label: { iconButton("trash") }.accessibilityLabel("Excluir scan")
         }
       }
     }
+    .confirmationDialog("Excluir este scan?", isPresented: $confirmDelete, titleVisibility: .visible) {
+      Button("Excluir", role: .destructive) { Task { await up.delete(id) } }
+      Button("Cancelar", role: .cancel) {}
+    } message: { Text("Apaga da fila, do PC e da galeria. Não dá pra desfazer.") }
     .padding(14)
     .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
   }
@@ -954,6 +1081,14 @@ struct Scan3DCard: View {
       if results.contains("model.glb") { ShareLink("GLB", item: url("model.glb")) }
     }
     Section { ShareLink("Link do mostruário", item: mostruario) }
+  }
+
+  private func actionButton(_ title: String, icon: String, _ action: @escaping () async -> Void) -> some View {
+    Button { Task { await action() } } label: {
+      Label(title, systemImage: icon).font(.subheadline.weight(.semibold)).lineLimit(1).foregroundStyle(.white)
+        .frame(maxWidth: .infinity).frame(height: 44)
+        .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }.buttonStyle(.plain)
   }
 
   private func iconButton(_ name: String) -> some View {
@@ -997,6 +1132,7 @@ struct Scan3DCard: View {
       if let s = (hasIA ? stats["ia_size_cm"] : nil) as? String ?? stats["size_cm"] as? String { return "Tamanho real: \(s)" }
       return "Malha pronta"
     case "pendente": return "Na fila: o PC processa assim que estiver ligado"
+    case "pausado": return up.localPaused.contains(id) ? "Envio pausado neste iPhone" : "Pausado: toque em Continuar (retoma de onde parou)"
     default: return job["stage"] as? String ?? ""
     }
   }
