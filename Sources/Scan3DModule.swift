@@ -72,6 +72,9 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
   @Published var paused = false
   private var isPaused = false, pauseAt: Double?, pausedTotal = 0.0
   private var objRadius: Float?, objAxis: simd_float2?
+  // 0.12.6: MIRA = ponto onde os raios da camera convergem (o que a pessoa esta filmando de verdade). A marca pode cair
+  // do lado do objeto (09/11: 16 cm, na mesa); a previa e o PC seguem a mira.
+  private var rayA = simd_double3x3(), rayB = simd_double3(0, 0, 0), rayN = 0
   private var vox: [Int32: UInt8] = [:]
   private var voxFrame = 0, lastVol = 0.0
   private var nTotal = 0, nFast = 0, nBadTrack = 0, nBadDist = 0, luxN = 0
@@ -133,6 +136,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       self.dir = d; self.frames = []; self.lastShot = nil; self.vt0 = nil; self.closing = false
       self.nTotal = 0; self.nFast = 0; self.nBadTrack = 0; self.nBadDist = 0; self.luxN = 0; self.luxSum = 0
       self.isPaused = false; self.pauseAt = nil; self.pausedTotal = 0
+      self.rayA = simd_double3x3(); self.rayB = simd_double3(0, 0, 0); self.rayN = 0
       if self.videoMode {
         guard let f = self.session.currentFrame else { return }
         let w = CVPixelBufferGetWidth(f.capturedImage), h = CVPixelBufferGetHeight(f.capturedImage)
@@ -274,6 +278,9 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
         if !ok { nBadTrack += 1 }
         if d < 0.15 || d > 0.6 { nBadDist += 1 }
         if let le = frame.lightEstimate { luxSum += Double(le.ambientIntensity); luxN += 1 }
+        let fd = simd_normalize(simd_double3(-simd_make_float3(m.columns.2))), pd = simd_double3(simd_make_float3(m.columns.3))
+        let q = matrix_identity_double3x3 - simd_double3x3(columns: (fd * fd.x, fd * fd.y, fd * fd.z))
+        rayA = rayA + q; rayB = rayB + q * pd; rayN += 1
       }
       accumulatePoints(frame, center: c)
       if t - lastVol > 1.0 { lastVol = t; publishQuality() }
@@ -354,12 +361,17 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     guard !occ.isEmpty else { return [] }
     func dec(_ k: Int32) -> (Int32, Int32, Int32) { ((k >> 16) & 0xff, (k >> 8) & 0xff, k & 0xff) }
     func enc(_ x: Int32, _ y: Int32, _ z: Int32) -> Int32 { (x << 16) | (y << 8) | z }
+    var tx: Int32 = 64, ty: Int32 = 128, tz: Int32 = 64         // alvo: o ponto marcado...
+    if let m = mira(), let c = center, simd_distance(m, c) > 0.03 {   // ...ou a mira das cameras, se a marca ficou do lado
+      let o = (m - c) / Self.voxel
+      tx = max(0, min(127, Int32(o.x.rounded()) + 64)); ty = max(0, min(255, Int32(o.y.rounded()) + 128)); tz = max(0, min(127, Int32(o.z.rounded()) + 64))
+    }
     var seed: Int32?, best = Int32.max
-    for k in occ {                                               // o voxel mais perto do ponto marcado (64,128,64)
-      let (x, y, z) = dec(k); let d = (x - 64) * (x - 64) + (y - 128) * (y - 128) + (z - 64) * (z - 64)
+    for k in occ {
+      let (x, y, z) = dec(k); let d = (x - tx) * (x - tx) + (y - ty) * (y - ty) + (z - tz) * (z - tz)
       if d < best { best = d; seed = k }
     }
-    guard let s0 = seed, best <= 64 else { return Array(occ) }   // mais de 8 voxels (5 cm) do ponto: sem objeto claro ainda
+    guard let s0 = seed, best <= 100 else { return Array(occ) }   // mais de 8 voxels (5 cm) do ponto: sem objeto claro ainda
     var seen: Set<Int32> = [s0], fila = [s0], i = 0
     while i < fila.count {
       let (x, y, z) = dec(fila[i]); i += 1
@@ -371,6 +383,14 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       } } }
     }
     return fila.count >= 20 ? fila : Array(occ)
+  }
+
+  /// ponto que melhor cruza todos os raios da camera (minimos quadrados), depois de 30 quadros filmados
+  private func mira() -> simd_float3? {
+    guard rayN >= 30, abs(rayA.determinant) > 1e-6 else { return nil }
+    let x = rayA.inverse * rayB
+    guard let c = center, simd_distance(simd_float3(x), c) < 0.6 else { return nil }
+    return simd_float3(x)
   }
 
   /// nota 0-10 do modelo que vai sair: cobertura, firmeza, rastreio, distancia, luz e textura (pontos achados)
@@ -470,6 +490,7 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
     if videoMode { doc["video"] = "scan.mov"; doc["fps"] = vfps }
     if let floorY { doc["floor_y"] = floorY }
     if suporte { doc["suporte"] = true }                  // objeto em cima de algo MENOR que ele: o PC corta no degrau
+    if let m = mira() { doc["mira"] = [m.x, m.y, m.z] }
     if let objRadius, let objAxis { doc["objeto_raio"] = objRadius; doc["objeto_eixo"] = [objAxis.x, objAxis.y] }   // objeto achado na previa: o PC corta a mesa em volta
     try? JSONSerialization.data(withJSONObject: doc).write(to: d.appendingPathComponent("poses.json"), options: .atomic)
   }
