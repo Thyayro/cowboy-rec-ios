@@ -59,7 +59,7 @@ struct NativeCameraSettings: View {
           ForEach(camera.codecs, id: \.self) { codec in Text(codec == "hvc1" ? "HEVC" : codec == "avc1" ? "H.264" : codec).tag(codec) }
         }.disabled(configuringDisabled || camera.hdrEnabled || camera.logEnabled)
       }
-      ProResSettingsSection(camera: camera, disabled: configuringDisabled)
+      ProResSettingsSection(recording: camera.recording)
       Section("Foco e luz") {
         Toggle("Travar luz e cor", isOn: Binding(get: { camera.colorLocked }, set: { camera.lockColor($0) })).disabled(!camera.ready)
         Toggle("Lanterna", isOn: Binding(get: { camera.torchEnabled }, set: { camera.setTorch($0) })).disabled(!camera.ready || !camera.torchAvailable)

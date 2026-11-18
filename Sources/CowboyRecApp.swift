@@ -173,10 +173,8 @@ struct RecorderView: View {
       UIDevice.current.beginGeneratingDeviceOrientationNotifications()
       UIApplication.shared.isIdleTimerDisabled = true
       CloudStream.shared.cookieProvider = { await MainActor.run { CowboyCloud.shared.credential } }
-      ProResMasters.shared.cookieProvider = { await MainActor.run { CowboyCloud.shared.credential } }
-      ProResMasters.shared.recoverInterrupted()
-      ExternalSSD.shared.onChange = { camera.ssdChanged() }
-      if camera.proresOn { ExternalSSD.shared.start() }
+      ProResUploader.shared.cookieProvider = { await MainActor.run { CowboyCloud.shared.credential } }
+      ProResUploader.shared.start()
       camera.spaceMeta = { [tools, camera] in tools.meta(zoom: camera.zoom, fov: camera.fieldOfView) }
       camera.onStreamTake = { cid in Task { @MainActor in IGModule.shared.recordingFinished(cid: cid) } }
       camera.onLiveStarted = { Task { @MainActor in IGModule.shared.liveStarted() } }
@@ -201,7 +199,7 @@ struct RecorderView: View {
     }
     .onChange(of: phase) { _, value in
       if value == .background { camera.close(); CloudStream.shared.enterBackground(); MotionHub.shared.stop() }
-      else if value == .active && portal == nil && !arPresentation && !photoMode && !scanMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick(); ProResMasters.shared.kick(); ProResMasters.shared.refreshRemote() } }
+      else if value == .active && portal == nil && !arPresentation && !photoMode && !scanMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick(); ProResUploader.shared.wake() } }
     }
   }
 
@@ -250,7 +248,7 @@ struct RecorderView: View {
           HStack(spacing: 4) {
             Text(camera.formatShort).font(.system(size: 13, weight: .bold))
             if camera.logEnabled { Text("LOG").font(.system(size: 10, weight: .heavy)).padding(.horizontal, 4).padding(.vertical, 1).background(Color.purple, in: RoundedRectangle(cornerRadius: 3)) }
-            if camera.proresOn { Text(camera.proresCapped ? "PRORES·30" : "PRORES").font(.system(size: 10, weight: .heavy)).padding(.horizontal, 4).padding(.vertical, 1).background(camera.proresCapped ? Color.orange : Color.blue, in: RoundedRectangle(cornerRadius: 3)) }
+            if ProResPrefs.enabled { Text("PRORES").font(.system(size: 10, weight: .heavy)).padding(.horizontal, 4).padding(.vertical, 1).background(Color.blue, in: RoundedRectangle(cornerRadius: 3)) }
             if !camera.logEnabled && camera.hdrEnabled { Text("HDR").font(.system(size: 10, weight: .heavy)).padding(.horizontal, 4).padding(.vertical, 1).background(Color.orange, in: RoundedRectangle(cornerRadius: 3)) }
             Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).opacity(0.7)
           }.foregroundStyle(.white).padding(.horizontal, 10).padding(.vertical, 6).background(.white.opacity(0.12), in: Capsule())

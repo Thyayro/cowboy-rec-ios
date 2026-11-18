@@ -1,261 +1,390 @@
-import SwiftUI
 import AVFoundation
 import CryptoKit
 import Foundation
 import Network
+import SwiftUI
 import UIKit
 
-// PRORES LOG (0.13.0, pedido do operador 17/11). Desenho aprovado por ele:
-//  • o MESTRE ProRes (422 HQ/422/LT, Apple Log 10 bits) grava num .mov no aparelho — SSD externo no USB-C quando houver,
-//    senão o iPhone (Arquivos › No Meu iPhone › Cowboy Rec › ProRes) — fragmentado a cada 2 s (sobrevive a travamento);
-//  • ao mesmo tempo um PROXY 1080p HEVC Log (~20 Mb/s) sobe ao vivo pelo caminho de sempre (pedaços de 1 s com recibo):
-//    galeria, HLS, conversão e efeitos da VPS seguem iguais;
-//  • ao parar, o mestre sobe SÓ NO WI-FI em trechos de 8 MB com recibo, anexado à MESMA tomada; a VPS só guarda (não
-//    converte) e o PC puxa pro F:\CowboyRec conferindo sha256 (arquivar.py) e a VPS apaga a cópia dela;
-//  • o iPhone NUNCA apaga o mestre sozinho: só por ação manual do operador (Ajustes › Mestres ProRes).
+// PRORES LOG EXTRA (0.13.0, operador 17/11): chave em Ajustes, LIGADA por padrão, que soma um mestre ProRes à gravação de
+// sempre — desligada, o app é exatamente o 0.12.6 (nada da configuração dele muda). Sem SSD no celular, o mestre NÃO fica
+// guardado no iPhone: sai em pedaços de 2 s (ProRes é todo quadro-chave: emenda perfeita, sem recodificar) e cada pedaço
+// só é apagado do iPhone com o recibo de quem recebeu (sha256 conferido):
+//   • EM CASA (PC achado na rede Wi-Fi) → direto pro receptor do PC (F:\CowboyRec\ProRes), 422 LT 4K30;
+//   • FORA → VPS pela internet, 422 HQ (o máximo, pedido dele); o PC puxa da VPS sem parar e a VPS apaga.
+// O iPhone só segura o ATRASO da rede (fora de casa, no 4G, o HQ acumula — o mestre para se o iPhone ficar com < 3 GB).
+// Gravando a 60 qps o mestre vai a 30 (1 quadro sim, 1 não; limite da Apple sem SSD); a gravação de sempre fica a 60.
 
-/// SSD externo (iOS 17+): a API da Apple pra gravar em disco USB-C. Sem SSD, ProRes fica limitado a 4K30.
-final class ExternalSSD: ObservableObject, @unchecked Sendable {
-  static let shared = ExternalSSD()
-  struct Info: Equatable { let name: String; let freeBytes: Int64; let totalBytes: Int64; let notRecommended: Bool }
-  @Published private(set) var info: Info?
-  @Published private(set) var authorized = AVExternalStorageDevice.authorizationStatus == .authorized
-  var onChange: (() -> Void)?
-  private var observation: NSKeyValueObservation?
-  private var started = false
-  var supported: Bool { AVExternalStorageDeviceDiscoverySession.isSupported }
+enum ProResPrefs {
+  private static let d = UserDefaults.standard
+  static var enabled: Bool { get { d.object(forKey: "proresExtra") as? Bool ?? true } set { d.set(newValue, forKey: "proresExtra") } }
+  static var home: ProResFlavor { get { ProResFlavor(rawValue: d.string(forKey: "proresHome") ?? "") ?? .lt } set { d.set(newValue.rawValue, forKey: "proresHome") } }
+  static var away: ProResFlavor { get { ProResFlavor(rawValue: d.string(forKey: "proresAway") ?? "") ?? .hq } set { d.set(newValue.rawValue, forKey: "proresAway") } }
+}
 
-  func start() {
-    guard !started else { refresh(); return }
-    started = true
-    guard supported, let discovery = AVExternalStorageDeviceDiscoverySession.shared else { Diag.step("ssd-api", ["suportado": false], send: false); return }
-    if AVExternalStorageDevice.authorizationStatus == .notDetermined {
-      AVExternalStorageDevice.requestAccess { ok in
-        DispatchQueue.main.async { self.authorized = ok; self.refresh(); self.onChange?() }
+/// O PC de casa (receptor `C:\EvoOps\cowboy-rec-prores\receptor.py`): o PC publica endereço/porta/senha na VPS e o app lê
+/// de lá com o login; "em casa" = o PC respondeu na rede local há pouco.
+final class HomePC: @unchecked Sendable {
+  static let shared = HomePC()
+  struct Conf: Codable, Equatable { let ip: String; let port: Int; let token: String }
+  private let lock = NSLock()
+  private var okAt: Date?
+  private(set) var conf: Conf? = (UserDefaults.standard.data(forKey: "homePC")).flatMap { try? JSONDecoder().decode(Conf.self, from: $0) }
+  private lazy var http: URLSession = {
+    let c = URLSessionConfiguration.ephemeral
+    c.timeoutIntervalForRequest = 1.5; c.allowsCellularAccess = false; c.waitsForConnectivity = false
+    return URLSession(configuration: c)
+  }()
+  var reachable: Bool { lock.lock(); defer { lock.unlock() }; return okAt.map { Date().timeIntervalSince($0) < 300 } ?? false }
+  func lost() { lock.lock(); okAt = nil; lock.unlock() }
+  var base: URL? { conf.flatMap { URL(string: "http://\($0.ip):\($0.port)/prores/") } }
+  func refreshConf(cookie: String) async {
+    var r = URLRequest(url: URL(string: "/api/rec/pc", relativeTo: ProResUploader.origin)!.absoluteURL)
+    r.setValue(cookie, forHTTPHeaderField: "Cookie"); r.timeoutInterval = 15
+    guard let (body, resp) = try? await URLSession.shared.data(for: r), (resp as? HTTPURLResponse)?.statusCode == 200,
+      let j = try? JSONSerialization.jsonObject(with: body) as? [String: Any], let ip = j["ip"] as? String, let port = j["port"] as? Int, let token = j["token"] as? String else { return }
+    let c = Conf(ip: ip, port: port, token: token)
+    if c != conf { conf = c; UserDefaults.standard.set(try? JSONEncoder().encode(c), forKey: "homePC"); Diag.step("prores-pc-conf", ["ip": ip, "porta": port], send: false) }
+  }
+  @discardableResult func probe() async -> Bool {
+    guard let base, let token = conf?.token else { return false }
+    var r = URLRequest(url: base.appendingPathComponent("ping")); r.setValue(token, forHTTPHeaderField: "X-Token")
+    let ok = ((try? await http.data(for: r))?.1 as? HTTPURLResponse)?.statusCode == 200
+    lock.lock(); okAt = ok ? Date() : nil; lock.unlock()
+    return ok
+  }
+  func authorize(_ r: inout URLRequest) { if let t = conf?.token { r.setValue(t, forHTTPHeaderField: "X-Token") } }
+}
+
+/// Gravador do mestre em pedaços de 2 s (só na fila de quadros). Troca de pedaço sem parar: o próximo gravador é criado e
+/// iniciado ANTES (fila própria); o áudio vai pro pedaço do seu horário (o anterior fica aberto 0,6 s pra receber o atrasado),
+/// então cada amostra cai em exatamente um pedaço e a emenda no PC é contínua (sem buraco nem deriva).
+final class ProResRecorder: @unchecked Sendable {
+  let cid: String
+  let dir: URL
+  let flavor: ProResFlavor
+  var streamCid: String?
+  private let video: [String: Any], audio: [String: Any], transform: CGAffineTransform
+  private let step: Int, fps: Double
+  private let queue: DispatchQueue
+  private let prep = DispatchQueue(label: "cowboy.prores.prep", qos: .userInitiated)
+  private var cur: SegmentWriter?, curSeq = 0, curStart: Double?
+  private var prev: (w: SegmentWriter, seq: Int, boundary: Double)?
+  private var next: SegmentWriter?, preparing = false
+  private var frameIndex = 0
+  private var stopped: String?
+  private var segs = 0, dropped = 0
+
+  static func freeBytes() -> Int64 { Int64((try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? 0) }
+
+  init(owner: String, flavor: ProResFlavor, home: Bool, video: [String: Any], audio: [String: Any], transform: CGAffineTransform, fps: Double, width: Int, height: Int, rotation: Double, title: String, queue: DispatchQueue) throws {
+    cid = "pr" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(18).lowercased()
+    dir = ProResUploader.root.appendingPathComponent(cid)
+    self.flavor = flavor; self.video = video; self.audio = audio; self.transform = transform; self.queue = queue
+    step = ProResPolicy.step(fps: fps); self.fps = ProResPolicy.masterFPS(fps)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let take = ProResUploader.Take(cid: cid, owner: owner, flavor: flavor.label, codec: flavor.rawValue, fps: self.fps, width: width, height: height, rotation: rotation, title: title,
+      recordedAt: ISO8601DateFormatter().string(from: Date()), home: home, closed: false, count: 0)
+    ProResUploader.shared.save(take)
+    cur = try make(0)
+    _ = cur?.prestart()
+  }
+  private func file(_ seq: Int) -> URL { dir.appendingPathComponent(String(format: "seg_%06d.mov", seq)) }
+  private func make(_ seq: Int) throws -> SegmentWriter {
+    try? FileManager.default.removeItem(at: file(seq))
+    return try SegmentWriter.make(video: video, audio: audio, transform: transform, file: file(seq))
+  }
+  private func prepareNext() {
+    guard !preparing, next == nil else { return }
+    preparing = true
+    let seq = curSeq + 1
+    prep.async {
+      let w = try? self.make(seq)
+      if let w { _ = w.prestart() }
+      self.queue.async { self.preparing = false; if self.stopped == nil { self.next = w } else { w?.finish { _ in } } }
+    }
+  }
+  func appendVideo(_ s: CMSampleBuffer) {
+    guard stopped == nil else { return }
+    frameIndex += 1
+    if (frameIndex - 1) % step != 0 { return }
+    let pts = CMSampleBufferGetPresentationTimeStamp(s).seconds
+    if let st = curStart, pts - st >= ProResPolicy.segmentSeconds - 0.25 / fps { rotate(at: pts) }
+    guard let w = cur, stopped == nil else { return }
+    let before = w.dropped
+    w.appendVideo(s)
+    dropped += w.dropped - before
+    if curStart == nil, w.firstVideoPTS != nil { curStart = pts }
+    if let f = w.failed { stop("gravador ProRes: \(f)"); return }
+    if let st = curStart, pts - st > 0.8 { prepareNext() }
+    if let p = prev, pts - p.boundary > 0.6 { closePrev(p) }
+  }
+  func appendAudio(_ s: CMSampleBuffer) {
+    guard stopped == nil else { return }
+    let pts = CMSampleBufferGetPresentationTimeStamp(s).seconds
+    if let p = prev, pts < p.boundary { p.w.appendAudio(s) } else { cur?.appendAudio(s) }
+  }
+  private func rotate(at t: Double) {
+    if let p = prev { closePrev(p) }
+    guard let w = cur else { return }
+    prev = (w, curSeq, t)
+    curSeq += 1; curStart = nil
+    if let n = next { cur = n; next = nil }
+    else {
+      do { cur = try make(curSeq) } catch { cur = nil; stop("não abriu o pedaço \(curSeq): \(error.localizedDescription)"); return }
+      Diag.step("prores-pedaco-atrasado", ["seq": curSeq], send: false)
+    }
+    if ProResRecorder.freeBytes() < ProResPolicy.minFreeBytes { stop("iPhone com pouco espaço (a rede não acompanhou) — o mestre parou aqui; a gravação de sempre segue") }
+  }
+  private func closePrev(_ p: (w: SegmentWriter, seq: Int, boundary: Double)) {
+    prev = nil
+    seal(p.w, seq: p.seq, end: p.boundary)
+  }
+  /// fecha um pedaço e grava a ficha dele (só então ele entra na fila de envio)
+  private func seal(_ w: SegmentWriter, seq: Int, end: Double?) {
+    let url = file(seq), fps = self.fps, cid = self.cid
+    w.finish { ok in
+      guard ok || FileManager.default.fileExists(atPath: url.path), let v0 = w.firstVideoPTS else {
+        try? FileManager.default.removeItem(at: url); return
       }
+      let vEnd = end ?? ((w.lastVideoPTS ?? v0) + 1 / fps)
+      let meta = ProResUploader.Seg(seq: seq, frames: w.vOK, dropped: w.dropped, v0: v0, vEnd: vEnd, a0: w.firstAudioPTS, samples: w.aSamples, audioSkip: w.aSkip, ok: ok)
+      ProResUploader.shared.sealed(cid: cid, seg: meta)
     }
-    observation = discovery.observe(\.externalStorageDevices, options: [.new]) { [weak self] _, _ in
-      DispatchQueue.main.async { self?.refresh(); self?.onChange?() }
-    }
-    refresh()
+    segs += 1
   }
-  func refresh() {
-    authorized = AVExternalStorageDevice.authorizationStatus == .authorized
-    let dev = current
-    let next = dev.map { Info(name: $0.displayName ?? "SSD", freeBytes: Int64($0.freeSize), totalBytes: Int64($0.totalSize), notRecommended: $0.isNotRecommendedForCaptureUse) }
-    if next != info {
-      info = next
-      Diag.step("ssd", ["ligado": next != nil, "nome": next?.name ?? "", "livre_gb": Double(next?.freeBytes ?? 0) / 1e9, "nao_recomendado": next?.notRecommended ?? false, "autorizado": authorized])
-    }
+  private func stop(_ why: String) {
+    guard stopped == nil else { return }
+    stopped = why
+    Diag.step("prores-parou", ["por": why, "pedacos": segs, "drop": dropped])
+    if let p = prev { closePrev(p) }
+    if let w = cur { cur = nil; if w.started { seal(w, seq: curSeq, end: nil) } else { w.finish { _ in }; try? FileManager.default.removeItem(at: file(curSeq)) } }
+    if let n = next { next = nil; n.finish { _ in }; try? FileManager.default.removeItem(at: file(curSeq + 1)) }
+    ProResUploader.shared.close(cid: cid, count: segs, streamCid: streamCid, note: why)
+    DispatchQueue.main.async { ProResUploader.shared.notice = why }
   }
-  private var current: AVExternalStorageDevice? {
-    guard supported, authorized else { return nil }
-    return AVExternalStorageDeviceDiscoverySession.shared?.externalStorageDevices.first { $0.isConnected }
-  }
-  var connected: Bool { current != nil }
-  /// arquivo novo no SSD (nome dado pelo próprio iOS, na pasta de mídia do disco)
-  func nextURL() -> URL? {
-    guard let dev = current else { return nil }
-    var urls: [URL] = []
-    if let ex = CowboyObjC.catching({ urls = (try? dev.nextAvailableURLs(withPathExtensions: ["mov"])) ?? [] }) { Diag.step("ssd-url-fail", ["err": ex]); return nil }
-    guard let url = urls.first else { return nil }
-    _ = url.startAccessingSecurityScopedResource()
-    return url
+  /// parar a gravação: fecha tudo e marca o fim (o envio termina sozinho)
+  func finish() {
+    guard stopped == nil else { return }
+    if let p = prev { closePrev(p) }
+    let total = segs + ((cur?.started ?? false) ? 1 : 0)
+    stopped = "fim"
+    if let w = cur { cur = nil; if w.started { seal(w, seq: curSeq, end: nil) } else { w.finish { _ in }; try? FileManager.default.removeItem(at: file(curSeq)) } }
+    if let n = next { next = nil; n.finish { _ in }; try? FileManager.default.removeItem(at: file(curSeq + 1)) }
+    Diag.step("prores-fim", ["cid": cid, "pedacos": total, "drop": dropped, "sabor": flavor.label])
+    ProResUploader.shared.close(cid: cid, count: total, streamCid: streamCid, note: nil)
   }
 }
 
-/// Fila dos mestres ProRes: guarda (nunca apaga sozinha) e sobe pelo Wi-Fi com recibo, anexado à tomada do proxy.
-final class ProResMasters: ObservableObject, @unchecked Sendable {
-  static let shared = ProResMasters()
-  struct Item: Codable, Identifiable {
-    var cid: String
-    var owner: String
-    var created: Date
-    var path: String            // caminho absoluto na hora de gravar
-    var relative: String?       // dentro de Documents (iPhone): o caminho absoluto muda a cada instalação do app
-    var bookmark: Data?         // SSD: marcador pra reabrir o arquivo depois
-    var onSSD: Bool
-    var flavor: String
-    var format: String
-    var state: String           // gravando | pronto | subindo | na-nuvem | no-pc | falhou
-    var bytes: Int64 = 0
-    var sent: Int64 = 0
-    var take: String?
-    var sha256: String?
-    var note: String?
-    var id: String { cid }
-  }
-  private(set) var items: [Item] = []          // só com lock (fila de envio)
-  @Published private(set) var shown: [Item] = []   // cópia pra tela (main)
-  @Published private(set) var line = ""
-  var cookieProvider: (() async -> String?)?
-  /// gravando agora: o mestre espera (a banda é do proxy ao vivo)
-  var paused = false { didSet { if !paused { kick() } } }
+/// Fila de envio dos pedaços: cada pedaço vai pro PC (em casa) ou pra VPS; só sai do iPhone com recibo (sha256 igual).
+final class ProResUploader: ObservableObject, @unchecked Sendable {
+  static let shared = ProResUploader()
   static let origin = URL(string: "https://cowboy-editor.ybguyl.easypanel.host")!
-  static let chunk = 8 * 1024 * 1024
+  static let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CowboyProRes")
+  struct Take: Codable {
+    var cid: String; var owner: String; var flavor: String; var codec: String; var fps: Double; var width: Int; var height: Int; var rotation: Double
+    var title: String; var recordedAt: String; var home: Bool; var closed: Bool; var count: Int
+    var streamCid: String? = nil; var take: String? = nil; var note: String? = nil; var doneTo: String? = nil
+  }
+  struct Seg: Codable { var seq: Int; var frames: Int; var dropped: Int; var v0: Double; var vEnd: Double; var a0: Double?; var samples: Int; var audioSkip: Int; var ok: Bool; var sha256: String? = nil }
+  @Published var line = ""
+  @Published var notice = ""
+  @Published var pendingGB: Double = 0
+  @Published var pcOnline = false
+  var cookieProvider: (() async -> String?)?
   private let lock = NSLock()
   private var running = false
-  private var wifi = false
+  private var started = false
   private let monitor = NWPathMonitor()
-  private let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("CowboyMasters")
-  static let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("ProRes", isDirectory: true)
+  private var wifi = false
   private lazy var http: URLSession = {
     let c = URLSessionConfiguration.ephemeral
-    c.httpShouldSetCookies = false; c.timeoutIntervalForRequest = 120
-    c.allowsCellularAccess = false; c.allowsExpensiveNetworkAccess = false   // mestre de GB só no Wi-Fi
+    c.httpShouldSetCookies = false; c.timeoutIntervalForRequest = 300; c.timeoutIntervalForResource = 3600
+    c.allowsCellularAccess = true; c.allowsExpensiveNetworkAccess = true; c.allowsConstrainedNetworkAccess = true
     return URLSession(configuration: c, delegate: CowboyNoRedirect(), delegateQueue: nil)
   }()
 
-  init() {
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+  func start() {
+    guard !started else { wake(); return }
+    started = true
+    try? FileManager.default.createDirectory(at: Self.root, withIntermediateDirectories: true)
     monitor.pathUpdateHandler = { [weak self] path in
       guard let self else { return }
-      let ok = path.status == .satisfied && path.usesInterfaceType(.wifi) && !path.isExpensive
-      self.lock.lock(); let changed = ok != self.wifi; self.wifi = ok; self.lock.unlock()
-      if changed && ok { self.kick() }
-      if changed { self.publishLine() }
+      let w = path.status == .satisfied && path.usesInterfaceType(.wifi)
+      self.lock.lock(); let changed = w != self.wifi; self.wifi = w; self.lock.unlock()
+      if changed { if !w { HomePC.shared.lost() }; self.wake() }
     }
     monitor.start(queue: DispatchQueue(label: "cowboy.prores.net"))
-    load()
+    Task.detached(priority: .utility) { [weak self] in await self?.recoverOrphans(); self?.wake() }
   }
-
-  // ---- arquivo do mestre
-  /// destino do próximo mestre: SSD (se ligado) ou Documents/ProRes no iPhone
-  func newFile(cid: String) -> (URL, Bool)? {
-    if let url = ExternalSSD.shared.nextURL() { return (url, true) }
-    try? FileManager.default.createDirectory(at: Self.documents, withIntermediateDirectories: true)
-    let f = DateFormatter(); f.locale = Locale(identifier: "pt_BR"); f.timeZone = TimeZone(identifier: "America/Sao_Paulo"); f.dateFormat = "yyyy-MM-dd_HH'h'mm'm'ss"
-    return (Self.documents.appendingPathComponent("Cowboy_\(f.string(from: Date()))_\(cid.suffix(6)).mov"), false)
-  }
-  func begin(cid: String, owner: String, url: URL, onSSD: Bool, flavor: ProResFlavor, format: String) {
-    var it = Item(cid: cid, owner: owner, created: Date(), path: url.path, relative: nil, bookmark: nil, onSSD: onSSD, flavor: flavor.label, format: format, state: "gravando")
-    if !onSSD { it.relative = url.lastPathComponent }
-    save(it)
-  }
-  /// gravador fechou: marca pronto (ou falhou — o arquivo fica do mesmo jeito, fragmentado ele ainda toca até o fim salvo)
-  func finished(cid: String, ok: Bool, note: String?) {
-    update(cid) { it in
-      if let url = self.url(of: it) {
-        it.bytes = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-        if it.onSSD { it.bookmark = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) }
+  /// o app fechou no meio de uma tomada: fecha a tomada e dá ficha aos pedaços que ficaram sem (nada fica pra trás)
+  private func recoverOrphans() async {
+    let dirs = (try? FileManager.default.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: nil)) ?? []
+    for d in dirs {
+      guard var t = load(d.lastPathComponent), !t.closed else { continue }
+      let files = (try? FileManager.default.contentsOfDirectory(atPath: d.path)) ?? []
+      var n = 0
+      for f in files.filter({ $0.hasPrefix("seg_") && $0.hasSuffix(".mov") }).sorted() {
+        n += 1
+        let json = d.appendingPathComponent(f.replacingOccurrences(of: ".mov", with: ".json"))
+        if FileManager.default.fileExists(atPath: json.path) { continue }
+        let url = d.appendingPathComponent(f), seq = Int(f.dropFirst(4).dropLast(4)) ?? 0
+        let dur = (try? await AVURLAsset(url: url).load(.duration)).map { $0.seconds } ?? 0
+        if !(dur > 0) { try? FileManager.default.removeItem(at: url); continue }
+        let seg = Seg(seq: seq, frames: Int((dur * t.fps).rounded()), dropped: 0, v0: 0, vEnd: dur, a0: nil, samples: 0, audioSkip: 0, ok: false)
+        if let data = try? JSONEncoder().encode(seg) { try? data.write(to: json, options: .atomic) }
       }
-      it.state = ok ? "pronto" : (it.bytes > 0 ? "pronto" : "falhou")
-      if it.take == nil { it.take = CloudStream.shared.takeID(it.cid) }
-      it.note = ok ? nil : (note ?? "o gravador ProRes terminou com erro — o que foi salvo continua no aparelho")
+      t.closed = true; t.count = max(t.count, n); t.note = "app fechou gravando — recuperado até o último pedaço salvo"
+      save(t)
+      Diag.step("prores-recuperado", ["cid": t.cid, "pedacos": n])
     }
-    kick()
   }
-  /// a VPS deu o número da tomada do proxy (CloudStream): o mestre vai anexado a ela
-  func linkTake(cid: String, take: String) {
-    guard FileManager.default.fileExists(atPath: file(cid).path) else { return }
-    update(cid) { $0.take = take }
-    kick()
-  }
-  func url(of it: Item) -> URL? {
-    if let r = it.relative { return Self.documents.appendingPathComponent(r) }
-    if let b = it.bookmark {
-      var stale = false
-      if let u = try? URL(resolvingBookmarkData: b, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) { _ = u.startAccessingSecurityScopedResource(); return u }
+  /// reconfere o PC de casa e solta a fila (abrir o app, voltar o Wi-Fi, fim de tomada)
+  func wake() {
+    Task.detached(priority: .utility) { [weak self] in
+      guard let self else { return }
+      if let cookie = await self.cookieProvider?(), !cookie.isEmpty { await HomePC.shared.refreshConf(cookie: cookie) }
+      self.lock.lock(); let w = self.wifi; self.lock.unlock()
+      let ok = w ? await HomePC.shared.probe() : false
+      if !w { HomePC.shared.lost() }
+      DispatchQueue.main.async { self.pcOnline = ok }
+      self.kick()
     }
-    let u = URL(fileURLWithPath: it.path)
-    return FileManager.default.fileExists(atPath: u.path) ? u : (it.state == "gravando" ? u : nil)
-  }
-  /// Apagar do aparelho: SÓ por ação manual do operador (confirmada na tela)
-  func discard(_ cid: String) {
-    lock.lock(); let it = items.first { $0.cid == cid }; lock.unlock()
-    guard let it, it.state != "gravando", it.state != "subindo" else { return }
-    if let u = url(of: it) { try? FileManager.default.removeItem(at: u) }
-    try? FileManager.default.removeItem(at: file(cid))
-    Diag.step("prores-apagado-manual", ["cid": cid, "estado": it.state, "gb": Double(it.bytes) / 1e9])
-    load()
   }
 
-  // ---- envio (Wi-Fi)
+  // ---- fichas (disco)
+  private func takeURL(_ cid: String) -> URL { Self.root.appendingPathComponent(cid).appendingPathComponent("take.json") }
+  func save(_ t: Take) { if let d = try? JSONEncoder().encode(t) { try? d.write(to: takeURL(t.cid), options: .atomic) } }
+  func load(_ cid: String) -> Take? { (try? Data(contentsOf: takeURL(cid))).flatMap { try? JSONDecoder().decode(Take.self, from: $0) } }
+  private func update(_ cid: String, _ fn: (inout Take) -> Void) { lock.lock(); defer { lock.unlock() }; guard var t = load(cid) else { return }; fn(&t); save(t) }
+  func sealed(cid: String, seg: Seg) {
+    if let d = try? JSONEncoder().encode(seg) { try? d.write(to: Self.root.appendingPathComponent(cid).appendingPathComponent(String(format: "seg_%06d.json", seg.seq)), options: .atomic) }
+    kick()
+  }
+  func close(cid: String, count: Int, streamCid: String?, note: String?) {
+    update(cid) { t in t.closed = true; t.count = count; t.streamCid = streamCid; t.note = note; if t.take == nil, let s = streamCid { t.take = CloudStream.shared.takeID(s) } }
+    wake()
+  }
+  func linkTake(streamCid: String, take: String) {
+    let dirs = (try? FileManager.default.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: nil)) ?? []
+    for d in dirs { if let t = load(d.lastPathComponent), t.streamCid == streamCid, t.take == nil { update(t.cid) { $0.take = take } } }
+  }
+
+  // ---- envio
   func kick() {
-    lock.lock()
-    let go = !running && wifi && !paused && items.contains { $0.take != nil && ["pronto", "subindo"].contains($0.state) }
-    if go { running = true }
-    lock.unlock()
-    publishLine()
-    guard go else { return }
+    lock.lock(); if running { lock.unlock(); return }; running = true; lock.unlock()
     Task.detached(priority: .utility) { [weak self] in await self?.run() }
   }
+  private struct Wait: Error { let text: String; let seconds: Double }
   private func run() async {
-    defer { lock.lock(); running = false; lock.unlock(); publishLine() }
+    defer { lock.lock(); running = false; lock.unlock() }
+    var backoff = 2.0
     while true {
-      lock.lock(); let ok = wifi && !paused; let next = items.first { $0.take != nil && ["pronto", "subindo"].contains($0.state) }; lock.unlock()
-      guard ok, let it = next else { return }
-      guard let cookie = await cookieProvider?(), !cookie.isEmpty else { setLine("Mestre ProRes espera o login na conta Cowboy"); return }
-      do { try await upload(it, cookie: cookie) }
-      catch let e as Stop { setLine(e.text); if e.wait > 0 { try? await Task.sleep(nanoseconds: UInt64(e.wait) * 1_000_000_000) } else { return } }
-      catch { setLine("Mestre ProRes: rede caiu (\(error.localizedDescription)) — continua sozinho no Wi-Fi"); try? await Task.sleep(nanoseconds: 15_000_000_000) }
-    }
-  }
-  struct Stop: Error { let text: String; let wait: Int }
-  private func upload(_ it0: Item, cookie: String) async throws {
-    guard let take = it0.take else { return }
-    guard let url = url(of: it0), let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap({ $0 }), size > 0 else {
-      update(it0.cid) { $0.note = $0.onSSD ? "Ligue o SSD pra subir este mestre" : "Arquivo não encontrado no iPhone" }
-      throw Stop(text: it0.onSSD ? "Mestre ProRes no SSD: ligue o SSD no USB-C pra subir" : "Mestre ProRes não encontrado", wait: 0)
-    }
-    let count = (size + Self.chunk - 1) / Self.chunk
-    let q = take.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? take
-    let (sc, sj) = try await call("/api/rec/master-status?take=\(q)", cookie: cookie)
-    if sc == 404 || sc == 410 { update(it0.cid) { $0.state = "falhou"; $0.note = "a tomada do proxy não existe mais na VPS — o mestre fica no aparelho" }; return }
-    guard (200..<300).contains(sc) else { throw Stop(text: "Mestre ProRes: VPS respondeu \(sc)", wait: 60) }
-    if let st = sj["state"] as? String, st == "pronto" || st == "arquivado" {
-      update(it0.cid) { $0.state = st == "arquivado" ? "no-pc" : "na-nuvem"; $0.sent = Int64(size); $0.sha256 = sj["sha256"] as? String }
-      return
-    }
-    var next = sj["next"] as? Int ?? 0
-    guard next >= 0, next <= count else { throw Stop(text: "Recibo do mestre inválido", wait: 60) }
-    update(it0.cid) { $0.state = "subindo"; $0.bytes = Int64(size) }
-    let handle = try FileHandle(forReadingFrom: url)
-    defer { try? handle.close() }
-    while next < count {
-      lock.lock(); let stop = paused || !wifi; lock.unlock()
-      if stop { throw Stop(text: paused ? "Mestre ProRes pausado enquanto grava" : "Mestre ProRes espera o Wi-Fi", wait: 0) }
-      try handle.seek(toOffset: UInt64(next) * UInt64(Self.chunk))
-      guard let data = try handle.read(upToCount: Self.chunk), !data.isEmpty else { throw Stop(text: "Não consegui ler o mestre ProRes", wait: 30) }
-      let (code, j) = try await call("/api/rec/master?take=\(q)&seq=\(next)&size=\(size)&chunks=\(count)", method: "PUT", data: data, cookie: cookie)
-      switch code {
-      case 200..<300:
-        guard let ack = j["next"] as? Int, ack == next + 1 else { throw Stop(text: "VPS não confirmou o trecho \(next) do mestre", wait: 10) }
-        next = ack
-        let sent = Int64(min(size, next * Self.chunk))
-        update(it0.cid) { $0.sent = sent }
-        setLine(String(format: "Subindo mestre ProRes: %.1f de %.1f GB (Wi-Fi)", Double(sent) / 1e9, Double(size) / 1e9))
-      case 409:
-        if let n = j["next"] as? Int, n >= 0, n <= count { next = n } else { throw Stop(text: "Mestre fora de ordem", wait: 10) }
-      case 507:
-        throw Stop(text: "VPS sem espaço pro mestre ProRes (\(String(format: "%.1f", Double(size) / 1e9)) GB) — espera o PC arquivar e tenta de novo", wait: 300)
-      case 401: throw Stop(text: "Login venceu — entre de novo; o mestre espera no aparelho", wait: 0)
-      default: throw Stop(text: "Mestre ProRes: VPS respondeu \(code)", wait: 30)
-      }
-    }
-    setLine("Conferindo o mestre ProRes (sha256)…")
-    let digest = try Self.sha256(url)
-    let (dc, dj) = try await call("/api/rec/master-done", method: "POST", json: ["take": take, "bytes": size, "chunks": count, "sha256": digest, "flavor": it0.flavor, "format": it0.format], cookie: cookie, timeout: 900)
-    guard (200..<300).contains(dc), dj["ok"] as? Bool == true else {
-      if dc == 422 { update(it0.cid) { $0.sent = 0; $0.state = "pronto"; $0.note = "a VPS recebeu diferente (\(dj["error"] as? String ?? "?")) — reenviando do começo" } }
-      throw Stop(text: "VPS não confirmou o mestre: \(dj["error"] as? String ?? "HTTP \(dc)")", wait: 30)
-    }
-    update(it0.cid) { $0.state = "na-nuvem"; $0.sha256 = digest; $0.note = nil }
-    Diag.step("prores-na-nuvem", ["cid": it0.cid, "take": take, "gb": Double(size) / 1e9, "sha": String(digest.prefix(12))])
-    setLine("Mestre ProRes na nuvem (sha256 conferido) — o PC puxa pro F:\\CowboyRec")
-  }
-  /// estado no servidor dos que já subiram (na-nuvem → no-pc depois que o PC arquivou)
-  func refreshRemote() {
-    Task.detached(priority: .utility) { [weak self] in
-      guard let self, let cookie = await self.cookieProvider?(), !cookie.isEmpty else { return }
-      self.lock.lock(); let list = self.items.filter { $0.state == "na-nuvem" && $0.take != nil }; self.lock.unlock()
-      for it in list {
-        let q = it.take!.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? it.take!
-        if case let (c, j)? = try? await self.call("/api/rec/master-status?take=\(q)", cookie: cookie), (200..<300).contains(c), j["state"] as? String == "arquivado" {
-          self.update(it.cid) { $0.state = "no-pc" }
+      let work = scan()
+      publishCounters(work)
+      guard let (cid, item) = work.next else { if work.total == 0 { setLine("") }; return }
+      guard let cookie = await cookieProvider?(), !cookie.isEmpty else { setLine("Mestre ProRes espera o login na conta Cowboy (fica no iPhone)"); return }
+      do {
+        switch item {
+        case .seg(let seg): try await send(cid: cid, seg: seg, cookie: cookie)
+        case .done(let t): try await done(t, cookie: cookie)
         }
+        backoff = 2
+      } catch let w as Wait {
+        setLine(w.text)
+        if w.seconds <= 0 { return }
+        try? await Task.sleep(nanoseconds: UInt64(w.seconds * 1e9))
+      } catch {
+        HomePC.shared.lost()
+        setLine("Mestre ProRes: sem rede (\(error.localizedDescription)) — fica no iPhone e tenta de novo")
+        try? await Task.sleep(nanoseconds: UInt64(backoff * 1e9)); backoff = min(backoff * 2, 60)
       }
     }
+  }
+  private enum Item { case seg(Seg), done(Take) }
+  private func scan() -> (next: (String, Item)?, total: Int, bytes: Int64) {
+    let dirs = ((try? FileManager.default.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: nil)) ?? []).sorted { $0.lastPathComponent < $1.lastPathComponent }
+    var first: (String, Item)?, total = 0, bytes: Int64 = 0
+    for d in dirs {
+      guard let t = load(d.lastPathComponent) else { continue }
+      let files = (try? FileManager.default.contentsOfDirectory(atPath: d.path)) ?? []
+      let segs = files.filter { $0.hasPrefix("seg_") && $0.hasSuffix(".json") }.sorted()
+      for f in files where f.hasSuffix(".mov") { bytes += Int64((try? d.appendingPathComponent(f).resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+      total += segs.count + (t.closed && t.doneTo == nil ? 1 : 0)
+      guard first == nil else { continue }
+      if let f = segs.first, let s = (try? Data(contentsOf: d.appendingPathComponent(f))).flatMap({ try? JSONDecoder().decode(Seg.self, from: $0) }) { first = (t.cid, .seg(s)) }
+      // só fecha a tomada quando não sobrou pedaço gravado sem ficha (o último ainda pode estar fechando)
+      else if t.closed && t.doneTo == nil && !files.contains(where: { $0.hasSuffix(".mov") }) { first = (t.cid, .done(t)) }
+    }
+    return (first, total, bytes)
+  }
+  private func destination() -> (URL, String)? {
+    if HomePC.shared.reachable, let b = HomePC.shared.base { return (b, "pc") }
+    return nil
+  }
+  private func send(cid: String, seg: Seg, cookie: String) async throws {
+    let dir = Self.root.appendingPathComponent(cid)
+    let mov = dir.appendingPathComponent(String(format: "seg_%06d.mov", seg.seq)), meta = dir.appendingPathComponent(String(format: "seg_%06d.json", seg.seq))
+    guard let size = (try? mov.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap({ $0 }), size > 0 else {
+      try? FileManager.default.removeItem(at: meta); return   // ficha sem vídeo (pedaço vazio): nada a mandar
+    }
+    var s = seg
+    if s.sha256 == nil { s.sha256 = try Self.sha256(mov); try? JSONEncoder().encode(s).write(to: meta, options: .atomic) }
+    let t = load(cid)
+    let toPC = destination()
+    // fora de casa a banda é de quem grava ao vivo: o mestre espera a fila da gravação de sempre esvaziar
+    if toPC == nil, CloudStream.shared.liveBacklog > 3 { throw Wait(text: "Mestre ProRes cede a rede pra gravação ao vivo (fica no iPhone)", seconds: 3) }
+    var url: URL
+    var r: URLRequest
+    if let dest = toPC {
+      url = dest.0.appendingPathComponent("seg")
+    } else {
+      url = URL(string: "/api/rec/prores/seg", relativeTo: Self.origin)!.absoluteURL
+    }
+    var c = URLComponents(url: url, resolvingAgainstBaseURL: true)!
+    c.queryItems = [URLQueryItem(name: "cid", value: cid), URLQueryItem(name: "seq", value: String(seg.seq))]
+    url = c.url!
+    r = URLRequest(url: url); r.httpMethod = "PUT"; r.timeoutInterval = 600
+    if toPC != nil { HomePC.shared.authorize(&r) } else { r.setValue(cookie, forHTTPHeaderField: "Cookie") }
+    r.setValue("video/quicktime", forHTTPHeaderField: "Content-Type")
+    r.setValue(s.sha256, forHTTPHeaderField: "X-Sha256")
+    if let d = try? JSONEncoder().encode(s) { r.setValue(d.base64EncodedString(), forHTTPHeaderField: "X-Seg") }
+    if let t, let d = try? JSONEncoder().encode(t) { r.setValue(d.base64EncodedString(), forHTTPHeaderField: "X-Take") }
+    let where_ = toPC != nil ? "PC" : "VPS"
+    setLine(String(format: "Mestre ProRes → %@: pedaço %d (%.0f MB)", where_, seg.seq, Double(size) / 1e6))
+    let (body, resp) = try await http.upload(for: r, fromFile: mov)
+    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+    let j = ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any]) ?? [:]
+    switch code {
+    case 200..<300:
+      guard j["sha256"] as? String == s.sha256 else { throw Wait(text: "\(where_) não confirmou o pedaço \(seg.seq) (sha256) — reenviando", seconds: 3) }
+      // RECIBO: só agora o pedaço sai do iPhone
+      try? FileManager.default.removeItem(at: mov); try? FileManager.default.removeItem(at: meta)
+      if seg.seq % 30 == 0 { Diag.step("prores-recibo", ["cid": cid, "seq": seg.seq, "destino": where_, "mb": size / 1_000_000], send: false) }
+    case 507: throw Wait(text: "VPS sem espaço pro mestre ProRes — fica no iPhone; o PC puxa e libera (tenta de novo em 1 min)", seconds: 60)
+    case 401, 403:
+      if toPC != nil { HomePC.shared.lost(); throw Wait(text: "PC recusou a senha — usando a VPS", seconds: 1) }
+      throw Wait(text: "Login venceu — entre de novo; o mestre espera no iPhone", seconds: 0)
+    default:
+      if toPC != nil { HomePC.shared.lost() }
+      throw Wait(text: "\(where_) respondeu \(code) no pedaço \(seg.seq) — tenta de novo", seconds: 10)
+    }
+  }
+  private func done(_ t0: Take, cookie: String) async throws {
+    var t = t0
+    if t.take == nil, let s = t.streamCid { t.take = CloudStream.shared.takeID(s) }
+    let body = try JSONEncoder().encode(t)
+    var r: URLRequest
+    let toPC = destination()
+    if let dest = toPC { r = URLRequest(url: dest.0.appendingPathComponent("done")); HomePC.shared.authorize(&r) }
+    else { r = URLRequest(url: URL(string: "/api/rec/prores/done", relativeTo: Self.origin)!.absoluteURL); r.setValue(cookie, forHTTPHeaderField: "Cookie") }
+    r.httpMethod = "POST"; r.httpBody = body; r.setValue("application/json", forHTTPHeaderField: "Content-Type"); r.timeoutInterval = 60
+    let (_, resp) = try await http.data(for: r)
+    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+    guard (200..<300).contains(code) else { if toPC != nil { HomePC.shared.lost() }; throw Wait(text: "Fim do mestre não confirmado (\(code)) — tenta de novo", seconds: 10) }
+    // tudo entregue com recibo: some a pasta da tomada no iPhone
+    try? FileManager.default.removeItem(at: Self.root.appendingPathComponent(t.cid))
+    Diag.step("prores-entregue", ["cid": t.cid, "pedacos": t.count, "destino": toPC != nil ? "pc" : "vps", "take": t.take ?? ""])
+    setLine("Mestre ProRes entregue (\(t.count) pedaços) — o PC emenda no F:\\CowboyRec\\ProRes")
   }
   static func sha256(_ url: URL) throws -> String {
     let h = try FileHandle(forReadingFrom: url); defer { try? h.close() }
@@ -263,120 +392,36 @@ final class ProResMasters: ObservableObject, @unchecked Sendable {
     while let d = try h.read(upToCount: 8 * 1024 * 1024), !d.isEmpty { hasher.update(data: d) }
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
   }
-
-  // ---- persistência
-  private func file(_ cid: String) -> URL { dir.appendingPathComponent(cid + ".json") }
-  private func save(_ it: Item) {
-    if let d = try? JSONEncoder().encode(it) { try? d.write(to: file(it.cid), options: .atomic) }
-    load()
-  }
-  private func update(_ cid: String, _ fn: (inout Item) -> Void) {
-    guard let d = try? Data(contentsOf: file(cid)), var it = try? JSONDecoder().decode(Item.self, from: d) else { return }
-    fn(&it); save(it)
-  }
-  func load() {
-    let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-    var list = files.filter { $0.pathExtension == "json" }.compactMap { (try? Data(contentsOf: $0)).flatMap { try? JSONDecoder().decode(Item.self, from: $0) } }
-    list.sort { $0.created > $1.created }
-    lock.lock(); items = list; lock.unlock()
-    DispatchQueue.main.async { self.shown = list }
-  }
-  /// app reaberto depois de morrer gravando: o mestre fragmentado continua válido até o último pedaço salvo
-  func recoverInterrupted() {
-    lock.lock(); let stuck = items.filter { $0.state == "gravando" }; lock.unlock()
-    for it in stuck { finished(cid: it.cid, ok: false, note: "o app fechou gravando — o mestre ficou até o último trecho salvo") }
-  }
   private func setLine(_ s: String) { DispatchQueue.main.async { self.line = s } }
-  private func publishLine() {
-    lock.lock(); let w = wifi, list = items, p = paused; lock.unlock()
-    let pend = list.filter { ["pronto", "subindo"].contains($0.state) }
-    let waiting = pend.filter { $0.take == nil }.count
-    let s: String
-    if pend.isEmpty { s = list.isEmpty ? "" : "Nenhum mestre ProRes pendente" }
-    else if p { s = "\(pend.count) mestre(s) ProRes esperam a gravação acabar" }
-    else if !w { s = "\(pend.count) mestre(s) ProRes esperam o Wi-Fi (não sobem no 4G)" }
-    else if waiting == pend.count { s = "\(pend.count) mestre(s) ProRes esperam a tomada do proxy chegar na VPS" }
-    else { s = line.isEmpty ? "Subindo mestre ProRes pelo Wi-Fi" : line }
-    setLine(s)
-  }
-  private func call(_ path: String, method: String = "GET", json: [String: Any]? = nil, data: Data? = nil, cookie: String, timeout: TimeInterval = 120) async throws -> (Int, [String: Any]) {
-    var r = URLRequest(url: URL(string: path, relativeTo: Self.origin)!.absoluteURL)
-    r.httpMethod = method; r.timeoutInterval = timeout
-    r.setValue(cookie, forHTTPHeaderField: "Cookie")
-    r.setValue(json == nil ? "application/octet-stream" : "application/json", forHTTPHeaderField: "Content-Type")
-    r.httpBody = try json.map { try JSONSerialization.data(withJSONObject: $0) } ?? data
-    let (body, response) = try await http.data(for: r)
-    guard let h = response as? HTTPURLResponse else { throw Stop(text: "sem resposta", wait: 15) }
-    if (300..<400).contains(h.statusCode) { return (401, [:]) }
-    return (h.statusCode, ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any]) ?? [:])
-  }
+  private func publishCounters(_ w: (next: (String, Item)?, total: Int, bytes: Int64)) { let gb = Double(w.bytes) / 1e9; DispatchQueue.main.async { self.pendingGB = gb } }
 }
 
-/// Ajustes › Gravar em: HEVC (nuvem ao vivo) × ProRes (mestre no aparelho + proxy) — com destino, teto e mestres guardados
+/// Ajustes › ProRes Log extra (soma à gravação de sempre; desligado = o app como era)
 struct ProResSettingsSection: View {
-  @ObservedObject var camera: NativeCamera
-  @ObservedObject var ssd = ExternalSSD.shared
-  @ObservedObject var masters = ProResMasters.shared
-  let disabled: Bool
-  @State private var confirm: ProResMasters.Item?
-  private func gb(_ b: Int64) -> String { String(format: "%.1f GB", Double(b) / 1e9) }
-  private var internalFree: Int64 { Int64((try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? 0) }
+  let recording: Bool
+  @ObservedObject var up = ProResUploader.shared
+  @State private var on = ProResPrefs.enabled
+  @State private var home = ProResPrefs.home
+  @State private var away = ProResPrefs.away
   var body: some View {
-    Section("Gravar em") {
-      Picker("Codec", selection: Binding(get: { camera.proresOn }, set: { camera.setProRes($0) })) {
-        Text("HEVC Log").tag(false); Text("ProRes Log").tag(true)
-      }.pickerStyle(.segmented).disabled(disabled || (camera.proresFlavors.isEmpty && !camera.proresOn))
-      if camera.proresFlavors.isEmpty && !camera.proresOn { Text("Este iPhone/formato não oferece ProRes ao gravador.").font(.caption2) }
-      if camera.proresOn {
-        Picker("ProRes", selection: Binding(get: { camera.proresFlavor }, set: { camera.setProResFlavor($0) })) {
-          ForEach(ProResFlavor.allCases.filter { camera.proresFlavors.isEmpty || camera.proresFlavors.contains($0.rawValue) }, id: \.rawValue) { f in Text(f.label).tag(f.rawValue) }
-        }.pickerStyle(.segmented).disabled(disabled)
-        let flavor = ProResFlavor(rawValue: camera.proresFlavor) ?? .hq
-        let p = camera.profiles.first { $0.id == camera.profileID } ?? .main
-        let rate = ProResPolicy.gbPerMinute(flavor, p)
-        if let s = ssd.info {
-          Text("Destino: SSD \(s.name) · \(gb(s.freeBytes)) livres (~\(Int(Double(s.freeBytes) / 1e9 / max(rate, 0.1))) min)").font(.caption)
-          if s.notRecommended { Text("O iOS marcou este SSD como lento pra gravar — pode perder quadros.").font(.caption2).foregroundStyle(.orange) }
-        } else {
-          Text("Destino: iPhone · \(gb(internalFree)) livres (~\(Int(Double(internalFree) / 1e9 / max(rate, 0.1))) min)").font(.caption)
-          Text(ssd.authorized || !ssd.supported ? "No iPhone o ProRes vai até 4K30. Pra 4K60, ligue um SSD no USB-C (exFAT ou APFS)." : "Permita o acesso a discos externos (aparece ao ligar o SSD) pra gravar 4K60 nele.").font(.caption2)
-        }
-        if camera.proresCapped { Text("Escolhido \(camera.proresWanted) → gravando \(camera.formatLabel) (sem SSD)").font(.caption.bold()).foregroundStyle(.orange) }
-        Text(String(format: "ProRes %@ em %@ ≈ %.1f GB por minuto. Junto sobe ao vivo um proxy 1080p HEVC Log (galeria, aprovação, montagem). O mestre sobe depois SÓ NO WI-FI, com recibo, e o PC guarda no F:\CowboyRec. Do aparelho, só você apaga.", flavor.label, p.label, rate)).font(.caption2)
-        if camera.bake709 { Text("No ProRes o arquivo fica em Log puro (o \"Rec.709 no iPhone\" vale só pro HEVC); a tela continua com Log→709 + look.").font(.caption2).foregroundStyle(.secondary) }
+    Section("ProRes Log extra (mestre)") {
+      Toggle("Gravar mestre ProRes junto", isOn: $on).disabled(recording)
+        .onChange(of: on) { _, v in ProResPrefs.enabled = v; if v { ProResUploader.shared.wake() } }
+      if on {
+        Picker("Em casa (Wi-Fi → PC)", selection: $home) { ForEach(ProResFlavor.allCases, id: \.self) { Text($0.label).tag($0) } }
+          .disabled(recording).onChange(of: home) { _, v in ProResPrefs.home = v }
+        Picker("Fora (internet → VPS)", selection: $away) { ForEach(ProResFlavor.allCases, id: \.self) { Text($0.label).tag($0) } }
+          .disabled(recording).onChange(of: away) { _, v in ProResPrefs.away = v }
+        Text(up.pcOnline ? "PC de casa achado na rede: o mestre vai direto pro F:\\CowboyRec (\(home.label))." : "PC de casa fora de alcance: o mestre vai pra VPS (\(away.label)) e o PC puxa de lá.").font(.caption)
+          .foregroundStyle(up.pcOnline ? .green : .secondary)
+        Text(String(format: "4K30: %@ ≈ %.1f GB/min · %@ ≈ %.1f GB/min. Gravando a 60, o mestre sai a 30 (sem SSD é o limite da Apple); a gravação de sempre continua igual. Cada pedaço de 2 s só sai do iPhone com recibo; o iPhone guarda só o que a rede ainda não levou. Fora de casa, no 4G, o HQ acumula no iPhone (sobe depois sozinho); com menos de 3 GB livres o mestre para e a gravação de sempre segue.",
+          home.label, ProResPolicy.gbPerMinute(home, width: 3840, height: 2160, fps: 30), away.label, ProResPolicy.gbPerMinute(away, width: 3840, height: 2160, fps: 30))).font(.caption2)
       }
-      if !masters.shown.isEmpty {
-        Text("Mestres ProRes").font(.caption.bold())
-        if !masters.line.isEmpty { Text(masters.line).font(.caption2) }
-        ForEach(masters.shown) { it in
-          VStack(alignment: .leading, spacing: 3) {
-            Text("\(it.created.formatted(date: .abbreviated, time: .shortened)) · \(it.flavor) · \(it.format) · \(gb(it.bytes))\(it.onSSD ? " · SSD" : "")").font(.caption)
-            Text(Self.label(it)).font(.caption2).foregroundStyle(it.state == "no-pc" || it.state == "na-nuvem" ? .green : it.state == "falhou" ? .red : .secondary)
-            if let n = it.note { Text(n).font(.caption2).foregroundStyle(.orange) }
-            if it.state != "gravando" && it.state != "subindo" {
-              Button(it.state == "no-pc" ? "Apagar do aparelho (já está no PC)" : "Apagar do aparelho", role: .destructive) { confirm = it }.buttonStyle(.bordered).font(.caption)
-            }
-          }
-        }
-        Button("Retomar envio dos mestres") { ProResMasters.shared.kick(); ProResMasters.shared.refreshRemote() }
-      }
+      if up.pendingGB > 0.01 { Text(String(format: "Mestre no iPhone esperando envio: %.1f GB", up.pendingGB)).font(.caption) }
+      if !up.line.isEmpty { Text(up.line).font(.caption2) }
+      if !up.notice.isEmpty { Text(up.notice).font(.caption2).foregroundStyle(.orange) }
+      Button("Procurar o PC / retomar envio") { ProResUploader.shared.wake() }
     }
-    .onAppear { ssd.refresh(); ProResMasters.shared.refreshRemote() }
-    .alert("Apagar o mestre ProRes do aparelho?", isPresented: Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } }), presenting: confirm) { it in
-      Button("Apagar", role: .destructive) { ProResMasters.shared.discard(it.cid) }
-      Button("Cancelar", role: .cancel) {}
-    } message: { it in
-      Text(it.state == "no-pc" ? "Ele já está no PC (sha256 conferido). Libera \(gb(it.bytes))." : it.state == "na-nuvem" ? "Ele está na VPS, mas o PC ainda não arquivou. Libera \(gb(it.bytes))." : "ATENÇÃO: este mestre ainda NÃO subiu. Apagar perde o ProRes (o proxy continua na nuvem).")
-    }
-  }
-  static func label(_ it: ProResMasters.Item) -> String {
-    switch it.state {
-    case "gravando": return "Gravando…"
-    case "pronto": return it.take == nil ? "No aparelho — espera a tomada do proxy chegar na VPS" : "No aparelho — sobe no Wi-Fi"
-    case "subindo": return String(format: "Subindo: %.0f%%", it.bytes > 0 ? Double(it.sent) / Double(it.bytes) * 100 : 0)
-    case "na-nuvem": return "Na VPS (sha256 conferido) — o PC puxa pro F:\CowboyRec"
-    case "no-pc": return "No PC (F:\CowboyRec) ✓"
-    default: return "Falhou — o arquivo fica no aparelho"
-    }
+    .onAppear { ProResUploader.shared.wake() }
   }
 }

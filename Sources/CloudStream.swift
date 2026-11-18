@@ -74,7 +74,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     kick()
     return cid
   }
-  /// número da tomada no servidor (se já foi registrada) — o mestre ProRes procura por aqui se nasceu depois
+  /// número da tomada no servidor (se já foi registrada) — o mestre ProRes leva junto pra o PC achar a tomada da galeria
   func takeID(_ cid: String) -> String? {
     lock.lock(); let mem = takes.first { $0.m.cid == cid }?.m.take; lock.unlock()
     if let mem { return mem }
@@ -272,7 +272,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
       let (code, j) = try await call("/api/rec/take", method: "POST", json: body, cookie: cookie)
       guard (200..<300).contains(code), let id = j["take"] as? String else { if code == 507 { await cloudFull(t, j["error"] as? String); return }; throw CloudCallError.http(code) }
       lock.lock(); t.m.take = id; lock.unlock(); save(t)
-      ProResMasters.shared.linkTake(cid: t.m.cid, take: id)   // 0.13.0: o mestre ProRes sobe anexado a esta tomada
+      ProResUploader.shared.linkTake(streamCid: t.m.cid, take: id)   // 0.13.0: o mestre ProRes leva o número desta tomada
     }
     if t.serverNext == nil {
       let (code, j) = try await call("/api/rec/take-status?take=\(t.m.take!)", cookie: cookie)
@@ -345,6 +345,8 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
   }
   private func setHealth(_ h: Health, _ text: String) { lock.lock(); netDown = h == .offline; lock.unlock(); publish { self.health = h; self.line = text } }
   var uploadMbps: Double { rate * 8 / 1_000_000 }
+  /// pedaços da gravação ao vivo ainda não enviados (o mestre ProRes cede a rede quando > 3)
+  var liveBacklog: Int { lock.lock(); defer { lock.unlock() }; return takes.filter { !$0.m.closed && $0.m.dead == nil }.reduce(0) { $0 + $1.mem.count + $1.disk.count } }
 
   private func call(_ path: String, method: String = "GET", json: [String: Any]? = nil, data: Data? = nil, cookie: String, type: String? = nil) async throws -> (Int, [String: Any]) {
     var request = URLRequest(url: URL(string: path, relativeTo: Self.origin)!.absoluteURL)
