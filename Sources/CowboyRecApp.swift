@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 
 @main struct CowboyRecApp: App {
+  @UIApplicationDelegateAdaptor(CowboyAppDelegate.self) private var appDelegate   // 0.13.2: envio em 2º plano
   var body: some Scene { WindowGroup { RecorderView() } }
 }
 
@@ -199,7 +200,8 @@ struct RecorderView: View {
     }
     .onChange(of: phase) { _, value in
       if value == .background { camera.close(); CloudStream.shared.enterBackground(); MotionHub.shared.stop() }
-      else if value == .active && portal == nil && !arPresentation && !photoMode && !scanMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick(); ProResUploader.shared.wake() } }
+      if value == .active { CloudStream.shared.leaveBackground() }   // 0.13.2: de volta à tela, o laço normal reassume (qualquer tela)
+      if value == .active && portal == nil && !arPresentation && !photoMode && !scanMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick(); ProResUploader.shared.wake() } }
     }
   }
 

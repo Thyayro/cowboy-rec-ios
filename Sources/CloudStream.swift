@@ -62,6 +62,18 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
   private var lastOk = Date.distantPast
   private var rate: Double = 0   // bytes/s medidos
   private var netDown = false
+  private var bgMode = false   // 0.13.2: app fora da tela — quem sobe é o iOS (BGUpload); o laço daqui espera
+
+  private init() {
+    // 0.13.2: aviso de memória do iOS = nada pode ficar só na RAM (17/11: a 0.11.10 segurava pedaços na memória no 4G,
+    // o iPhone esquentou, perdeu quadros e o iOS matou o app — 31 s da tomada 17:02 e 12 s da 17:07 sumiram)
+    NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: nil) { [weak self] _ in
+      guard let self else { return }
+      self.lock.lock(); let mb = self.takes.reduce(0) { $0 + $1.memBytes } / 1_048_576; self.lock.unlock()
+      self.spillAll()
+      Diag.step("memoria-aviso", ["fila_ram_mb": mb])
+    }
+  }
 
   private func publish(_ action: @escaping @Sendable () -> Void) { DispatchQueue.main.async(execute: action) }
 
@@ -127,6 +139,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
   }
   func enterBackground() {
     spillAll()
+    handOffToSystem()
     publish {
       guard self.background == .invalid else { return }
       self.background = UIApplication.shared.beginBackgroundTask(withName: "cowboy-upload") { [weak self] in
@@ -135,6 +148,60 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
       }
     }
   }
+  // ---- 0.13.2: envio em 2º plano (o iOS sobe com o app fora da tela / iPhone bloqueado / app fechado)
+  /// Ao sair do app: registra cada tomada no servidor (precisa do número dela) e entrega TODOS os pedaços do disco ao iOS.
+  private func handOffToSystem() {
+    lock.lock(); bgMode = true; lock.unlock()
+    Task.detached(priority: .userInitiated) { [weak self] in
+      guard let self, let cookie = await self.cookieProvider?(), !cookie.isEmpty else { return }
+      let already: Set<String> = await withCheckedContinuation { c in BGUpload.shared.pending { c.resume(returning: $0) } }
+      self.lock.lock(); let list = self.takes.filter { $0.m.dead == nil }; self.lock.unlock()
+      var queued = 0, takesN = 0
+      for t in list {
+        do { try await self.ensureServer(t, cookie: cookie) } catch { continue }
+        self.lock.lock()
+        guard let take = t.m.take, t.m.dead == nil else { self.lock.unlock(); continue }
+        let from = t.serverNext ?? 0
+        let seqs = t.disk.filter { $0 >= from }.sorted()
+        let dur = t.m.durationMs, cid = t.m.cid
+        self.lock.unlock()
+        var any = false
+        for s in seqs where !already.contains("\(cid)|\(s)") {
+          let f = t.dir.appendingPathComponent(String(format: "%06d.m4s", s))
+          guard FileManager.default.fileExists(atPath: f.path) else { continue }
+          BGUpload.shared.upload(file: f, take: take, cid: cid, seq: s, durationMs: dur, cookie: cookie)
+          queued += 1; any = true
+        }
+        if any { takesN += 1 }
+      }
+      Diag.step("envio-2o-plano", ["pedacos": queued, "tomadas": takesN, "ja_no_ios": already.count])
+    }
+  }
+  /// Voltou pra tela: cancela o que o iOS ainda não terminou e o laço normal segue de onde o servidor está (sem duplicar).
+  func leaveBackground() {
+    lock.lock(); let was = bgMode; bgMode = false; for t in takes { t.serverNext = nil }; lock.unlock()
+    guard was else { return }
+    BGUpload.shared.cancelAll { n in if n > 0 { Diag.step("envio-2o-plano-volta", ["canceladas": n]) } }
+    kick()
+  }
+  /// Resultado de um pedaço enviado pelo iOS (pode chegar com o app recém-acordado em 2º plano, sem a fila carregada:
+  /// trabalha direto nos arquivos). Só apaga do iPhone com recibo do servidor.
+  func bgDone(cid: String, seq: Int, code: Int, json: [String: Any]) {
+    guard (200..<300).contains(code) else { return }
+    let dir = root.appendingPathComponent(cid)
+    let next = json["next"] as? Int ?? 0
+    var gone = Set<Int>()
+    if json["held"] as? Bool == true || seq < next { gone.insert(seq) }
+    let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasSuffix(".m4s") }
+    for f in files { if let s = Int(f.replacingOccurrences(of: ".m4s", with: "")), s < next { gone.insert(s) } }
+    lock.lock()
+    let t = takes.first { $0.m.cid == cid }
+    for s in gone { try? FileManager.default.removeItem(at: dir.appendingPathComponent(String(format: "%06d.m4s", s))); t?.disk.remove(s); t?.mem[s] = nil }
+    if let t, next > (t.serverNext ?? 0) { t.serverNext = next }
+    lock.unlock()
+    refreshCounters()
+  }
+
   private func endBackground() {
     publish { if self.background != .invalid { UIApplication.shared.endBackgroundTask(self.background); self.background = .invalid } }
   }
@@ -212,6 +279,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     var backoff: UInt64 = 500_000_000
     while true {
       lock.lock()
+      if bgMode { running = false; lock.unlock(); return }   // 0.13.2: fora da tela quem sobe é o iOS (BGUpload)
       // recusada ainda gravando continua na lista (os pedaços seguintes ainda vão pro disco dela); sai só depois de fechada
       takes.removeAll { $0.m.dead != nil && $0.m.closed }
       let live = takes.filter { $0.m.dead == nil }
