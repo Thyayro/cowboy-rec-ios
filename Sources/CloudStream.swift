@@ -37,6 +37,9 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     var mem: [Int: Data] = [:]
     var disk = Set<Int>()
     var serverNext: Int?
+    var holdUntil = Date.distantPast   // 0.13.1: em espera depois de erros seguidos do servidor (as outras passam na frente)
+    var httpFails = 0
+    var gapSince: Date?                // 0.13.1: o pedaço que o servidor pede não existe no iPhone desde quando
     init(m: Manifest, dir: URL) { self.m = m; self.dir = dir }
     var memBytes: Int { mem.values.reduce(0) { $0 + $1.count } }
   }
@@ -163,6 +166,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     }
     refreshCounters()
     refreshKept()
+    reportQueue()
     kick()
   }
 
@@ -210,9 +214,17 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
       lock.lock()
       // recusada ainda gravando continua na lista (os pedaços seguintes ainda vão pro disco dela); sai só depois de fechada
       takes.removeAll { $0.m.dead != nil && $0.m.closed }
-      guard let t = takes.first(where: { $0.m.dead == nil }) else {
+      let live = takes.filter { $0.m.dead == nil }
+      guard !live.isEmpty else {
         running = false; let k = keptCount; lock.unlock()
         setHealth(k == 0 ? .idle : .error, k == 0 ? "Tudo na nuvem" : "\(k) gravação(ões) guardada(s) no iPhone — veja em Ajustes"); endBackground(); return
+      }
+      // 0.13.1: uma tomada com erro do servidor NUNCA segura a fila (18/11: a tomada 17/11 17:02 parou no pedaço 15 e
+      // nada mais subiu — nem as tomadas novas). A que está em espera vai pro fim; as outras sobem.
+      let now = Date()
+      guard let t = live.first(where: { $0.holdUntil <= now }) else {
+        let wait = live.map { $0.holdUntil }.min()!.timeIntervalSince(now); lock.unlock()
+        try? await Task.sleep(nanoseconds: UInt64(max(0.5, min(wait, 30)) * 1e9)); continue
       }
       lock.unlock()
       guard let cookie = await cookieProvider?(), !cookie.isEmpty else {
@@ -231,6 +243,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
             ack(t, below: next)
             let dt = Date().timeIntervalSince(t0); if dt > 0 { rate = rate == 0 ? Double(data.count) / dt : rate * 0.7 + Double(data.count) / dt * 0.3 }
             lastOk = Date(); backoff = 500_000_000
+            lock.lock(); t.httpFails = 0; t.gapSince = nil; lock.unlock()
             let behind = pendingCount(t)
             setHealth(behind > 3 ? .slow : .ok, behind > 3 ? "Rede lenta — \(behind) s na fila (sobe sozinho)" : "Gravando direto na nuvem")
           case 409:
@@ -249,10 +262,19 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
           try await finish(t, chunks: produced, cookie: cookie)
           continue
         }
+        if skipGap(t) { continue }   // 0.13.1: pedaço que o servidor pede sumiu do iPhone — antes ficava esperando pra sempre
         try? await Task.sleep(nanoseconds: 120_000_000)   // esperando o próximo pedaço da gravação
       } catch {
         spillAll()
-        setHealth(.offline, "Sem rede — guardando no iPhone, sobe quando voltar")
+        if case CloudCallError.http(let code) = error {
+          // o servidor respondeu (a rede está boa): erro repetido nesta tomada → ela espera 60 s no fim da fila
+          lock.lock(); t.httpFails += 1; let n = t.httpFails; if n >= 3 { t.holdUntil = Date().addingTimeInterval(60) }; let pend = t.disk.count + t.mem.count; lock.unlock()
+          if n == 1 || n % 10 == 0 { Diag.step("stream-erro-http", ["cid": t.m.cid, "take": t.m.take ?? "", "http": code, "pedaco": t.serverNext ?? -1, "falhas": n, "na_fila": pend]) }
+          setHealth(.error, "Servidor recusou (HTTP \(code)) — tenta de novo sozinho; as outras tomadas seguem")
+          if n >= 3 { continue }
+        } else {
+          setHealth(.offline, "Sem rede — guardando no iPhone, sobe quando voltar")
+        }
         try? await Task.sleep(nanoseconds: backoff); backoff = min(backoff * 2, 8_000_000_000)
       }
     }
@@ -296,6 +318,42 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     for s in gone { t.disk.remove(s); try? FileManager.default.removeItem(at: t.dir.appendingPathComponent(String(format: "%06d.m4s", s))) }
     lock.unlock()
     refreshCounters()
+  }
+  /// 0.13.1 — tomada FECHADA cujo pedaço pedido pelo servidor não existe mais no iPhone (sumiu/ilegível), mas há pedaços
+  /// depois dele: renumera o que sobrou pra continuar dali (o MP4 fragmentado toca, só pula o trecho perdido — mesma regra
+  /// da retomada). Antes a fila ficava esperando esse pedaço pra sempre e NENHUMA tomada subia mais.
+  private func skipGap(_ t: Take) -> Bool {
+    lock.lock()
+    guard t.m.closed, let next = t.serverNext, t.mem[next] == nil else { lock.unlock(); return false }
+    if t.disk.contains(next) { t.disk.remove(next) }   // listado mas ilegível (nextItem não conseguiu ler)
+    let ahead = Set(t.mem.keys).union(t.disk).filter { $0 > next }.sorted()
+    guard let first = ahead.first else { lock.unlock(); return false }
+    let shift = first - next
+    for s in ahead {
+      if let d = t.mem.removeValue(forKey: s) { t.mem[s - shift] = d }
+      if t.disk.remove(s) != nil {
+        let from = t.dir.appendingPathComponent(String(format: "%06d.m4s", s)), to = t.dir.appendingPathComponent(String(format: "%06d.m4s", s - shift))
+        try? FileManager.default.removeItem(at: to)
+        if (try? FileManager.default.moveItem(at: from, to: to)) != nil { t.disk.insert(s - shift) }
+      }
+    }
+    t.m.produced = max(next, t.m.produced - shift)
+    let left = t.disk.count + t.mem.count
+    lock.unlock()
+    save(t)
+    Diag.step("stream-buraco", ["cid": t.m.cid, "take": t.m.take ?? "", "faltou_de": next, "faltou_ate": first - 1, "restam": left])
+    return true
+  }
+  /// 0.13.1 — retrato da fila ao abrir o app (prova do que está preso no iPhone, sem precisar de print do operador)
+  func reportQueue() {
+    lock.lock()
+    let rows = takes.map { t -> String in
+      let seqs = Set(t.mem.keys).union(t.disk)
+      return "\(t.m.title)|\(t.m.cid.suffix(6))|take=\(t.m.take ?? "-")|fech=\(t.m.closed ? 1 : 0)|prod=\(t.m.produced)|srv=\(t.serverNext.map(String.init) ?? "?")|n=\(seqs.count)|min=\(seqs.min().map(String.init) ?? "-")|dead=\(t.m.dead ?? "")"
+    }
+    let kept = keptCount
+    lock.unlock()
+    Diag.step("stream-fila", ["n": rows.count, "guardadas": kept, "fila": rows.prefix(12).joined(separator: " ; ")])
   }
   private func pendingCount(_ t: Take) -> Int { lock.lock(); defer { lock.unlock() }; return t.mem.count + t.disk.count }
   private func finish(_ t: Take, chunks: Int, cookie: String) async throws {
