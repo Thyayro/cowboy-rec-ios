@@ -45,7 +45,7 @@ import Foundation
     // ProRes: sem SSD, 4K60 cai pra 4K30 (mesmo tamanho); com SSD fica 4K60; 1080p60 cabe no interno
     let pr=[NativeCaptureProfile(width:3840,height:2160,fps:24),NativeCaptureProfile(width:3840,height:2160,fps:30),NativeCaptureProfile(width:3840,height:2160,fps:60),NativeCaptureProfile(width:1920,height:1080,fps:60),NativeCaptureProfile(width:1920,height:1080,fps:120)]
     assert(ProResPolicy.cap(.main,external:false,options:pr)==NativeCaptureProfile(width:3840,height:2160,fps:30),"ProRes 4K60 interno tem que cair pra 4K30")
-    assert(ProResPolicy.cap(.main,external:true,options:pr)==.main,"com SSD o ProRes grava 4K60")
+    assert(ProResPolicy.cap(.main,external:true,options:pr) == .main,"com SSD o ProRes grava 4K60")
     assert(ProResPolicy.cap(NativeCaptureProfile(width:1920,height:1080,fps:60),external:false,options:pr).fps==60)
     let pr2=[NativeCaptureProfile(width:3840,height:2160,fps:29.97),NativeCaptureProfile(width:3840,height:2160,fps:59.94)]
     assert(ProResPolicy.cap(NativeCaptureProfile(width:3840,height:2160,fps:59.94),external:false,options:pr2).fps==29.97)
