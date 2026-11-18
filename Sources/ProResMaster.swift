@@ -17,7 +17,7 @@ import UIKit
 enum ProResPrefs {
   private static let d = UserDefaults.standard
   static var enabled: Bool { get { d.object(forKey: "proresExtra") as? Bool ?? true } set { d.set(newValue, forKey: "proresExtra") } }
-  static var home: ProResFlavor { get { ProResFlavor(rawValue: d.string(forKey: "proresHome") ?? "") ?? .lt } set { d.set(newValue.rawValue, forKey: "proresHome") } }
+  static var home: ProResFlavor { get { ProResFlavor(rawValue: d.string(forKey: "proresHome") ?? "") ?? .hq } set { d.set(newValue.rawValue, forKey: "proresHome") } }
   static var away: ProResFlavor { get { ProResFlavor(rawValue: d.string(forKey: "proresAway") ?? "") ?? .hq } set { d.set(newValue.rawValue, forKey: "proresAway") } }
 }
 
