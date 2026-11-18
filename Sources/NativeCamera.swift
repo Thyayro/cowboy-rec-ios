@@ -153,6 +153,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   private var requestedHDR = false
   private var requestedLog = UserDefaults.standard.bool(forKey: "log")
   private var requestedCodec = AVVideoCodecType.hevc
+  // PRORES (0.13.0): mestre ProRes no aparelho/SSD + proxy 1080p HEVC Log ao vivo (ver ProResMaster.swift)
+  private var requestedProRes = UserDefaults.standard.bool(forKey: "prores")
+  private var userProfile: NativeCaptureProfile?   // o formato que o operador escolheu (o ProRes sem SSD pode gravar menos)
+  private var masterWriter: SegmentWriter?          // só dataQueue
+  private var masterCid: String?
+  private var masterFailed = false
   private var availableDevices: [AVCaptureDevice] = []
   private var previewAngle: Double = 90
   private var telemetry: DispatchSourceTimer?
@@ -191,6 +197,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var convertRec709 = UserDefaults.standard.object(forKey: "conv709") as? Bool ?? true { didSet { UserDefaults.standard.set(convertRec709, forKey: "conv709") } }
   @Published var codecs: [String] = []
   @Published var codec = "hvc1"
+  @Published var proresOn = UserDefaults.standard.bool(forKey: "prores")
+  @Published var proresFlavors: [String] = []     // ProResFlavor.rawValue que o gravador deste iPhone aceita
+  @Published var proresFlavor = ProResFlavor(rawValue: UserDefaults.standard.string(forKey: "proresFlavor") ?? "")?.rawValue ?? ProResFlavor.hq.rawValue
+  @Published var proresCapped = false             // sem SSD: o formato escolhido caiu pro limite interno (4K30)
+  @Published var proresWanted = ""                // rótulo do formato escolhido (quando caiu)
   @Published var torchAvailable = false
   @Published var torchEnabled = false
   @Published var focusAvailable = false
@@ -505,6 +516,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       // trocando de câmera: a frontal pode não ter 4K60 — usa o melhor que ela tiver no mesmo qps, senão o melhor geral
       if let best = NativeCapturePolicy.profiles(catalog, hdr: wantsHDR, log: wantsLog).first(where: { abs($0.fps - chosen.fps) < 0.5 }) ?? NativeCapturePolicy.profiles(catalog, hdr: wantsHDR, log: wantsLog).first { chosen = best }
     }
+    if profile == nil, let u = userProfile, u != chosen, NativeCapturePolicy.select(u, hdr: wantsHDR, formats: catalog, log: wantsLog) != nil { chosen = u }
+    var proCapped = false, proWanted = chosen
+    if requestedProRes {
+      chosen = ProResPolicy.cap(proWanted, external: ExternalSSD.shared.connected, options: NativeCapturePolicy.profiles(catalog, hdr: wantsHDR, log: wantsLog))
+      proCapped = chosen != proWanted
+    }
     guard let index = NativeCapturePolicy.select(chosen, hdr: wantsHDR, formats: catalog, log: wantsLog) else {
       throw failure("\(name(cam)) não tem \(chosen.label)\(wantsLog ? " em Apple Log" : wantsHDR ? " HDR" : ""). Escolha outro formato — a qualidade não é reduzida sozinha.")
     }
@@ -713,6 +730,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let hdrOK = catalog.contains { $0.supports(chosen, hdr: true) }
       let logOK = catalog.contains { $0.supports(chosen, hdr: false, log: true) }
       let codecNames = videoOut.availableVideoCodecTypes.filter { $0 == .hevc || $0 == .h264 }.map { $0.rawValue }
+      var movCodecs: [AVVideoCodecType] = []
+      _ = CowboyObjC.catching { movCodecs = self.videoOut.availableVideoCodecTypesForAssetWriter(writingTo: .mov) }
+      let proFlavors = ProResFlavor.allCases.map { $0.rawValue }.filter { r in movCodecs.contains { $0.rawValue == r } }
+      if requestedProRes { Diag.step("prores-config", ["sabores": proFlavors.joined(separator: ","), "formato": chosen.label, "escolhido": proWanted.label, "caiu": proCapped, "ssd": ExternalSSD.shared.connected], send: false) }
+      let proWantedLabel = proWanted.label
       let display = name(cam), minimumISO = Double(cam.activeFormat.minISO), maximumISO = Double(cam.activeFormat.maxISO)
       let exposureMinimum = CMTimeGetSeconds(cam.activeFormat.minExposureDuration)
       let dims = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
@@ -727,6 +749,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         self.profiles = options; self.profileID = chosen.id; self.formatLabel = chosen.label; self.formatShort = chosen.short
         self.hdrAvailable = hdrOK; self.hdrEnabled = wantsHDR; self.logAvailable = logOK; self.logEnabled = wantsLog
         self.codecs = codecNames; self.codec = encoding.rawValue; self.front = isFront; self.fieldOfView = fov
+        self.proresFlavors = proFlavors; self.proresCapped = proCapped; self.proresWanted = proCapped ? proWantedLabel : ""
         self.videoSize = isFront ? frontShown : shown
         self.torchAvailable = cam.hasTorch; self.torchEnabled = cam.torchMode == .on
         self.focusAvailable = cam.isFocusModeSupported(.locked) && cam.isLockingFocusWithCustomLensPositionSupported; self.manualFocus = false
@@ -776,12 +799,31 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   func selectProfile(_ id: String) {
     reconfigure {
       guard let cam = self.device, let p = NativeCapturePolicy.profiles(self.descriptors(cam), hdr: self.requestedHDR, log: self.requestedLog).first(where: { $0.id == id }) else { throw self.failure("Formato indisponível") }
+      self.userProfile = p
       try self.configure(profile: p)
     }
   }
   func setHDR(_ enabled: Bool) { reconfigure { try self.configure(hdr: enabled, log: false) } }
   func setLog(_ enabled: Bool) { reconfigure { try self.configure(hdr: false, log: enabled) } }
   func setCodec(_ value: String) { reconfigure { try self.configure(codec: AVVideoCodecType(rawValue: value)) } }
+  /// HEVC (direto na nuvem) × ProRes (mestre no aparelho/SSD + proxy ao vivo). Troca o teto de formato (4K30 sem SSD).
+  func setProRes(_ on: Bool) {
+    UserDefaults.standard.set(on, forKey: "prores")
+    publish { self.proresOn = on }
+    if on { DispatchQueue.main.async { ExternalSSD.shared.start() } }
+    reconfigure { self.requestedProRes = on; try self.configure() }
+  }
+  func setProResFlavor(_ raw: String) {
+    guard ProResFlavor(rawValue: raw) != nil else { return }
+    UserDefaults.standard.set(raw, forKey: "proresFlavor"); publish { self.proresFlavor = raw }
+  }
+  /// SSD ligado/desligado: refaz o teto do formato (parado). Gravando, a tomada segue até parar.
+  func ssdChanged() {
+    queue.async {
+      guard self.requestedProRes, self.configured, !self.isRecording else { return }
+      self.reconfigure { try self.configure() }
+    }
+  }
   func setStabilization(_ value: Int) {
     UserDefaults.standard.set(value, forKey: "stab")
     queue.async {
@@ -975,7 +1017,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // digital só se o arquivo for convertido no iPhone (o shader amplia o quadro); senão a tela mostraria o que o arquivo não tem
   // 0.9.3: pinça partindo do 0,5× vai pela ultra até o MÁXIMO da câmera (o mesmo teto da pinça nas outras lentes, até 25×).
   // O teto fixo 2,0 parava a pinça em 0,99 × 2 ≈ 2× (reclamação do filmmaker 10/10).
-  var maxDigital: Double { bake709 ? max(1, maximumZoom / Self.ultraEdge) : 1.0 }
+  var maxDigital: Double { bake709 && !proresOn ? max(1, maximumZoom / Self.ultraEdge) : 1.0 }   // ProRes = Log puro (sem shader no arquivo)
   // PINÇA (0.9.1): APROXIMANDO = tela "na hora" (amplia o quadro atrasado pelo zoom medido); AFASTANDO = a tela mostra o
   // quadro como ele é (contínuo, igual ao arquivo). Afastar "na hora" só ia até a borda do quadro atrasado e o resto chegava
   // 0,55 s depois — medido nos trechos da 0.9.0: 0,60 -> pausa -> 0,41 = o pulo no arrasto. O modo é escolhido no começo do
@@ -1248,6 +1290,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let convert = convertRec709, bitrate = Self.bitrates[max(0, min(Self.bitrates.count - 1, bitrateChoice))].bps
     let fxLive = motionBlur && !fxRender, fxRend = motionBlur && fxRender, fxDeg = blurAngle
     let mistL = Mist.level(mistLevel)
+    let proFlavor = proresOn ? ProResFlavor(rawValue: proresFlavor) : nil
     let horizon: Double? = rotation.map { Double($0.videoRotationAngleForHorizonLevelCapture) }   // lido na thread principal
     queue.async {
       guard self.configured, self.session.isRunning, !self.isRecording, let cam = self.device else { return }
@@ -1261,16 +1304,63 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           Diag.step("idle-rate", ["qps": fps, "por": "gravar"])
         }
         let source: SourceColor = self.requestedLog ? .appleLog : self.requestedHDR ? .hlg : .sdr
-        var bakeFn = self.bake709 ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
-        if bakeFn == nil && self.bake709 && mistL != nil { bakeFn = { $0 } }   // SDR natural com névoa: o shader passa a cor igual e aplica a névoa
+        // ProRes = mestre em Log puro (sem conversão no arquivo); a tela segue com Log→709 + look no shader
+        let bakeOn = self.bake709 && proFlavor == nil
+        var bakeFn = bakeOn ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
+        if bakeFn == nil && bakeOn && mistL != nil { bakeFn = { $0 } }   // SDR natural com névoa: o shader passa a cor igual e aplica a névoa
         let incoming = (self.videoOut.videoSettings?[kCVPixelBufferPixelFormatTypeKey as String] as? NSNumber)?.uint32Value ?? CMFormatDescriptionGetMediaSubType(cam.activeFormat.formatDescription)
         if bakeFn != nil && !LutBaker.supports(incoming) { Diag.step("bake-unsupported", ["fmt": incoming]) }
         let baker = LutBaker.supports(incoming) ? bakeFn.flatMap { LutBaker(transform: $0) } : nil
         if bakeFn != nil && baker == nil { Diag.step("bake-init-fail") }
         var (videoSettings, how) = self.writerVideoSettings(cam, bake: baker != nil)
+        // ---- PRORES (0.13.0): mestre ProRes em arquivo no SSD/iPhone + proxy 1080p HEVC Log no lugar do 4K que subia
+        var master: SegmentWriter?, masterURL: URL?, masterSSD = false, proActive: ProResFlavor?
+        let dims = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
+        let (pw, ph) = ProResPolicy.proxySize(width: Int(dims.width), height: Int(dims.height))
+        if let proFlavor {
+          let need = ProResPolicy.gbPerMinute(proFlavor, self.selectedProfile) * 1e9 * 2   // pelo menos 2 min de espaço
+          if case let (url, ssd)? = ProResMasters.shared.newFile(cid: UUID().uuidString) {
+            let free = ssd ? Double(ExternalSSD.shared.info?.freeBytes ?? 0) : Double((try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? 0)
+            if free < need {
+              Diag.step("prores-sem-espaco", ["livre_gb": free / 1e9, "ssd": ssd])
+              let gb = free / 1e9
+              self.publish { self.status = String(format: "Pouco espaço pro ProRes (%.1f GB livres) — gravando em HEVC Log como antes", gb) }
+            } else {
+              let codec = AVVideoCodecType(rawValue: proFlavor.rawValue)
+              var mv: [String: Any] = [AVVideoCodecKey: codec, AVVideoWidthKey: Int(dims.width), AVVideoHeightKey: Int(dims.height)]
+              var rec: [String: Any]?
+              if CowboyObjC.catching({ rec = self.videoOut.recommendedVideoSettings(forVideoCodecType: codec, assetWriterOutputFileType: .mov) }) == nil, let rec, rec[AVVideoWidthKey] != nil,
+                (rec[AVVideoCodecKey] as? AVVideoCodecType) == codec || (rec[AVVideoCodecKey] as? String) == codec.rawValue { mv = rec }
+              let pcm: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVLinearPCMBitDepthKey: 24,
+                AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]
+              let aac: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 320000]
+              let isFront0 = cam.position == .front
+              let mt = CGAffineTransform(rotationAngle: CGFloat((isFront0 ? 0 : (horizon ?? self.previewAngle)) * .pi / 180))
+              do {
+                var w = try SegmentWriter.make(video: mv, audio: pcm, transform: mt, file: url)
+                if !w.hasAudio { try? FileManager.default.removeItem(at: url); w = try SegmentWriter.make(video: mv, audio: aac, transform: mt, file: url) }
+                master = w; masterURL = url; masterSSD = ssd; proActive = proFlavor
+                Diag.step("prores-writer", ["sabor": proFlavor.label, "ssd": ssd, "fmt": self.selectedProfile.label, "audio": w.hasAudio, "video": String(String(describing: mv).prefix(400))])
+              } catch {
+                Diag.step("prores-writer-fail", ["err": error.localizedDescription, "sabor": proFlavor.label, "ssd": ssd])
+                let why = error.localizedDescription
+                self.publish { self.status = "O iPhone recusou o ProRes (\(why)) — gravando em HEVC Log como antes" }
+              }
+            }
+          } else { self.publish { self.status = "Sem lugar pro mestre ProRes — gravando em HEVC Log como antes" } }
+        }
+        if proActive != nil {
+          var comp: [String: Any] = [AVVideoAverageBitRateKey: ProResPolicy.proxyBitrate(fps: self.selectedProfile.fps), AVVideoMaxKeyFrameIntervalDurationKey: 1.0,
+            AVVideoExpectedSourceFrameRateKey: Int(self.selectedProfile.fps.rounded()), AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String]
+          comp[AVVideoAllowFrameReorderingKey] = true
+          var proxy: [String: Any] = [AVVideoCodecKey: AVVideoCodecType.hevc, AVVideoWidthKey: pw, AVVideoHeightKey: ph, AVVideoScalingModeKey: AVVideoScalingModeResizeAspect, AVVideoCompressionPropertiesKey: comp]
+          if self.requestedHDR { proxy[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG, AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020] }
+          else if !self.requestedLog { proxy[AVVideoColorPropertiesKey] = [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2, AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2, AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2] }
+          videoSettings = proxy; how = "proxy-\(min(pw, ph))p"
+        }
         var compression = (videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any]) ?? [:]
         let codecName = (videoSettings[AVVideoCodecKey] as? AVVideoCodecType)?.rawValue ?? (videoSettings[AVVideoCodecKey] as? String) ?? ""
-        if codecName == AVVideoCodecType.hevc.rawValue || codecName == AVVideoCodecType.h264.rawValue {
+        if proActive == nil && (codecName == AVVideoCodecType.hevc.rawValue || codecName == AVVideoCodecType.h264.rawValue) {
           compression[AVVideoMaxKeyFrameIntervalDurationKey] = 1.0
           compression[AVVideoExpectedSourceFrameRateKey] = Int(self.selectedProfile.fps.rounded())
           if let bitrate { compression[AVVideoAverageBitRateKey] = bitrate }
@@ -1303,6 +1393,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let colorProfile = baker != nil ? "rec709" : self.requestedLog ? "applelog" : self.requestedHDR ? "hlg" : "rec709"
         var meta = NativeCaptureMetadata(width: profile.width, height: profile.height, frameRate: profile.fps, hdr: self.requestedHDR, codec: self.requestedCodec.rawValue, lens: self.name(cam), stabilization: Self.label(mode), colorProfile: colorProfile, convertRec709: convert, captureMode: "avfoundation-stream").settings
         if baker != nil { meta["baked"] = "\(source == .appleLog ? "Apple Log" : source == .hlg ? "HLG" : "SDR") -> Rec.709\(look.neutral ? "" : " + look " + look.label) (no iPhone, 10 bits)" }
+        if let proActive, let masterURL {
+          meta["prores"] = ["sabor": proActive.label, "codec": proActive.rawValue, "destino": masterSSD ? "ssd" : "iphone", "formato": profile.label, "arquivo": masterURL.lastPathComponent,
+            "gb_min": (ProResPolicy.gbPerMinute(proActive, profile) * 10).rounded() / 10]
+          meta["proxy"] = "\(pw)x\(ph) HEVC 10 bits"; meta["width"] = pw; meta["height"] = ph; meta["codec"] = "hvc1"
+        }
         meta["zoom"] = Double(cam.videoZoomFactor / self.base); meta["bitrate"] = bitrate ?? (compression[AVVideoAverageBitRateKey] as? Int ?? 0); meta["rotation"] = angle
         // efeitos (0.8.9): live = já no arquivo; render = a VPS aplica pelo arquivo .fx; live sem conversão no iPhone = só na tela
         meta["efeitos"] = fxRend ? "render" : fxLive ? (baker != nil ? "live" : "live-so-tela") : "off"
@@ -1317,7 +1412,10 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           try JSONEncoder().encode(owner).write(to: localFile.appendingPathExtension("owner"), options: .atomic)
           let m = NativeCaptureMetadata(width: profile.width, height: profile.height, frameRate: profile.fps, hdr: self.requestedHDR, codec: self.requestedCodec.rawValue, lens: self.name(cam), stabilization: Self.label(mode), colorProfile: colorProfile, convertRec709: convert, captureMode: "avfoundation-file")
           try JSONEncoder().encode(m).write(to: localFile.appendingPathExtension("capture"), options: .atomic)
+          let localCid = "local" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16).lowercased()
+          if let masterURL, let proActive { ProResMasters.shared.begin(cid: localCid, owner: owner, url: masterURL, onSSD: masterSSD, flavor: proActive, format: profile.label); ProResMasters.shared.paused = true }
           self.dataQueue.async {
+            self.masterWriter = master; self.masterCid = master == nil ? nil : localCid; self.masterFailed = false
             self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
             self.recBaker = baker; self.recMist = mistFile
             self.fileBlur = fxLive && baker != nil; self.fxLogOn = false; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
@@ -1326,7 +1424,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           }
           return
         }
-        let cid = CloudStream.shared.begin(owner: owner, title: "iPhone \(f.string(from: Date()))", body: body)
+        let cid = CloudStream.shared.begin(owner: owner, title: "iPhone \(f.string(from: Date()))\(proActive != nil ? " · ProRes" : "")", body: body)
+        if let masterURL, let proActive { ProResMasters.shared.begin(cid: cid, owner: owner, url: masterURL, onSSD: masterSSD, flavor: proActive, format: profile.label); ProResMasters.shared.paused = true }
         if !look.neutral && baker == nil {
           let text = ColorMath.cubeText(title: "Cowboy \(look.label)") { ColorMath.grade($0, look.p) }
           CloudStream.shared.side(cid, kind: "cube", data: Data(text.utf8))
@@ -1354,6 +1453,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           } catch { Diag.step("ig-live-writer-fail", ["err": error.localizedDescription]); uplink.close() }
         }
         self.dataQueue.async {
+          self.masterWriter = master; self.masterCid = master == nil ? nil : cid; self.masterFailed = false
           self.liveWriter = liveW; self.liveUplink = liveW == nil ? nil : uplink; self.liveLastPTS = 0
           if liveW != nil { self.publish { self.onLiveStarted?() } }
           self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
@@ -1409,6 +1509,14 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     dataQueue.async {
       guard let writer = self.writer else { self.publish { self.finishing = false }; return }
       self.writer = nil
+      if let mw = self.masterWriter, let mcid = self.masterCid {
+        self.masterWriter = nil; self.masterCid = nil
+        mw.finish { ok in
+          Diag.step("stop-prores", ["ok": ok, "v": mw.vOK, "a": mw.aOK, "drop": mw.dropped, "err": mw.failed ?? ""])
+          ProResMasters.shared.finished(cid: mcid, ok: ok, note: mw.failed)
+          ProResMasters.shared.paused = false
+        }
+      }
       self.applyIdleRate()
       if let b = self.recBaker, b.failures > 0 { Diag.step("bake-failures", ["n": b.failures, "err": b.lastError]) }
       self.recBaker = nil
@@ -1497,7 +1605,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     if output === audioOut {
       meter(sampleBuffer)
       let clean = noise.process(sampleBuffer)   // roda sempre (a estimativa do ruído fica pronta antes de gravar)
-      if !stopping { writer?.appendAudio(clean ?? sampleBuffer); liveWriter?.appendAudio(clean ?? sampleBuffer) }
+      if !stopping { masterWriter?.appendAudio(clean ?? sampleBuffer); writer?.appendAudio(clean ?? sampleBuffer); liveWriter?.appendAudio(clean ?? sampleBuffer) }
       return
     }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
@@ -1534,6 +1642,14 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         shading: (Float(LensShading.k(lens: pixel.flatMap { LensID.name($0) })), Float(renderer.frameZoom?(pts.seconds) ?? zoomDriver.lastSet?.1 ?? 1)))
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
+    if let mw = masterWriter {   // mestre ProRes: quadro do sensor como chegou (Log 10 bits), antes do proxy
+      mw.appendVideo(sampleBuffer)
+      if !masterFailed, let f = mw.failed {
+        masterFailed = true
+        Diag.step("prores-writer-error", ["err": f, "v": mw.vOK, "drop": mw.dropped])
+        publish { self.status = "ProRes parou (\(f)) — o proxy segue gravando; o que o mestre salvou fica no aparelho" }
+      }
+    }
     writer.appendVideo(baked ?? sampleBuffer)
     if let lw = liveWriter, pts.seconds - liveLastPTS >= 1.0 / 30 - 0.004 { liveLastPTS = pts.seconds; lw.appendVideo(baked ?? sampleBuffer) }   // live: 30 qps
     if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds) }
@@ -1568,7 +1684,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let now = CACurrentMediaTime()
     if now - lastPublish > 0.25 {
       lastPublish = now
-      let e = Double(elapsedMs) / 1000, d = writer.dropped, failed = writer.failed
+      let e = Double(elapsedMs) / 1000, d = writer.dropped + (masterWriter?.dropped ?? 0), failed = writer.failed
       publish { self.elapsed = e; self.droppedFrames = d; if let failed { self.status = "Gravador: \(failed)" } }
       if let failed { Diag.step("writer-error", ["err": failed]); stopRecording() }
     }

@@ -74,6 +74,13 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     kick()
     return cid
   }
+  /// número da tomada no servidor (se já foi registrada) — o mestre ProRes procura por aqui se nasceu depois
+  func takeID(_ cid: String) -> String? {
+    lock.lock(); let mem = takes.first { $0.m.cid == cid }?.m.take; lock.unlock()
+    if let mem { return mem }
+    guard let d = try? Data(contentsOf: root.appendingPathComponent(cid).appendingPathComponent("take.json")), let m = try? JSONDecoder().decode(Manifest.self, from: d) else { return nil }
+    return m.take
+  }
   func sideFile(_ cid: String, kind: String) -> URL { root.appendingPathComponent(cid).appendingPathComponent("side." + kind) }
   func push(_ cid: String, _ data: Data, durationMs: Int) {
     lock.lock()
@@ -265,6 +272,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
       let (code, j) = try await call("/api/rec/take", method: "POST", json: body, cookie: cookie)
       guard (200..<300).contains(code), let id = j["take"] as? String else { if code == 507 { await cloudFull(t, j["error"] as? String); return }; throw CloudCallError.http(code) }
       lock.lock(); t.m.take = id; lock.unlock(); save(t)
+      ProResMasters.shared.linkTake(cid: t.m.cid, take: id)   // 0.13.0: o mestre ProRes sobe anexado a esta tomada
     }
     if t.serverNext == nil {
       let (code, j) = try await call("/api/rec/take-status?take=\(t.m.take!)", cookie: cookie)

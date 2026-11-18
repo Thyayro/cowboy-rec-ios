@@ -65,3 +65,33 @@ struct NativeCaptureMetadata: Codable, Sendable {
   var captureMode: String? = nil
   var settings: [String:Any] { ["width":width,"height":height,"frameRate":frameRate,"hdr":hdr,"codec":codec,"lens":lens,"native_stabilization":stabilization,"capture_mode":captureMode ?? "avfoundation","color_profile":colorProfile ?? (hdr ? "hlg" : "rec709")] }
 }
+
+// PRORES (0.13.0): o iPhone 16 Pro grava ProRes (422 HQ / 422 / 422 LT) com Apple Log. Regra da Apple: no armazenamento
+// INTERNO vai até 4K30; 4K60 (e acima) só gravando direto num SSD externo pelo USB-C. A conta é por taxa de pixels
+// (largura × altura × qps ≤ 4K30), então 1080p60 continua valendo no iPhone. Puro (sem AVFoundation) pra rodar no CI.
+enum ProResFlavor: String, CaseIterable, Sendable {
+  case hq = "apch", standard = "apcn", lt = "apcs"
+  var label: String { switch self { case .hq: return "422 HQ"; case .standard: return "422"; case .lt: return "422 LT" } }
+  /// taxa de referência da Apple em 3840×2160 a 29,97 qps (white paper do ProRes)
+  var mbps4K30: Double { switch self { case .hq: return 707; case .standard: return 471; case .lt: return 328 } }
+}
+enum ProResPolicy {
+  static let internalPixelRate = 3840.0 * 2160.0 * 30.5
+  static func pixelRate(_ p: NativeCaptureProfile) -> Double { Double(p.width * p.height) * p.fps }
+  /// Formato que vale de verdade: o escolhido, ou — sem SSD — o mais rápido do MESMO tamanho que cabe no limite interno.
+  static func cap(_ p: NativeCaptureProfile, external: Bool, options: [NativeCaptureProfile]) -> NativeCaptureProfile {
+    guard !external, pixelRate(p) > internalPixelRate else { return p }
+    let fits = options.filter { pixelRate($0) <= internalPixelRate }
+    if let same = fits.filter({ $0.width == p.width && $0.height == p.height }).max(by: { $0.fps < $1.fps }) { return same }
+    return fits.max { a, b in a.width * a.height == b.width * b.height ? a.fps < b.fps : a.width * a.height < b.width * b.height } ?? p
+  }
+  static func mbps(_ f: ProResFlavor, _ p: NativeCaptureProfile) -> Double { f.mbps4K30 * pixelRate(p) / (3840.0 * 2160.0 * 29.97) }
+  /// gigabytes por minuto de gravação (vídeo; o áudio PCM soma ~17 MB/min)
+  static func gbPerMinute(_ f: ProResFlavor, _ p: NativeCaptureProfile) -> Double { mbps(f, p) * 60 / 8 / 1000 }
+  /// proxy que sobe ao vivo enquanto o mestre ProRes grava no aparelho: 1080p HEVC Log (decisão do operador 17/11)
+  static func proxySize(width: Int, height: Int) -> (Int, Int) {
+    let long = 1920, short = max(2, Int((Double(long) * Double(min(width, height)) / Double(max(1, max(width, height))) / 2).rounded()) * 2)
+    return width >= height ? (long, short) : (short, long)
+  }
+  static func proxyBitrate(fps: Double) -> Int { fps > 31 ? 24_000_000 : 20_000_000 }
+}

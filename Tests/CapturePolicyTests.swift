@@ -42,6 +42,17 @@ import Foundation
     assert(ZoomMath.label(0.5)=="0,5×" && ZoomMath.label(5)=="5×")
     let c=Framing.crop(width:1080,height:1920,ratio:0.8)
     assert(c.w==1080 && abs(c.h-1350)<0.01)
+    // ProRes: sem SSD, 4K60 cai pra 4K30 (mesmo tamanho); com SSD fica 4K60; 1080p60 cabe no interno
+    let pr=[NativeCaptureProfile(width:3840,height:2160,fps:24),NativeCaptureProfile(width:3840,height:2160,fps:30),NativeCaptureProfile(width:3840,height:2160,fps:60),NativeCaptureProfile(width:1920,height:1080,fps:60),NativeCaptureProfile(width:1920,height:1080,fps:120)]
+    assert(ProResPolicy.cap(.main,external:false,options:pr)==NativeCaptureProfile(width:3840,height:2160,fps:30),"ProRes 4K60 interno tem que cair pra 4K30")
+    assert(ProResPolicy.cap(.main,external:true,options:pr)==.main,"com SSD o ProRes grava 4K60")
+    assert(ProResPolicy.cap(NativeCaptureProfile(width:1920,height:1080,fps:60),external:false,options:pr).fps==60)
+    let pr2=[NativeCaptureProfile(width:3840,height:2160,fps:29.97),NativeCaptureProfile(width:3840,height:2160,fps:59.94)]
+    assert(ProResPolicy.cap(NativeCaptureProfile(width:3840,height:2160,fps:59.94),external:false,options:pr2).fps==29.97)
+    let gb=ProResPolicy.gbPerMinute(.hq,NativeCaptureProfile(width:3840,height:2160,fps:30))
+    assert(gb>5.2 && gb<5.4,"4K30 HQ ~5,3 GB/min, deu \(gb)")
+    assert(ProResPolicy.proxySize(width:3840,height:2160)==(1920,1080) && ProResPolicy.proxySize(width:2160,height:3840)==(1080,1920))
+    assert(ProResFlavor(rawValue:"apch") == .hq && ProResFlavor.allCases.count==3)
     print("PASS actual profile selection: no resolution/FPS/HDR downgrade, supported slow-motion rates, fractional FPS and stabilization preference")
   }
 }
