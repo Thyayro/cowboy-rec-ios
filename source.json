@@ -1,0 +1,109 @@
+{
+  "name": "Cowboy Rec",
+  "identifier": "com.cowboy.rec.source",
+  "subtitle": "Versões do Cowboy Rec",
+  "sourceURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/source.json",
+  "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+  "tintColor": "#F5C518",
+  "apps": [
+    {
+      "name": "Cowboy Rec",
+      "bundleIdentifier": "com.cowboy.rec.personal",
+      "developerName": "Cowboy do Consórcio",
+      "subtitle": "Apple Log direto na nuvem",
+      "localizedDescription": "Câmera Apple Log que grava direto na nuvem Cowboy.",
+      "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+      "tintColor": "#F5C518",
+      "category": "photo-video",
+      "versions": [
+        {
+          "version": "0.13.4",
+          "date": "2026-11-21T06:21:27Z",
+          "localizedDescription": "Cowboy Rec 0.13.4\n\nMestre ProRes sobe em 2º plano (iPhone bloqueado/app fechado), Rec.709 ao vivo começa desligado.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.4-test/CowboyRec-0.13.4-unsigned.ipa",
+          "size": 2702216,
+          "minOSVersion": "17.2",
+          "buildVersion": "87"
+        },
+        {
+          "version": "0.13.3",
+          "date": "2026-11-18T15:26:45Z",
+          "localizedDescription": "Cowboy Rec 0.13.3\n\nProRes 422 HQ em casa e na rua por padrão (+ envio em 2º plano da 0.13.2).",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.3-test/CowboyRec-0.13.3-unsigned.ipa",
+          "size": 2693198,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.2",
+          "date": "2026-11-18T14:20:53Z",
+          "localizedDescription": "Cowboy Rec 0.13.2\n\nEnvio em 2º plano: ao sair do app/bloquear o iPhone, o iOS continua subindo os pedaços. Aviso de memória despeja a RAM no disco.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.2-test/CowboyRec-0.13.2-unsigned.ipa",
+          "size": 2693126,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.1",
+          "date": "2026-11-18T07:37:26Z",
+          "localizedDescription": "Cowboy Rec 0.13.1\n\nFila de envio não trava mais numa tomada só (a de 17/11 17:02 segurava tudo desde ontem 20:31). Tomada com pedaço sumido pula o buraco. Diag stream-fila ao abrir.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.1-test/CowboyRec-0.13.1-unsigned.ipa",
+          "size": 2672888,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.0",
+          "date": "2026-11-18T03:14:16Z",
+          "localizedDescription": "Cowboy Rec 0.13.0 (teste) — ProRes Log extra\n\nProRes Log EXTRA (Ajustes › ProRes Log extra, ligado por padrão; desligado = app igual ao 0.12.6).\r\n- Mestre ProRes gravado JUNTO da gravação de sempre (formato, Rec.709, taxa e envio ao vivo não mudam).\r\n- Em casa (PC achado no Wi-Fi): pedaços de 2 s direto pro F:\\CowboyRec\\ProRes, 422 LT. Fora: VPS, 422 HQ; o PC puxa e a VPS apaga.\r\n- Cada pedaço só sai do iPhone com recibo (sha256). Mestre a 30 qps (gravando a 60, 1 quadro sim 1 não). Com menos de 3 GB livres o mestre para e o resto segue.\r\n- Na 1ª abertura o iPhone pede acesso à rede local: permitir.\r\n",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.0-test/CowboyRec-0.13.0.ipa",
+          "size": 2654992,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.6",
+          "date": "2026-11-09T13:49:37Z",
+          "localizedDescription": "Cowboy Rec 0.12.6 (teste)\n\nSCAN 3D: prévia do volume segue a mira da câmera quando a marca cai fora do objeto.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.6-test/CowboyRec-0.12.6-unsigned.ipa",
+          "size": 2563335,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.5",
+          "date": "2026-11-09T13:14:07Z",
+          "localizedDescription": "Cowboy Rec 0.12.5 (teste)\n\nSCAN 3D: layout cabe na tela; pausar/continuar/descartar na gravação; pausar/continuar/excluir em Meus scans; prévia só do objeto (sem a mesa) e raio/eixo pro PC.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.5-test/CowboyRec-0.12.5-unsigned.ipa",
+          "size": 2561347,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.12.4",
+          "date": "2026-11-09T05:33:44Z",
+          "localizedDescription": "Cowboy Rec 0.12.4 (teste)\n\nSCAN 3D: nota prevista durante a captura com dica do que melhorar, prévia do volume captado em cinza, opção de apoio Mesa/Suporte.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.12.4-test/CowboyRec-0.12.4-unsigned.ipa",
+          "size": 2527507,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSCameraUsageDescription": "Gravar vídeo.",
+          "NSMicrophoneUsageDescription": "Gravar o som do vídeo.",
+          "NSPhotoLibraryUsageDescription": "Mandar vídeos da galeria.",
+          "NSPhotoLibraryAddUsageDescription": "Salvar na galeria."
+        }
+      },
+      "version": "0.13.4",
+      "versionDate": "2026-11-21T06:21:27Z",
+      "versionDescription": "Cowboy Rec 0.13.4\n\nMestre ProRes sobe em 2º plano (iPhone bloqueado/app fechado), Rec.709 ao vivo começa desligado.",
+      "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.4-test/CowboyRec-0.13.4-unsigned.ipa",
+      "size": 2702216
+    }
+  ],
+  "news": []
+}
