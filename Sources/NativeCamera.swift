@@ -248,7 +248,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
   @Published var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant2") as? Bool ?? false   // 0.10.8: padrão = quadro como é (ver PreviewRenderer)
   // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
-  @Published var bake709 = UserDefaults.standard.object(forKey: "bake709") as? Bool ?? true { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
+  @Published var bake709 = false { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
   @Published var lastThumb: UIImage? = UIImage(contentsOfFile: NativeCamera.thumbURL.path)
   // EFEITOS E ZOOM (0.8.9): velocidade do toque nas lentes, desfoque de movimento e onde ele é aplicado
   //  - Live (padrão): tela e arquivo com o rastro (no shader do arquivo, só nos quadros com movimento: parado não custa);

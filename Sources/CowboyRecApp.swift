@@ -199,7 +199,7 @@ struct RecorderView: View {
       updateIconAngle()
     }
     .onChange(of: phase) { _, value in
-      if value == .background { camera.close(); CloudStream.shared.enterBackground(); MotionHub.shared.stop() }
+      if value == .background { camera.close(); CloudStream.shared.enterBackground(); ProResUploader.shared.handOff(); MotionHub.shared.stop() }
       if value == .active { CloudStream.shared.leaveBackground() }   // 0.13.2: de volta à tela, o laço normal reassume (qualquer tela)
       if value == .active && portal == nil && !arPresentation && !photoMode && !scanMode { camera.start(); Task { await cloud.refresh(); CloudStream.shared.kick(); ProResUploader.shared.wake() } }
     }

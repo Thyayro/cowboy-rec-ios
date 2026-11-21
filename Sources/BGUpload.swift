@@ -34,6 +34,14 @@ final class BGUpload: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
     let task = session.uploadTask(with: r, fromFile: file)
     task.taskDescription = "\(cid)|\(seq)"
+    task.priority = URLSessionTask.highPriority   // gravação de sempre (galeria) passa na frente do mestre ProRes
+    task.resume()
+  }
+  /// 0.13.4: pedido pronto (mestre ProRes: PC de casa ou VPS); descrição começa com "prores|"
+  func upload(request r: URLRequest, file: URL, desc: String, low: Bool) {
+    let task = session.uploadTask(with: r, fromFile: file)
+    task.taskDescription = desc
+    task.priority = low ? URLSessionTask.lowPriority : URLSessionTask.defaultPriority
     task.resume()
   }
 
@@ -52,10 +60,11 @@ final class BGUpload: NSObject, URLSessionDataDelegate, @unchecked Sendable {
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     lock.lock(); let body = bodies.removeValue(forKey: task.taskIdentifier); lock.unlock()
     guard let desc = task.taskDescription else { return }
-    let parts = desc.split(separator: "|")
-    guard parts.count == 2, let seq = Int(parts[1]) else { return }
     let code = (task.response as? HTTPURLResponse)?.statusCode ?? 0
     let json = body.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+    if desc.hasPrefix("prores|") { ProResUploader.shared.bgDone(desc: desc, code: error == nil ? code : 0, json: json); return }
+    let parts = desc.split(separator: "|")
+    guard parts.count == 2, let seq = Int(parts[1]) else { return }
     CloudStream.shared.bgDone(cid: String(parts[0]), seq: seq, code: error == nil ? code : 0, json: json)
   }
 

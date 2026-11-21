@@ -257,7 +257,14 @@ final class ProResUploader: ObservableObject, @unchecked Sendable {
   func load(_ cid: String) -> Take? { (try? Data(contentsOf: takeURL(cid))).flatMap { try? JSONDecoder().decode(Take.self, from: $0) } }
   private func update(_ cid: String, _ fn: (inout Take) -> Void) { lock.lock(); defer { lock.unlock() }; guard var t = load(cid) else { return }; fn(&t); save(t) }
   func sealed(cid: String, seg: Seg) {
-    if let d = try? JSONEncoder().encode(seg) { try? d.write(to: Self.root.appendingPathComponent(cid).appendingPathComponent(String(format: "seg_%06d.json", seg.seq)), options: .atomic) }
+    let meta = Self.root.appendingPathComponent(cid).appendingPathComponent(String(format: "seg_%06d.json", seg.seq))
+    if let d = try? JSONEncoder().encode(seg) { try? d.write(to: meta, options: .atomic) }
+    // 0.13.4: sha256 já no fechamento do pedaço (fora da fila de câmera) — o envio em 2º plano sai na hora, sem recalcular
+    DispatchQueue.global(qos: .utility).async {
+      let mov = meta.deletingPathExtension().appendingPathExtension("mov")
+      guard let h = try? Self.sha256(mov), var s = (try? Data(contentsOf: meta)).flatMap({ try? JSONDecoder().decode(Seg.self, from: $0) }), s.sha256 == nil else { return }
+      s.sha256 = h; try? JSONEncoder().encode(s).write(to: meta, options: .atomic)
+    }
     kick()
   }
   func close(cid: String, count: Int, streamCid: String?, note: String?) {
@@ -333,22 +340,7 @@ final class ProResUploader: ObservableObject, @unchecked Sendable {
     let toPC = destination()
     // fora de casa a banda é de quem grava ao vivo: o mestre espera a fila da gravação de sempre esvaziar
     if toPC == nil, CloudStream.shared.liveBacklog > 3 { throw Wait(text: "Mestre ProRes cede a rede pra gravação ao vivo (fica no iPhone)", seconds: 3) }
-    var url: URL
-    var r: URLRequest
-    if let dest = toPC {
-      url = dest.0.appendingPathComponent("seg")
-    } else {
-      url = URL(string: "/api/rec/prores/seg", relativeTo: Self.origin)!.absoluteURL
-    }
-    var c = URLComponents(url: url, resolvingAgainstBaseURL: true)!
-    c.queryItems = [URLQueryItem(name: "cid", value: cid), URLQueryItem(name: "seq", value: String(seg.seq))]
-    url = c.url!
-    r = URLRequest(url: url); r.httpMethod = "PUT"; r.timeoutInterval = 600
-    if toPC != nil { HomePC.shared.authorize(&r) } else { r.setValue(cookie, forHTTPHeaderField: "Cookie") }
-    r.setValue("video/quicktime", forHTTPHeaderField: "Content-Type")
-    r.setValue(s.sha256, forHTTPHeaderField: "X-Sha256")
-    if let d = try? JSONEncoder().encode(s) { r.setValue(d.base64EncodedString(), forHTTPHeaderField: "X-Seg") }
-    if let t, let d = try? JSONEncoder().encode(t) { r.setValue(d.base64EncodedString(), forHTTPHeaderField: "X-Take") }
+    let r = request(cid: cid, seg: s, take: t, toPC: toPC, cookie: cookie)
     let where_ = toPC != nil ? "PC" : "VPS"
     setLine(String(format: "Mestre ProRes → %@: pedaço %d (%.0f MB)", where_, seg.seq, Double(size) / 1e6))
     let (body, resp) = try await http.upload(for: r, fromFile: mov)
@@ -368,6 +360,58 @@ final class ProResUploader: ObservableObject, @unchecked Sendable {
       if toPC != nil { HomePC.shared.lost() }
       throw Wait(text: "\(where_) respondeu \(code) no pedaço \(seg.seq) — tenta de novo", seconds: 10)
     }
+  }
+  private func request(cid: String, seg s: Seg, take t: Take?, toPC: (URL, String)?, cookie: String) -> URLRequest {
+    var url = toPC.map { $0.0.appendingPathComponent("seg") } ?? URL(string: "/api/rec/prores/seg", relativeTo: Self.origin)!.absoluteURL
+    var c = URLComponents(url: url, resolvingAgainstBaseURL: true)!
+    c.queryItems = [URLQueryItem(name: "cid", value: cid), URLQueryItem(name: "seq", value: String(s.seq))]
+    url = c.url!
+    var r = URLRequest(url: url); r.httpMethod = "PUT"; r.timeoutInterval = 600
+    if toPC != nil { HomePC.shared.authorize(&r) } else { r.setValue(cookie, forHTTPHeaderField: "Cookie") }
+    r.setValue("video/quicktime", forHTTPHeaderField: "Content-Type")
+    r.setValue(s.sha256, forHTTPHeaderField: "X-Sha256")
+    if let d = try? JSONEncoder().encode(s) { r.setValue(d.base64EncodedString(), forHTTPHeaderField: "X-Seg") }
+    if let t, let d = try? JSONEncoder().encode(t) { r.setValue(d.base64EncodedString(), forHTTPHeaderField: "X-Take") }
+    return r
+  }
+
+  // ---- 0.13.4: envio em 2º plano do mestre (20/11: 5 tomadas HQ na rua ficaram no iPhone — o mestre só andava com o
+  // app aberto, um pedaço de ~190 MB por vez). Ao sair do app, cada pedaço com ficha vira upload do iOS (prioridade baixa:
+  // a gravação de sempre passa na frente). Recibo = sha256 devolvido igual; só então sai do iPhone.
+  func handOff() {
+    Task.detached(priority: .utility) { [weak self] in
+      guard let self, let cookie = await self.cookieProvider?(), !cookie.isEmpty else { return }
+      let already: Set<String> = await withCheckedContinuation { c in BGUpload.shared.pending { c.resume(returning: $0) } }
+      let toPC = self.destination()
+      let dirs = ((try? FileManager.default.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: nil)) ?? []).sorted { $0.lastPathComponent < $1.lastPathComponent }
+      var n = 0, gb = 0.0
+      for d in dirs {
+        guard let t = self.load(d.lastPathComponent) else { continue }
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: d.path)) ?? []
+        for f in files.filter({ $0.hasPrefix("seg_") && $0.hasSuffix(".json") }).sorted() {
+          let meta = d.appendingPathComponent(f), mov = d.appendingPathComponent(f.replacingOccurrences(of: ".json", with: ".mov"))
+          guard var s = (try? Data(contentsOf: meta)).flatMap({ try? JSONDecoder().decode(Seg.self, from: $0) }),
+                let size = (try? mov.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap({ $0 }), size > 0 else { continue }
+          let prefix = "prores|\(t.cid)|\(s.seq)|"
+          if already.contains(where: { $0.hasPrefix(prefix) }) { continue }
+          if s.sha256 == nil { guard let h = try? Self.sha256(mov) else { continue }; s.sha256 = h; try? JSONEncoder().encode(s).write(to: meta, options: .atomic) }
+          BGUpload.shared.upload(request: self.request(cid: t.cid, seg: s, take: t, toPC: toPC, cookie: cookie), file: mov,
+            desc: prefix + "\(s.sha256!)|\(toPC != nil ? "pc" : "vps")", low: true)
+          n += 1; gb += Double(size) / 1e9
+        }
+      }
+      if n > 0 { Diag.step("prores-2o-plano", ["pedacos": n, "gb": String(format: "%.1f", gb), "destino": toPC != nil ? "pc" : "vps"]) }
+    }
+  }
+  /// resultado de um pedaço do mestre enviado pelo iOS
+  func bgDone(desc: String, code: Int, json: [String: Any]) {
+    let p = desc.split(separator: "|").map(String.init)
+    guard p.count == 5, let seq = Int(p[2]) else { return }
+    let cid = p[1], sha = p[3]
+    guard (200..<300).contains(code), json["sha256"] as? String == sha else { if p[4] == "pc" && code != 0 { HomePC.shared.lost() }; return }
+    let dir = Self.root.appendingPathComponent(cid)
+    try? FileManager.default.removeItem(at: dir.appendingPathComponent(String(format: "seg_%06d.mov", seq)))
+    try? FileManager.default.removeItem(at: dir.appendingPathComponent(String(format: "seg_%06d.json", seq)))
   }
   private func done(_ t0: Take, cookie: String) async throws {
     var t = t0
