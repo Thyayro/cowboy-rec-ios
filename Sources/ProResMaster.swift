@@ -289,6 +289,11 @@ final class ProResUploader: ObservableObject, @unchecked Sendable {
       let work = scan()
       publishCounters(work)
       guard let (cid, item) = work.next else { if work.total == 0 { setLine("") }; return }
+      // 0.13.5: gravando, o mestre não disputa com a câmera — na rua espera parar; em casa só com o aparelho frio
+      if !RecGate.allowsProRes(toPC: destination() != nil) {
+        setLine("Mestre ProRes guardado no iPhone enquanto grava — sobe sozinho ao parar")
+        try? await Task.sleep(nanoseconds: 2_000_000_000); continue
+      }
       guard let cookie = await cookieProvider?(), !cookie.isEmpty else { setLine("Mestre ProRes espera o login na conta Cowboy (fica no iPhone)"); return }
       do {
         switch item {

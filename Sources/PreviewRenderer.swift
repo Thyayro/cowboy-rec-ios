@@ -77,6 +77,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var lastDZ = 1.0
   // DESFOQUE DE MOVIMENTO (0.8.9, ver MotionBlur): tela com rastro no Live (ou no Render com "ver como render")
   var blurPreview = false
+  // 0.13.5: TELA LEVE = Log cru (sem LUT/look, sem vinheta, sem névoa/desfoque na tela) e 30 qps gravando (24 com a câmera
+  // sob pressão). Só a tela muda: o mestre ProRes e o arquivo recebem todos os quadros, iguais.
+  var rawScreen = UserDefaults.standard.object(forKey: "telaCrua") as? Bool ?? true
+  var pressure = 0   // pressão do sistema na câmera: 0 normal, 1 média, 2 séria, 3 crítica, 4 desligando
   var mistLevel = 0   // névoa (0.10.3): 0 = desligada; mesma conta do arquivo (Mist.swift)
   var blurShutter: (() -> Double)?   // obturador sintético agora (s), já sem a exposição real
   var blurFOV = 106.0                // campo horizontal do formato no zoom 1 do aparelho (graus)
@@ -582,7 +586,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let newestFast = zoomTrack.newestPTS
     lock.lock()
     if let zNow, zNow > 0 { zoomHistory.append((now, zNow)); if zoomHistory.count > 600 { zoomHistory.removeFirst(zoomHistory.count - 600) } }
-    let buffer = pending, pts = pendingPTS, sid = pendingSID; pending = nil; let cube = self.cube, size = cubeSize, orient = orientation, mirror = mirrored
+    let buffer = pending, pts = pendingPTS, sid = pendingSID; pending = nil; let cube = rawScreen ? nil : self.cube, size = cubeSize, orient = orientation, mirror = mirrored
     let zFrame = pts.flatMap { zoomAt($0 + Self.contentLead) }
     let zNewest = newestFast.flatMap { zoomAt($0 + Self.contentLead) }   // conteúdo adiantado ~25 ms em relação ao zoom lido
     let tapT = tapRef, tapDz = tapDZ, zTap = tapRef == nil ? nil : (tapZ ?? tapRef.flatMap { zoomAt($0) }), zDisp30 = zoomAt(now - 1.0 / 30)
@@ -604,7 +608,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     var dz = dzNow
     if !blurHot { tap.tick(now: now, moving: zoomMovedNow || dMoved) }
     // quente, sem gravar e com o zoom parado há 1 s: a tela a 30 qps (metade do trabalho de GPU da prévia)
-    let wantFPS = blurHot && !(recordingNow?() ?? false) && now - lastZoomMove > 1.0 && xfade == nil ? 30 : 60
+    let recNow = recordingNow?() ?? false
+    let wantFPS = recNow && (rawScreen || pressure >= 2) ? (pressure >= 2 ? 24 : 30) : (blurHot && !recNow && now - lastZoomMove > 1.0 && xfade == nil ? 30 : 60)
     if wantFPS != shownFPS { shownFPS = wantFPS; view.preferredFramesPerSecond = wantFPS; Diag.step("screen-fps", ["qps": wantFPS], send: false) }
     if live {
       guard let liveFrame else { return }
@@ -656,10 +661,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     // mostra o quadro como ele é, com o movimento que ele carrega
     var screenSpeed: Double?
     if zoomInstant && tapT == nil, let zN = zNow, zN > 0, let z30 = zDisp30, z30 > 0 { screenSpeed = log(zN / z30) * 30 + dzSpeed }
-    if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: scale * k * dz, fit: fit, zoomSpeed: screenSpeed) }
-    image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
-    image = LensShading.apply(image, lens: LensID.name(buffer), zoom: (zFrame ?? zNow ?? 1) * k * dz)   // vinheta da ultra (0.10.5)
-    if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
+    let lite = rawScreen
+    if blurPreview && !lite, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: scale * k * dz, fit: fit, zoomSpeed: screenSpeed) }
+    if !lite {
+      image = Self.matched(Self.filtered(image, cube: cube, size: size), lensMatch?.correction(at: pts ?? now, lens: LensID.name(buffer)) ?? .identity).cropped(to: fit)
+      image = LensShading.apply(image, lens: LensID.name(buffer), zoom: (zFrame ?? zNow ?? 1) * k * dz)   // vinheta da ultra (0.10.5)
+      if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
+    } else { image = image.cropped(to: fit) }
     let black = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target))
     image = image.composited(over: black)
     // troca de lente com o zoom parado: dissolve curto do último quadro da lente velha (0.9.0) — no meio do zoom o movimento esconde
@@ -693,10 +701,13 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let sc = fitScale * max(1, crop) * Double(geo.cover)
     image = image.transformed(by: CGAffineTransform(scaleX: sc, y: sc))
     image = image.transformed(by: CGAffineTransform(translationX: fit.midX - image.extent.midX, y: fit.midY - image.extent.midY)).cropped(to: fit)
-    if blurPreview, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: sc, fit: fit) }
-    image = Self.matched(Self.filtered(image, cube: cube, size: size), match).cropped(to: fit)
-    image = LensShading.apply(image, lens: LensID.name(buffer), zoom: (zoomNow?() ?? 1) * max(1, crop))   // vinheta da ultra (0.10.5)
-    if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
+    let lite = rawScreen
+    if blurPreview && !lite, let p = pts { image = previewBlur(image, raw: raw, at: p, orient: orient, mirror: mirror, scale: sc, fit: fit) }
+    if !lite {
+      image = Self.matched(Self.filtered(image, cube: cube, size: size), match).cropped(to: fit)
+      image = LensShading.apply(image, lens: LensID.name(buffer), zoom: (zoomNow?() ?? 1) * max(1, crop))   // vinheta da ultra (0.10.5)
+      if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
+    } else { image = image.cropped(to: fit) }
     image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target)))
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true

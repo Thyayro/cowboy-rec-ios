@@ -290,8 +290,15 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
       // 0.13.1: uma tomada com erro do servidor NUNCA segura a fila (18/11: a tomada 17/11 17:02 parou no pedaço 15 e
       // nada mais subiu — nem as tomadas novas). A que está em espera vai pro fim; as outras sobem.
       let now = Date()
-      guard let t = live.first(where: { $0.holdUntil <= now }) else {
-        let wait = live.map { $0.holdUntil }.min()!.timeIntervalSince(now); lock.unlock()
+      // 0.13.5: gravando, só a tomada atual e só com o aparelho frio (o resto fica no disco e sobe ao parar)
+      let open = live.filter { RecGate.allows(stream: $0.m.cid) }
+      if open.isEmpty {
+        lock.unlock()
+        setHealth(.slow, RecGate.isHot ? "Gravando no iPhone — aparelho quente, a nuvem recebe ao parar" : "Gravando no iPhone — as anteriores sobem ao parar")
+        try? await Task.sleep(nanoseconds: 1_000_000_000); continue
+      }
+      guard let t = open.first(where: { $0.holdUntil <= now }) else {
+        let wait = open.map { $0.holdUntil }.min()!.timeIntervalSince(now); lock.unlock()
         try? await Task.sleep(nanoseconds: UInt64(max(0.5, min(wait, 30)) * 1e9)); continue
       }
       lock.unlock()
@@ -485,4 +492,23 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     if (300..<400).contains(r.statusCode) { return (401, [:]) }
     return (r.statusCode, ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any]) ?? [:])
   }
+}
+
+/// 0.13.5 — GRAVANDO, o envio não disputa com a câmera (rádio, CPU, memória e calor). Medido 20/11 (0.13.3, 4G, calor
+/// crítico): a tomada de 2:28 gravou 6.473 de ~8.866 quadros, com os buracos grandes junto dos avisos de memória, enquanto
+/// subiam as tomadas antigas e os pedaços ProRes (~190 MB). Agora: gravando, só a tomada ATUAL sobe e só com o aparelho
+/// frio; tomadas antigas e o mestre ProRes esperam no disco e saem sozinhos ao parar (nada se apaga).
+enum RecGate {
+  private static let lock = NSLock()
+  private static var current: String?   // tomada gravando agora ("?" = gravando sem nuvem); nil = parado
+  private static var hot = false        // calor ≥ quente ou pressão da câmera ≥ séria
+  static func begin(_ cid: String?) { lock.lock(); current = cid ?? "?"; lock.unlock() }
+  static func end() { lock.lock(); current = nil; lock.unlock(); CloudStream.shared.kick(); ProResUploader.shared.kick() }
+  static func setHot(_ h: Bool) { lock.lock(); hot = h; lock.unlock() }
+  static var recording: Bool { lock.lock(); defer { lock.unlock() }; return current != nil }
+  static var isHot: Bool { lock.lock(); defer { lock.unlock() }; return hot }
+  /// pode subir pedaço da tomada `cid` agora?
+  static func allows(stream cid: String) -> Bool { lock.lock(); defer { lock.unlock() }; guard let c = current else { return true }; return !hot && c == cid }
+  /// mestre ProRes: gravando, só pro PC de casa (Wi-Fi) e com o aparelho frio; na rua espera parar
+  static func allowsProRes(toPC: Bool) -> Bool { lock.lock(); defer { lock.unlock() }; return current == nil || (toPC && !hot) }
 }

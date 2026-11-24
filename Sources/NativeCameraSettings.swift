@@ -11,6 +11,8 @@ struct NativeCameraSettings: View {
           Text("Desligada").tag(0); Text("Standard").tag(1); Text("Cinematic").tag(2); Text("Cinematic Extended").tag(3); Text("Extrema").tag(4)
         }.pickerStyle(.segmented).disabled(configuringDisabled)
         Text("Ativa agora (arquivo): \(NativeCamera.label(camera.activeMode))").font(.caption)
+        Toggle("Tela leve (Log cru)", isOn: Binding(get: { camera.rawScreen }, set: { camera.setRawScreen($0) }))
+        Text(camera.rawScreen ? "A tela mostra o Log cru (cinza, sem LUT, sem look, sem névoa) e cai pra 30 qps gravando — menos GPU e calor. O mestre ProRes e o arquivo não mudam e recebem todos os quadros." : "A tela mostra a cor final (Rec.709 + look). Pesa mais: usar só com o aparelho frio.").font(.caption2)
         Toggle("Prévia sem atraso", isOn: Binding(get: { camera.lightPreview }, set: { camera.setLightPreview($0) }))
         Text(camera.lightPreview ? "A tela mostra a câmera em tempo real com estabilização leve (como a câmera do iPhone): zoom e troca de lente na hora. O ARQUIVO sai com a estabilização escolhida acima, no mesmo enquadramento." : "A tela mostra exatamente o quadro do arquivo (estabilização forte), com o atraso dela — inclusive no zoom.").font(.caption2)
         if !camera.lightPreview {

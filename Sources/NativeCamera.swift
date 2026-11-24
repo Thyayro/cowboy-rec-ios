@@ -246,6 +246,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var rawLog = false
   @Published var droppedFrames = 0
   @Published var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
+  @Published var rawScreen = UserDefaults.standard.object(forKey: "telaCrua") as? Bool ?? true   // 0.13.5: tela leve = Log cru
   @Published var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant2") as? Bool ?? false   // 0.10.8: padrão = quadro como é (ver PreviewRenderer)
   // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
   @Published var bake709 = false { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
@@ -318,6 +319,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // CALOR (0.8.2): aparelho morno/quente e câmera parada (sem gravar) = 30 qps; gravando, a cadência do formato
   private var idleSlow = false
   private var thermalObserver: NSObjectProtocol?
+  // 0.13.5: pressão do sistema NA CÂMERA (KVO) + quadros que a câmera descartou antes de chegar no app (didDrop — antes
+  // ninguém contava: na tomada de 20/11 sumiram ~2.400 quadros além dos 483 que o gravador recusou)
+  private var pressureObs: NSKeyValueObservation?
+  private var pressureLevel = 0, pressureMax = 0
+  private var capDrop = 0, capLate = 0, capNoBuf = 0, capDropBase = 0, capLateBase = 0, capNoBufBase = 0
+  private var capDiagAt = 0.0, capDiagN = 0
   private var recCadence: Double?
   private var recCadenceUntil = 0.0
   private var lastVideoPTS: Double?
@@ -701,9 +708,27 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         thermalObserver = NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { [weak self] _ in
           Diag.step("thermal", ["estado": Self.thermalName()])
           self?.renderer.blurHot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+          self?.updateHot()
           self?.applyIdleRate()
         }
       }
+      pressureObs = cam.observe(\.systemPressureState, options: [.initial, .new]) { [weak self] d, _ in
+        guard let self else { return }
+        let st = d.systemPressureState, l = st.level
+        let lv = l == .shutdown ? 4 : l == .critical ? 3 : l == .serious ? 2 : l == .fair ? 1 : 0
+        if lv != self.pressureLevel {
+          self.pressureLevel = lv
+          var f: [String] = []
+          if st.factors.contains(.systemTemperature) { f.append("temperatura") }
+          if st.factors.contains(.peakPower) { f.append("pico_energia") }
+          if st.factors.contains(.depthModuleTemperature) { f.append("modulo_prof") }
+          Diag.step("pressao", ["nivel": l.rawValue, "fatores": f.joined(separator: ","), "bits": st.factors.rawValue, "gravando": self.recording, "calor": Self.thermalName()])
+        }
+        if self.recording { self.pressureMax = max(self.pressureMax, lv) }
+        self.renderer.pressure = lv
+        self.updateHot()
+      }
+      renderer.rawScreen = rawScreen
       idleSlow = false
       applyIdleRate()
       if let o = subjectObserver { NotificationCenter.default.removeObserver(o) }
@@ -809,6 +834,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   func setZoomInstant(_ value: Bool) { UserDefaults.standard.set(value, forKey: "zoomInstant2"); renderer.zoomInstant = value; publish { self.zoomInstant = value } }
+  func setRawScreen(_ value: Bool) { UserDefaults.standard.set(value, forKey: "telaCrua"); renderer.rawScreen = value; publish { self.rawScreen = value } }
   func setLightPreview(_ value: Bool) { UserDefaults.standard.set(value, forKey: "lightPreview"); renderer.lightPreview = value; publish { self.lightPreview = value } }
   func setBitrate(_ value: Int) { UserDefaults.standard.set(value, forKey: "bitrate"); publish { self.bitrateChoice = value } }
   // interface girou (retrato/deitado): a prévia acompanha; o arquivo usa o ângulo do horizonte travado ao começar
@@ -965,6 +991,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       }
     }
   }
+  /// aparelho "quente" pro envio: calor ≥ quente OU pressão da câmera ≥ séria (gravando, a nuvem espera)
+  private func updateHot() { RecGate.setHot(ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue || pressureLevel >= 2) }
   static func thermalName() -> String {
     switch ProcessInfo.processInfo.thermalState { case .nominal: return "normal"; case .fair: return "morno"; case .serious: return "quente"; case .critical: return "crítico"; @unknown default: return "?" }
   }
@@ -1337,6 +1365,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
             self.recBaker = baker; self.recMist = mistFile
             self.fileBlur = fxLive && baker != nil; self.fxLogOn = false; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
+            RecGate.begin(nil); self.pressureMax = self.pressureLevel; self.capDiagN = 0
             self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = nil; self.elapsedMs = 0
             self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
           }
@@ -1378,6 +1407,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           self.recBaker = baker; self.recMist = mistFile
           self.fileBlur = fxLive && baker != nil; self.fxLogOn = fxRend; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
           self.writer = writer; self.recCid = cid; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = gyro; self.elapsedMs = 0
+          RecGate.begin(cid); self.pressureMax = self.pressureLevel; self.capDiagN = 0
           MotionHub.shared.attach(gyro)
           self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
         }
@@ -1467,6 +1497,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     dataQueue.async {
       guard let writer = self.writer else { self.publish { self.finishing = false }; return }
       self.writer = nil
+      let capD = self.recStart == nil ? 0 : self.capDrop - self.capDropBase, capL = self.capLate - self.capLateBase, capB = self.capNoBuf - self.capNoBufBase, pMax = self.pressureMax
+      defer { RecGate.end() }
       if let pr = self.proRec { self.proRec = nil; pr.finish() }
       self.applyIdleRate()
       if let b = self.recBaker, b.failures > 0 { Diag.step("bake-failures", ["n": b.failures, "err": b.lastError]) }
@@ -1490,7 +1522,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       let duration = self.elapsedMs, dropped = writer.dropped
       if !fx.isEmpty { CloudStream.shared.side(cid, kind: "fx", data: Data(fx.utf8)); Diag.step("fx-file", ["linhas": fxN]) }
       if let meta = self.spaceMeta?() {
-        var space = meta; space["camera"] = self.lensName; space["source"] = "ios-native"; space["fov_long_deg"] = self.fieldOfView; space["dropped_frames"] = dropped
+        var space = meta; space["camera"] = self.lensName; space["source"] = "ios-native"; space["fov_long_deg"] = self.fieldOfView; space["dropped_frames"] = dropped + capD
         if let data = try? JSONSerialization.data(withJSONObject: space) { CloudStream.shared.side(cid, kind: "space", data: data) }
       }
       self.publish { self.recording = false; self.finishing = true }
@@ -1498,7 +1530,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         gyro?.close()
         if (gyro?.lines ?? 0) == 0 { try? FileManager.default.removeItem(at: CloudStream.shared.sideFile(cid, kind: "gcsv")) }
         CloudStream.shared.close(cid, durationMs: duration)
-        Diag.step("stop-stream", ["ok": ok, "ms": duration, "dropped": dropped, "pedacos": writer.segs, "mb": writer.segBytes / 1_000_000, "v": writer.vOK, "a": writer.aOK, "a_fora": writer.aSkip, "status": writer.statusCode])
+        Diag.step("stop-stream", ["ok": ok, "ms": duration, "dropped": dropped, "camera_drop": capD, "cam_atrasado": capL, "cam_sem_buffer": capB, "pressao_max": pMax, "pedacos": writer.segs, "mb": writer.segBytes / 1_000_000, "v": writer.vOK, "a": writer.aOK, "a_fora": writer.aSkip, "status": writer.statusCode])
         self.publish { self.finishing = false; if !ok { self.status = "A gravação terminou com erro — o que já subiu está salvo na nuvem" } }
       }
     }
@@ -1561,15 +1593,20 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
     let pixel = CMSampleBufferGetImageBuffer(sampleBuffer)
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let prevVideoPTS = lastVideoPTS; lastVideoPTS = pts.seconds
+    let halt = stopping
+    // estava a 30 qps parada (aparelho quente): o arquivo só começa com os quadros já na cadência do formato
+    var cadenceWait = false
+    if let writer, !halt, !writer.started, let want = recCadence {
+      if pts.seconds - (prevVideoPTS ?? 0) > 1.5 / want && CACurrentMediaTime() < recCadenceUntil { cadenceWait = true } else { recCadence = nil }
+    }
+    // 0.13.5 — GRAVAÇÃO BLINDADA: sem conversão no iPhone, o mestre ProRes e o arquivo recebem o quadro ANTES de qualquer
+    // conta da tela (troca de lente, medidas). A tela pode pular quadro; o arquivo não.
+    let early = recBaker == nil && writer != nil && !halt && !cadenceWait
+    if early, let writer { proRec?.appendVideo(sampleBuffer); writer.appendVideo(sampleBuffer) }
     if metaScoutStab > 0 { scoutMeta(sampleBuffer, fast: false) }
     if let pixel { renderer.push(pixel, pts: pts.seconds) }
-    let prevVideoPTS = lastVideoPTS; lastVideoPTS = pts.seconds
-    guard let writer, !stopping else { return }
-    // estava a 30 qps parada (aparelho quente): o arquivo só começa com os quadros já na cadência do formato
-    if !writer.started, let want = recCadence {
-      if pts.seconds - (prevVideoPTS ?? 0) > 1.5 / want && CACurrentMediaTime() < recCadenceUntil { return }
-      recCadence = nil
-    }
+    guard let writer, !halt, !cadenceWait else { return }
     // desfoque de movimento (0.8.9): Live = no shader do arquivo; Render = linha no arquivo de efeitos (a VPS aplica)
     var blur = BlurParams.none, stages = (1, 1)
     if fileBlur || fxLogOn, let pixel {
@@ -1578,7 +1615,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
     // troca de lente com o zoom parado (0.9.0): dissolve curto do último quadro da lente velha, em vez de ampliar/desampliar
     let sidNow = pixel.map { LensID.of($0) } ?? 0
-    let geoNow = renderer.fileSwitchGeometry(pixel, pts: pts.seconds)
+    let geoNow = recBaker != nil ? renderer.fileSwitchGeometry(pixel, pts: pts.seconds) : .identity   // só a conversão no iPhone usa
     if recBaker != nil, let lf = lastFileFrame, lf.sid != 0, sidNow != 0, lf.sid != sidNow, abs(renderer.contentZoomSpeed(at: pts.seconds)) < 0.4 { fileXF = (lf.pixel, pts.seconds, lf.geo) }
     var xfOld: CVPixelBuffer?, xfBlend: Float = 0, xfGeo = SwitchGeometry.identity
     if let x = fileXF {
@@ -1593,10 +1630,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         shading: (Float(LensShading.k(lens: pixel.flatMap { LensID.name($0) })), Float(renderer.frameZoom?(pts.seconds) ?? zoomDriver.lastSet?.1 ?? 1)))
       if baked == nil { return }   // quadro que não converteu é descartado (nunca entra Log no meio do Rec.709)
     }
-    proRec?.appendVideo(sampleBuffer)   // mestre ProRes: quadro do sensor como chegou (Log 10 bits), nunca o convertido
-    writer.appendVideo(baked ?? sampleBuffer)
+    if !early {
+      proRec?.appendVideo(sampleBuffer)   // mestre ProRes: quadro do sensor como chegou (Log 10 bits), nunca o convertido
+      writer.appendVideo(baked ?? sampleBuffer)
+    }
     if let lw = liveWriter, pts.seconds - liveLastPTS >= 1.0 / 30 - 0.004 { liveLastPTS = pts.seconds; lw.appendVideo(baked ?? sampleBuffer) }   // live: 30 qps
-    if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds) }
+    if recStart == nil, writer.started { recStart = pts; gyro?.begin(at: pts.seconds); capDropBase = capDrop; capLateBase = capLate; capNoBufBase = capNoBuf }
     if fxLogOn, blur.active, let s = recStart { fxBuffer += MotionBlur.line(t: (pts - s).seconds, blur, stages: stages); fxLines += 1 }
     // gravador sem soltar pedaço nenhum (0.9.0): diagnóstico e, se o áudio não entra, fecha a faixa de áudio pro vídeo seguir
     if let s = recStart, writer.fileURL == nil, writer.segs == 0 {
@@ -1628,12 +1667,26 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let now = CACurrentMediaTime()
     if now - lastPublish > 0.25 {
       lastPublish = now
-      let e = Double(elapsedMs) / 1000, d = writer.dropped, failed = writer.failed
+      let cd = recStart == nil ? 0 : capDrop - capDropBase
+      let e = Double(elapsedMs) / 1000, d = writer.dropped + cd, failed = writer.failed
       publish { self.elapsed = e; self.droppedFrames = d; if let failed { self.status = "Gravador: \(failed)" } }
+      // 0.13.5: quadro caindo = diag NA HORA (com calor e pressão), no máximo 1 a cada 5 s
+      if d > capDiagN && now - capDiagAt > 5 {
+        capDiagAt = now; capDiagN = d
+        Diag.step("quadros-caindo", ["s": String(format: "%.1f", e), "camera": cd, "atrasado": capLate - capLateBase, "sem_buffer": capNoBuf - capNoBufBase, "gravador": writer.dropped,
+          "calor": Self.thermalName(), "pressao": pressureLevel, "tela_crua": renderer.rawScreen, "conversao": recBaker != nil, "prores": proRec != nil])
+      }
       if let failed { Diag.step("writer-error", ["err": failed]); stopRecording() }
     }
   }
-  func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {}
+  // 0.13.5: quadro que a câmera jogou fora antes de chegar (só o do arquivo conta; a saída rápida da tela pode pular)
+  func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    guard output === videoOut else { return }
+    let why = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil) as? String ?? ""
+    capDrop += 1
+    if why == (kCMSampleBufferDroppedFrameReason_FrameWasLate as String) { capLate += 1 }
+    else if why == (kCMSampleBufferDroppedFrameReason_OutOfBuffers as String) { capNoBuf += 1 }
+  }
   private var stopping: Bool { stopLock.lock(); defer { stopLock.unlock() }; return stopRequested }
 
   // ---- medidor: lê as amostras REAIS do microfone (as mesmas que vão pro arquivo), pico por canal
