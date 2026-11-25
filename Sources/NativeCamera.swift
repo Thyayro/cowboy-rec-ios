@@ -247,6 +247,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   @Published var droppedFrames = 0
   @Published var lightPreview = UserDefaults.standard.object(forKey: "lightPreview") as? Bool ?? true
   @Published var rawScreen = UserDefaults.standard.object(forKey: "telaCrua") as? Bool ?? true   // 0.13.5: tela leve = Log cru
+  // 0.13.8 MODO MESTRE (ligado = mestre ProRes ligado): o mestre é o armazenamento. Câmera a 30 qps (o mestre já é 30; 60
+  // só dobrava sensor, estabilização, codificação e calor), tela sem atraso (saída pequena) em Log cru, e gravando: sem
+  // conversão, sem efeitos, sem envio, áudio cru, sem contas de tela no quadro 4K.
+  @Published var masterMode = ProResPrefs.enabled
+  private var masterOn = ProResPrefs.enabled
   @Published var zoomInstant = UserDefaults.standard.object(forKey: "zoomInstant2") as? Bool ?? false   // 0.10.8: padrão = quadro como é (ver PreviewRenderer)
   // Arquivo final: Rec.709 + look convertido NO iPhone a partir do Log real (padrão) ou o Log original (cor na VPS)
   @Published var bake709 = false { didSet { UserDefaults.standard.set(bake709, forKey: "bake709") } }
@@ -522,6 +527,12 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let catalog = descriptors(cam)
     if wantsLog && !catalog.contains(where: { $0.log }) { wantsLog = false }   // lente/aparelho sem Log: segue sem, avisa no seletor
     if wantsLog { wantsHDR = false }
+    // 0.13.8 MODO MESTRE: o mestre sai a 30 — captar a 60 só dobrava o trabalho e o calor (24/11: pressão séria aos 45 s)
+    if masterOn, chosen.fps > 31, let p30 = NativeCapturePolicy.profiles(catalog, hdr: wantsHDR, log: wantsLog).first(where: { $0.width == chosen.width && $0.height == chosen.height && abs($0.fps - 30) < 0.6 }) {
+      Diag.step("modo-mestre-30", ["de": chosen.label, "para": p30.label], send: false)
+      chosen = p30
+    }
+    if masterOn && !renderer.lightPreview { setLightPreview(true) }   // a 30 qps a tela estabilizada atrasaria ~1 s
     if NativeCapturePolicy.select(chosen, hdr: wantsHDR, formats: catalog, log: wantsLog) == nil, profile == nil, cameraID != nil {
       // trocando de câmera: a frontal pode não ter 4K60 — usa o melhor que ela tiver no mesmo qps, senão o melhor geral
       if let best = NativeCapturePolicy.profiles(catalog, hdr: wantsHDR, log: wantsLog).first(where: { abs($0.fps - chosen.fps) < 0.5 }) ?? NativeCapturePolicy.profiles(catalog, hdr: wantsHDR, log: wantsLog).first { chosen = best }
@@ -816,6 +827,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   func selectProfile(_ id: String) {
     reconfigure {
       guard let cam = self.device, let p = NativeCapturePolicy.profiles(self.descriptors(cam), hdr: self.requestedHDR, log: self.requestedLog).first(where: { $0.id == id }) else { throw self.failure("Formato indisponível") }
+      UserDefaults.standard.set(p.fps, forKey: "qpsPedido")
       try self.configure(profile: p)
     }
   }
@@ -835,6 +847,19 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   func setZoomInstant(_ value: Bool) { UserDefaults.standard.set(value, forKey: "zoomInstant2"); renderer.zoomInstant = value; publish { self.zoomInstant = value } }
+  func setMasterMode(_ on: Bool) {
+    ProResPrefs.enabled = on; masterOn = on; publish { self.masterMode = on }
+    if on { setLightPreview(true); setRawScreen(true) }
+    Diag.step("modo-mestre", ["on": on])
+    reconfigure {
+      guard let cam = self.device else { return }
+      var p = self.selectedProfile
+      // desligando: volta ao qps que o operador escolheu (o modo mestre tinha descido pra 30)
+      let want = UserDefaults.standard.object(forKey: "qpsPedido") as? Double ?? 60
+      if !on, abs(p.fps - want) > 0.5, let back = NativeCapturePolicy.profiles(self.descriptors(cam), hdr: self.requestedHDR, log: self.requestedLog).first(where: { $0.width == p.width && $0.height == p.height && abs($0.fps - want) < 0.6 }) { p = back }
+      try self.configure(profile: p)
+    }
+  }
   func setRawScreen(_ value: Bool) { UserDefaults.standard.set(value, forKey: "telaCrua"); renderer.rawScreen = value; publish { self.rawScreen = value }; applyIdleRate() }
   func setLightPreview(_ value: Bool) { UserDefaults.standard.set(value, forKey: "lightPreview"); renderer.lightPreview = value; publish { self.lightPreview = value } }
   func setBitrate(_ value: Int) { UserDefaults.standard.set(value, forKey: "bitrate"); publish { self.bitrateChoice = value } }
@@ -1290,7 +1315,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   // ---- gravar: direto na nuvem
   func record(owner: String, aspect: String, look: LookPreset) {
     let convert = convertRec709, bitrate = Self.bitrates[max(0, min(Self.bitrates.count - 1, bitrateChoice))].bps
-    let fxLive = motionBlur && !fxRender, fxRend = motionBlur && fxRender, fxDeg = blurAngle
+    let fxLive = motionBlur && !fxRender && !masterOn, fxRend = motionBlur && fxRender && !masterOn, fxDeg = blurAngle   // 0.13.8: modo mestre sem efeitos
     let mistL = Mist.level(mistLevel)
     let horizon: Double? = rotation.map { Double($0.videoRotationAngleForHorizonLevelCapture) }   // lido na thread principal
     queue.async {
@@ -1305,8 +1330,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           Diag.step("idle-rate", ["qps": fps, "por": "gravar"])
         }
         let source: SourceColor = self.requestedLog ? .appleLog : self.requestedHDR ? .hlg : .sdr
-        var bakeFn = self.bake709 ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
-        if bakeFn == nil && self.bake709 && mistL != nil { bakeFn = { $0 } }   // SDR natural com névoa: o shader passa a cor igual e aplica a névoa
+        let bakeOn = self.bake709 && !self.masterOn   // 0.13.8: modo mestre nunca converte no iPhone (a VPS faz a cópia 709)
+        var bakeFn = bakeOn ? ColorMath.previewTransform(source: source, rawLog: false, look: look) : nil
+        if bakeFn == nil && bakeOn && mistL != nil { bakeFn = { $0 } }   // SDR natural com névoa: o shader passa a cor igual e aplica a névoa
         let incoming = (self.videoOut.videoSettings?[kCVPixelBufferPixelFormatTypeKey as String] as? NSNumber)?.uint32Value ?? CMFormatDescriptionGetMediaSubType(cam.activeFormat.formatDescription)
         if bakeFn != nil && !LutBaker.supports(incoming) { Diag.step("bake-unsupported", ["fmt": incoming]) }
         let baker = LutBaker.supports(incoming) ? bakeFn.flatMap { LutBaker(transform: $0) } : nil
@@ -1367,7 +1393,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             self.stopLock.lock(); self.stopRequested = false; self.stopLock.unlock()
             self.recBaker = baker; self.recMist = mistFile
             self.fileBlur = fxLive && baker != nil; self.fxLogOn = false; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
-            RecGate.begin(nil); self.pressureMax = self.pressureLevel; self.capDiagN = 0
+            RecGate.begin(nil, strict: self.masterOn); self.pressureMax = self.pressureLevel; self.capDiagN = 0
             self.writer = writer; self.recCid = nil; self.recOwner = owner; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = nil; self.elapsedMs = 0
             self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
           }
@@ -1409,7 +1435,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
           self.recBaker = baker; self.recMist = mistFile
           self.fileBlur = fxLive && baker != nil; self.fxLogOn = fxRend; self.fxBuffer = ""; self.fxLines = 0; self.lastFileFrame = nil; self.fileXF = nil; self.writerStall = 0
           self.writer = writer; self.recCid = cid; self.recStart = nil; self.recAngle = angle; self.recFront = isFront; self.thumbDone = false; self.gyro = gyro; self.elapsedMs = 0
-          RecGate.begin(cid); self.pressureMax = self.pressureLevel; self.capDiagN = 0
+          RecGate.begin(cid, strict: self.masterOn); self.pressureMax = self.pressureLevel; self.capDiagN = 0
           MotionHub.shared.attach(gyro)
           self.publish { self.recording = true; self.finishing = false; self.elapsed = 0; self.droppedFrames = 0 }
         }
@@ -1591,7 +1617,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
     if output === audioOut {
       meter(sampleBuffer)
-      let clean = noise.process(sampleBuffer)   // roda sempre (a estimativa do ruído fica pronta antes de gravar)
+      let clean = masterOn ? nil : noise.process(sampleBuffer)   // modo mestre: áudio cru (0.13.8); senão roda sempre
       if !stopping { proRec?.appendAudio(clean ?? sampleBuffer); writer?.appendAudio(clean ?? sampleBuffer); liveWriter?.appendAudio(clean ?? sampleBuffer) }
       return
     }
@@ -1608,8 +1634,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // conta da tela (troca de lente, medidas). A tela pode pular quadro; o arquivo não.
     let early = recBaker == nil && writer != nil && !halt && !cadenceWait
     if early, let writer { proRec?.appendVideo(sampleBuffer); writer.appendVideo(sampleBuffer) }
-    if metaScoutStab > 0 { scoutMeta(sampleBuffer, fast: false) }
-    if let pixel { renderer.push(pixel, pts: pts.seconds) }
+    if metaScoutStab > 0 && !early { scoutMeta(sampleBuffer, fast: false) }
+    // 0.13.8: gravando com a tela sem atraso e sem conversão, o quadro 4K não serve à tela — não segura buffer nem faz conta
+    if let pixel, !(early && renderer.lightPreview) { renderer.push(pixel, pts: pts.seconds) }
     guard let writer, !halt, !cadenceWait else { return }
     // desfoque de movimento (0.8.9): Live = no shader do arquivo; Render = linha no arquivo de efeitos (a VPS aplica)
     var blur = BlurParams.none, stages = (1, 1)

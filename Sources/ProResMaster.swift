@@ -456,6 +456,7 @@ final class ProResUploader: ObservableObject, @unchecked Sendable {
 /// Ajustes › ProRes Log extra (soma à gravação de sempre; desligado = o app como era)
 struct ProResSettingsSection: View {
   let recording: Bool
+  var onMaster: ((Bool) -> Void)? = nil
   @ObservedObject var up = ProResUploader.shared
   @State private var on = ProResPrefs.enabled
   @State private var home = ProResPrefs.home
@@ -463,7 +464,8 @@ struct ProResSettingsSection: View {
   var body: some View {
     Section("Mestre ProRes (armazenamento)") {
       Toggle("Gravar mestre ProRes (Apple Log 10 bits)", isOn: $on).disabled(recording)
-        .onChange(of: on) { _, v in ProResPrefs.enabled = v; if v { ProResUploader.shared.wake() } }
+        .onChange(of: on) { _, v in if let onMaster { onMaster(v) } else { ProResPrefs.enabled = v }; if v { ProResUploader.shared.wake() } }
+      if on { Text("MODO MESTRE (trabalho pesado): câmera a 30 qps no mesmo 4K (o mestre é 30), tela sem atraso em Log cru, e gravando: sem conversão, sem efeitos, sem envio (sobe ao parar) e áudio cru. Desligar volta o formato que você escolheu.").font(.caption2) }
       if !on { Text("DESLIGADO: só a gravação de sempre (HEVC). Ligue para guardar o mestre de cinema.").font(.caption).foregroundStyle(.orange) }
       if on {
         let free = Double(ProResRecorder.freeBytes() - ProResPolicy.minFreeBytes) / 1e9, rate = ProResPolicy.gbPerMinute(away, width: 3840, height: 2160, fps: 30)

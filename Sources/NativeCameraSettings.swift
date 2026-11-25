@@ -11,9 +11,9 @@ struct NativeCameraSettings: View {
           Text("Desligada").tag(0); Text("Standard").tag(1); Text("Cinematic").tag(2); Text("Cinematic Extended").tag(3); Text("Extrema").tag(4)
         }.pickerStyle(.segmented).disabled(configuringDisabled)
         Text("Ativa agora (arquivo): \(NativeCamera.label(camera.activeMode))").font(.caption)
-        Toggle("Tela leve (Log cru)", isOn: Binding(get: { camera.rawScreen }, set: { camera.setRawScreen($0) }))
+        Toggle("Tela leve (Log cru)", isOn: Binding(get: { camera.rawScreen }, set: { camera.setRawScreen($0) })).disabled(camera.masterMode)
         Text(camera.rawScreen ? "A tela mostra o Log cru (cinza, sem LUT, sem look, sem névoa) e cai pra 30 qps gravando — menos GPU e calor. O mestre ProRes e o arquivo não mudam e recebem todos os quadros." : "A tela mostra a cor final (Rec.709 + look). Pesa mais: usar só com o aparelho frio.").font(.caption2)
-        Toggle("Prévia sem atraso", isOn: Binding(get: { camera.lightPreview }, set: { camera.setLightPreview($0) }))
+        Toggle("Prévia sem atraso", isOn: Binding(get: { camera.lightPreview }, set: { camera.setLightPreview($0) })).disabled(camera.masterMode)
         Text(camera.lightPreview ? "A tela mostra a câmera em tempo real com estabilização leve (como a câmera do iPhone): zoom e troca de lente na hora. O ARQUIVO sai com a estabilização escolhida acima, no mesmo enquadramento." : "A tela mostra exatamente o quadro do arquivo (estabilização forte), com o atraso dela — inclusive no zoom.").font(.caption2)
         if !camera.lightPreview {
           Toggle("Zoom na hora", isOn: Binding(get: { camera.zoomInstant }, set: { camera.setZoomInstant($0) }))
@@ -53,7 +53,7 @@ struct NativeCameraSettings: View {
         Toggle("Apple Log", isOn: Binding(get: { camera.logEnabled }, set: { camera.setLog($0) })).disabled(configuringDisabled || !camera.logAvailable)
         if !camera.logAvailable { Text("Apple Log não aparece nesta lente/formato (\(camera.formatLabel)). Só iPhone Pro grava Log.").font(.caption2) }
         Toggle("HDR (HLG)", isOn: Binding(get: { camera.hdrEnabled }, set: { camera.setHDR($0) })).disabled(configuringDisabled || !camera.hdrAvailable || camera.logEnabled)
-        Toggle("Prévia em Rec.709 (LUT do Log)", isOn: Binding(get: { !camera.rawLog && !camera.rawScreen }, set: { camera.setRawLog(!$0); camera.setRawScreen(!$0) })).disabled(!(camera.logEnabled || camera.hdrEnabled))
+        Toggle("Prévia em Rec.709 (LUT do Log)", isOn: Binding(get: { !camera.rawLog && !camera.rawScreen }, set: { camera.setRawLog(!$0); camera.setRawScreen(!$0) })).disabled(!(camera.logEnabled || camera.hdrEnabled) || camera.masterMode)
         if camera.rawScreen { Text("Tela leve: a tela mostra o Log cru (cinza) pra não esquentar. O mestre e o arquivo não mudam.").font(.caption2) }
         Toggle("Arquivo final em Rec.709 + look", isOn: $camera.bake709).disabled(configuringDisabled)
         Text(camera.bake709 ? "Ligado: cada quadro do Log real (10 bits) é convertido no iPhone pela curva oficial do Apple Log pra Rec.709 e recebe o look escolhido. O arquivo que sobe já é o final, sem esperar a VPS." : "Desligado: sobe o Apple Log original (10 bits) pra colorir; a VPS faz a cópia Rec.709 + look depois.").font(.caption2)
@@ -62,7 +62,7 @@ struct NativeCameraSettings: View {
           ForEach(camera.codecs, id: \.self) { codec in Text(codec == "hvc1" ? "HEVC" : codec == "avc1" ? "H.264" : codec).tag(codec) }
         }.disabled(configuringDisabled || camera.hdrEnabled || camera.logEnabled)
       }
-      ProResSettingsSection(recording: camera.recording)
+      ProResSettingsSection(recording: camera.recording, onMaster: { camera.setMasterMode($0) })
       Section("Foco e luz") {
         Toggle("Travar luz e cor", isOn: Binding(get: { camera.colorLocked }, set: { camera.lockColor($0) })).disabled(!camera.ready)
         Toggle("Lanterna", isOn: Binding(get: { camera.torchEnabled }, set: { camera.setTorch($0) })).disabled(!camera.ready || !camera.torchAvailable)

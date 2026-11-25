@@ -507,13 +507,14 @@ enum RecGate {
   private static let lock = NSLock()
   private static var current: String?   // tomada gravando agora ("?" = gravando sem nuvem); nil = parado
   private static var hot = false        // calor ≥ quente ou pressão da câmera ≥ séria
-  static func begin(_ cid: String?) { lock.lock(); current = cid ?? "?"; lock.unlock() }
+  private static var strict = false     // 0.13.8 modo mestre: gravando, nada sobe
+  static func begin(_ cid: String?, strict s: Bool = false) { lock.lock(); current = cid ?? "?"; strict = s; lock.unlock() }
   static func end() { lock.lock(); current = nil; lock.unlock(); CloudStream.shared.kick(); ProResUploader.shared.kick() }
   static func setHot(_ h: Bool) { lock.lock(); hot = h; lock.unlock() }
   static var recording: Bool { lock.lock(); defer { lock.unlock() }; return current != nil }
   static var isHot: Bool { lock.lock(); defer { lock.unlock() }; return hot }
   /// pode subir pedaço da tomada `cid` agora?
-  static func allows(stream cid: String) -> Bool { lock.lock(); defer { lock.unlock() }; guard let c = current else { return true }; return !hot && c == cid }
+  static func allows(stream cid: String) -> Bool { lock.lock(); defer { lock.unlock() }; guard let c = current else { return true }; return !strict && !hot && c == cid }
   /// mestre ProRes: gravando, só pro PC de casa (Wi-Fi) e com o aparelho frio; na rua espera parar
-  static func allowsProRes(toPC: Bool) -> Bool { lock.lock(); defer { lock.unlock() }; return current == nil || (toPC && !hot) }
+  static func allowsProRes(toPC: Bool) -> Bool { lock.lock(); defer { lock.unlock() }; return current == nil || (!strict && toPC && !hot) }
 }
