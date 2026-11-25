@@ -457,13 +457,13 @@ struct ProResSettingsSection: View {
   var body: some View {
     Section("Mestre ProRes (armazenamento)") {
       Toggle("Gravar mestre ProRes (Apple Log 10 bits)", isOn: $on).disabled(recording)
+        .onChange(of: on) { _, v in ProResPrefs.enabled = v; if v { ProResUploader.shared.wake() } }
       if !on { Text("DESLIGADO: só a gravação de sempre (HEVC). Ligue para guardar o mestre de cinema.").font(.caption).foregroundStyle(.orange) }
       if on {
         let free = Double(ProResRecorder.freeBytes() - ProResPolicy.minFreeBytes) / 1e9, rate = ProResPolicy.gbPerMinute(away, width: 3840, height: 2160, fps: 30)
         Text(String(format: "iPhone com espaço pra ~%.0f min de mestre %@ 4K (%.1f GB/min) antes de parar com 3 GB.", max(0, free) / max(0.1, rate), away.label, rate)).font(.caption)
           .foregroundStyle(free / max(0.1, rate) < 5 ? .orange : .secondary)
       }
-        .onChange(of: on) { _, v in ProResPrefs.enabled = v; if v { ProResUploader.shared.wake() } }
       if on {
         Picker("Em casa (Wi-Fi → PC)", selection: $home) { ForEach(ProResFlavor.allCases, id: \.self) { Text($0.label).tag($0) } }
           .disabled(recording).onChange(of: home) { _, v in ProResPrefs.home = v }
