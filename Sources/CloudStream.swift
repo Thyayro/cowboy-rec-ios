@@ -294,7 +294,7 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
       let open = live.filter { RecGate.allows(stream: $0.m.cid) }
       if open.isEmpty {
         lock.unlock()
-        setHealth(.slow, RecGate.isHot ? "Gravando no iPhone — aparelho quente, a nuvem recebe ao parar" : "Gravando no iPhone — as anteriores sobem ao parar")
+        setHealth(.ok, "Gravando no iPhone — sobe ao parar")
         try? await Task.sleep(nanoseconds: 1_000_000_000); continue
       }
       guard let t = open.first(where: { $0.holdUntil <= now }) else {
@@ -476,7 +476,12 @@ final class CloudStream: ObservableObject, @unchecked Sendable {
     let total = Double(mem + disk) / 1_048_576, onDisk = Double(disk) / 1_048_576
     publish { self.pendingMB = total; self.diskMB = onDisk }
   }
-  private func setHealth(_ h: Health, _ text: String) { lock.lock(); netDown = h == .offline; lock.unlock(); publish { self.health = h; self.line = text } }
+  private var lastHealth: (Health, String)?
+  private func setHealth(_ h: Health, _ text: String) {
+    lock.lock(); netDown = h == .offline; let same = lastHealth?.0 == h && lastHealth?.1 == text; lastHealth = (h, text); lock.unlock()
+    if same { return }   // 0.13.7: mesmo aviso não é republicado (24/11: "vários avisos" na tela durante a gravação)
+    publish { self.health = h; self.line = text }
+  }
   var uploadMbps: Double { rate * 8 / 1_000_000 }
   /// pedaços da gravação ao vivo ainda não enviados (o mestre ProRes cede a rede quando > 3)
   var liveBacklog: Int { lock.lock(); defer { lock.unlock() }; return takes.filter { !$0.m.closed && $0.m.dead == nil }.reduce(0) { $0 + $1.mem.count + $1.disk.count } }

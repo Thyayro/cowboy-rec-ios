@@ -11,7 +11,7 @@ import UIKit
 // só é apagado do iPhone com o recibo de quem recebeu (sha256 conferido):
 //   • EM CASA (PC achado na rede Wi-Fi) → direto pro receptor do PC (F:\CowboyRec\ProRes), 422 LT 4K30;
 //   • FORA → VPS pela internet, 422 HQ (o máximo, pedido dele); o PC puxa da VPS sem parar e a VPS apaga.
-// O iPhone só segura o ATRASO da rede (fora de casa, no 4G, o HQ acumula — o mestre para se o iPhone ficar com < 3 GB).
+// O iPhone só segura o ATRASO da rede (fora de casa, no 4G, o HQ acumula — o mestre para se o iPhone ficar com < 5 GB).
 // Gravando a 60 qps o mestre vai a 30 (1 quadro sim, 1 não; limite da Apple sem SSD); a gravação de sempre fica a 60.
 
 enum ProResPrefs {
@@ -76,7 +76,13 @@ final class ProResRecorder: @unchecked Sendable {
   private var stopped: String?
   private var segs = 0, dropped = 0
 
-  static func freeBytes() -> Int64 { Int64((try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage) ?? 0) }
+  /// 0.13.7: livre REAL (o "importante" conta cache que o iOS só limpa depois: 24/11 marcava 13,3 GB e deu "Disco Cheio" em 1:47)
+  static func freeBytes() -> Int64 {
+    let v = try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+    let imp = Int64(v?.volumeAvailableCapacityForImportantUsage ?? 0), real = Int64(v?.volumeAvailableCapacity ?? 0)
+    if real <= 0 { return imp }
+    return imp > 0 ? min(imp, real) : real
+  }
 
   init(owner: String, flavor: ProResFlavor, home: Bool, video: [String: Any], audio: [String: Any], transform: CGAffineTransform, fps: Double, width: Int, height: Int, rotation: Double, title: String, queue: DispatchQueue) throws {
     cid = "pr" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(18).lowercased()
@@ -461,7 +467,7 @@ struct ProResSettingsSection: View {
       if !on { Text("DESLIGADO: só a gravação de sempre (HEVC). Ligue para guardar o mestre de cinema.").font(.caption).foregroundStyle(.orange) }
       if on {
         let free = Double(ProResRecorder.freeBytes() - ProResPolicy.minFreeBytes) / 1e9, rate = ProResPolicy.gbPerMinute(away, width: 3840, height: 2160, fps: 30)
-        Text(String(format: "iPhone com espaço pra ~%.0f min de mestre %@ 4K (%.1f GB/min) antes de parar com 3 GB.", max(0, free) / max(0.1, rate), away.label, rate)).font(.caption)
+        Text(String(format: "iPhone com espaço pra ~%.0f min de mestre %@ 4K (%.1f GB/min) antes de parar com 5 GB livres.", max(0, free) / max(0.1, rate), away.label, rate)).font(.caption)
           .foregroundStyle(free / max(0.1, rate) < 5 ? .orange : .secondary)
       }
       if on {
@@ -471,7 +477,7 @@ struct ProResSettingsSection: View {
           .disabled(recording).onChange(of: away) { _, v in ProResPrefs.away = v }
         Text(up.pcOnline ? "PC de casa achado na rede: o mestre vai direto pro F:\\CowboyRec (\(home.label))." : "PC de casa fora de alcance: o mestre vai pra VPS (\(away.label)) e o PC puxa de lá.").font(.caption)
           .foregroundStyle(up.pcOnline ? .green : .secondary)
-        Text(String(format: "4K30: %@ ≈ %.1f GB/min · %@ ≈ %.1f GB/min. Gravando a 60, o mestre sai a 30 (sem SSD é o limite da Apple); a gravação de sempre continua igual. Cada pedaço de 2 s só sai do iPhone com recibo; o iPhone guarda só o que a rede ainda não levou. Fora de casa, no 4G, o HQ acumula no iPhone (sobe depois sozinho); com menos de 3 GB livres o mestre para e a gravação de sempre segue.",
+        Text(String(format: "4K30: %@ ≈ %.1f GB/min · %@ ≈ %.1f GB/min. Gravando a 60, o mestre sai a 30 (sem SSD é o limite da Apple); a gravação de sempre continua igual. Cada pedaço de 2 s só sai do iPhone com recibo; o iPhone guarda só o que a rede ainda não levou. Fora de casa, no 4G, o HQ acumula no iPhone (sobe depois sozinho); com menos de 5 GB livres o mestre para e a gravação de sempre segue.",
           home.label, ProResPolicy.gbPerMinute(home, width: 3840, height: 2160, fps: 30), away.label, ProResPolicy.gbPerMinute(away, width: 3840, height: 2160, fps: 30))).font(.caption2)
       }
       if up.pendingGB > 0.01 { Text(String(format: "Mestre no iPhone esperando envio: %.1f GB", up.pendingGB)).font(.caption) }

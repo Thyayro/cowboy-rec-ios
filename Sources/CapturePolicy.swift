@@ -86,5 +86,6 @@ enum ProResPolicy {
   static func gbPerMinute(_ f: ProResFlavor, width: Int, height: Int, fps: Double) -> Double { mbps(f, width: width, height: height, fps: fps) * 60 / 8 / 1000 }
   static let segmentSeconds = 2.0
   /// livre mínimo no iPhone pra continuar o ProRes (abaixo disso o mestre para e a gravação de sempre segue)
-  static let minFreeBytes: Int64 = 3_000_000_000
+  // 0.13.7: 5 GB de folga (24/11: perto de encher, a escrita do iPhone fica lenta e a câmera fica sem buffer — 499 quadros)
+  static let minFreeBytes: Int64 = 5_000_000_000
 }

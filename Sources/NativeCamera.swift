@@ -1451,7 +1451,9 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     do {
       let r = try ProResRecorder(owner: owner, flavor: flavor, home: home, video: mv, audio: pcm, transform: transform, fps: fps, width: Int(d.width), height: Int(d.height),
         rotation: front ? 0 : angle, title: "iPhone \(f.string(from: Date())) · ProRes", queue: dataQueue)
-      Diag.step("prores-start", ["sabor": flavor.label, "destino": home ? "pc" : "vps", "fmt": "\(d.width)x\(d.height)", "qps_mestre": ProResPolicy.masterFPS(fps), "livre_gb": Double(free) / 1e9, "video": String(String(describing: mv).prefix(300))])
+      let mins = Double(free - ProResPolicy.minFreeBytes) / 1e9 / max(0.1, ProResPolicy.gbPerMinute(flavor, width: Int(d.width), height: Int(d.height), fps: ProResPolicy.masterFPS(fps)))
+      publish { self.status = String(format: "Mestre ProRes %@: cabe ~%.0f min no iPhone (%.0f GB livres)", flavor.label, max(0, mins), Double(free) / 1e9) }
+      Diag.step("prores-start", ["min_cabem": String(format: "%.1f", mins), "sabor": flavor.label, "destino": home ? "pc" : "vps", "fmt": "\(d.width)x\(d.height)", "qps_mestre": ProResPolicy.masterFPS(fps), "livre_gb": Double(free) / 1e9, "video": String(String(describing: mv).prefix(300))])
       return r
     } catch {
       Diag.step("prores-writer-fail", ["err": error.localizedDescription, "sabor": flavor.label])
