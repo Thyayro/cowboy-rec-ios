@@ -13,6 +13,7 @@ final class PreviewEIS: @unchecked Sendable {
   private var pathX = 0.0, pathY = 0.0      // caminho acumulado (fração do quadro)
   private var smX = 0.0, smY = 0.0          // caminho suavizado
   private var lastT = 0.0
+  private var lastSensor = 0                 // 0.14.1: lente do quadro anterior
   var margin = 0.035                         // quanto a tela pode deslocar (cabe no corte do estabilizador do arquivo)
 
   // pequena (luma 0–1) direto do plano Y — 8 ou 10 bits
@@ -56,12 +57,16 @@ final class PreviewEIS: @unchecked Sendable {
     let fy = Double(best.dy) + sub(cost(a, b, best.dx, best.dy - 1), best.e, cost(a, b, best.dx, best.dy + 1))
     return (fx / Double(w), fy / Double(h))
   }
-  func reset() { prev = nil; pathX = 0; pathY = 0; smX = 0; smY = 0; lastT = 0 }
+  func reset() { prev = nil; pathX = 0; pathY = 0; smX = 0; smY = 0; lastT = 0; lastSensor = 0 }
   // correção do quadro (coordenadas do sensor, fração): aplicar como deslocamento da imagem
-  func process(_ buffer: CVPixelBuffer, t: Double, hold: Bool = false) -> (Double, Double) {
+  func process(_ buffer: CVPixelBuffer, t: Double, hold: Bool = false, sensor: Int = 0) -> (Double, Double) {
     guard let cur = Self.luma(buffer) else { return (0, 0) }
     let dt = lastT == 0 ? 1.0 / 60 : min(0.1, max(0.004, t - lastT)); lastT = t
-    if !hold, let p = prev, let s = Self.shift(cur, p) { pathX += s.0; pathY += s.1 }   // a cena andou s -> a câmera andou −s
+    // 0.14.1: quadro de OUTRA lente não é tremor da mão. Antes o pulo da troca entrava como movimento e a tela
+    // "corrigia" até 3,5% (a quebra de posição grosseira saindo do 0,5x; 0,5x->5x = 2 trocas = 2 quebras)
+    let switched = sensor != 0 && lastSensor != 0 && sensor != lastSensor
+    if sensor != 0 { lastSensor = sensor }
+    if !hold, !switched, let p = prev, let s = Self.shift(cur, p) { pathX += s.0; pathY += s.1 }   // a cena andou s -> a câmera andou −s
     prev = cur
     let k = 1 - exp(-dt / 0.33)
     smX += (pathX - smX) * k; smY += (pathY - smY) * k

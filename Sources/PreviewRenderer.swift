@@ -33,6 +33,9 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
   private var fastFresh = false
   private let eis = PreviewEIS()
   private var fastCorr = (0.0, 0.0)
+  private var fastSid = 0                                   // 0.14.1: lente do quadro rápido
+  private var prevLive: (image: CIImage, sid: Int)?        // 0.14.1: último quadro mostrado na tela sem atraso
+  private var liveXfade: (image: CIImage, t0: Double)?
   // prévia estabilizada: zoom que cada quadro carrega pelo REGISTRO exato do ZoomDriver + trava calibrada no aparelho
   // (ZoomLag/ZoomCalibration); nil = sem calibração aprovada: conta antiga. Só a thread da tela lê e escreve.
   let calibRec = ZoomCalibRecorder()
@@ -256,10 +259,10 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       }
     }
     if !lightPreview && zoomInstant { zoomTrack.feed(pts: pts, zHist: zHistFast, thumb: trackMoving ? ZoomImage.thumb(buffer) : nil, moving: trackMoving, sensor: sid) }
-    let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming) : (0, 0)
+    let corr = lightPreview ? eis.process(buffer, t: pts, hold: zooming, sensor: sid) : (0, 0)
     lock.lock()
     if frozen { lock.unlock(); return }
-    fastBuffer = buffer; fastPTS = pts; fastFresh = true; fastCorr = corr
+    fastBuffer = buffer; fastPTS = pts; fastFresh = true; fastCorr = corr; fastSid = sid
     let now = CACurrentMediaTime()
     fastAt = now
     let wantStats = now >= nextStats && !statsBusy
@@ -542,7 +545,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if first { onCrop?(value) }
   }
   // troca de câmera/formato: a tela segura o último quadro (sem piscar deitado) até chegarem quadros da configuração nova
-  func freeze() { lock.lock(); frozen = true; pending = nil; prevShown = nil; xfade = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; arrival.reset(); frameLock.reset(); fastRetry = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
+  func freeze() { lock.lock(); frozen = true; pending = nil; prevShown = nil; xfade = nil; prevLive = nil; liveXfade = nil; fastBuffer = nil; lastFast = nil; lastStab = nil; arrival.reset(); frameLock.reset(); fastRetry = nil; eis.reset(); fastCorr = (0, 0); shownK.removeAll(); lock.unlock(); zoomTrack.reset(); switchHider.reset() }
   func thaw(drop: Int = 4) { lock.lock(); frozen = false; dropFrames = drop; zoomHistory.removeAll(); cropSamples.removeAll(); cropFrozen = false; crop = 1.06; shownCrop = 0; nextCalib = 0; calibFast = nil; calibBusy = false; lock.unlock() }
   private func zoomAt(_ t: Double) -> Double? {
     guard let first = zoomHistory.first else { return nil }
@@ -598,7 +601,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     let live = lightPreview && fast != nil
     let corrNow = fastCorr
     let liveFrame: CVPixelBuffer? = live && fastFresh ? fast : nil
-    let livePTS = fastPTS
+    let livePTS = fastPTS, liveSid = fastSid
     if live { fastFresh = false; pending = nil }
     lock.unlock()
     let dzNow = max(1, digitalNow?() ?? 1)
@@ -615,7 +618,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if live {
       guard let liveFrame else { return }
       drawLive(view, liveFrame, crop: cropNow, cube: cube, size: size, orient: orient, mirror: mirror, match: lensMatch?.correction(at: livePTS ?? now, lens: LensID.name(liveFrame)) ?? .identity,
-        geo: aligner?.geometry("fast", at: livePTS ?? now) ?? .identity, shake: corrNow, pts: livePTS)
+        geo: .identity, shake: corrNow, pts: livePTS, sid: liveSid, now: now)   // 0.14.1: sem o alinhador antigo (empurrava ~3% + ampliava na troca)
       return
     }
     // troca de lente (0.8.0): preparo/saída sem pulo; ida-e-volta rápida = a tela segura o quadro anterior
@@ -688,7 +691,7 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     frames += 1
   }
 
-  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection, geo: SwitchGeometry, shake: (Double, Double) = (0, 0), pts: Double? = nil) {
+  private func drawLive(_ view: MTKView, _ buffer: CVPixelBuffer, crop: Double, cube: Data?, size: Int, orient: CGImagePropertyOrientation, mirror: Bool, match: LensCorrection, geo: SwitchGeometry, shake: (Double, Double) = (0, 0), pts: Double? = nil, sid: Int = 0, now: Double = CACurrentMediaTime()) {
     guard let commandQueue, let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
     let target = view.drawableSize
     guard target.width > 0, target.height > 0 else { return }
@@ -710,6 +713,14 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
       if mistLevel > 0 { image = Mist.apply(image, level: mistLevel) }
     } else { image = image.cropped(to: fit) }
     image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: CGRect(origin: .zero, size: target)))
+    // 0.14.1: troca de lente = o mesmo dissolve curto da tela estabilizada (0,18 s), sem deslocar nem ampliar
+    if let pv = prevLive, pv.sid != 0, sid != 0, pv.sid != sid { liveXfade = (pv.image, now) }
+    let fresh = image
+    if let x = liveXfade {
+      let a = (now - x.t0) / Self.xfadeDur
+      if a >= 1 || a < 0 { liveXfade = nil } else { image = x.image.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: image, kCIInputTimeKey: a * a * (3 - 2 * a)]) }
+    }
+    prevLive = (fresh, sid)
     let destination = CIRenderDestination(width: Int(target.width), height: Int(target.height), pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer) { drawable.texture }
     destination.isFlipped = true
     _ = try? context.startTask(toRender: image, to: destination)
