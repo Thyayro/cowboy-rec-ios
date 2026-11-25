@@ -609,7 +609,8 @@ final class PreviewRenderer: NSObject, MTKViewDelegate, @unchecked Sendable {
     if !blurHot { tap.tick(now: now, moving: zoomMovedNow || dMoved) }
     // quente, sem gravar e com o zoom parado há 1 s: a tela a 30 qps (metade do trabalho de GPU da prévia)
     let recNow = recordingNow?() ?? false
-    let wantFPS = recNow && (rawScreen || pressure >= 2) ? (pressure >= 2 ? 24 : 30) : (blurHot && !recNow && now - lastZoomMove > 1.0 && xfade == nil ? 30 : 60)
+    let wantFPS = recNow ? ((rawScreen || pressure >= 2) ? (pressure >= 2 ? 24 : 30) : 60)
+      : ((rawScreen || blurHot || pressure >= 2) && now - lastZoomMove > 1.0 && xfade == nil ? 30 : 60)   // 0.13.6: tela leve parada = 30
     if wantFPS != shownFPS { shownFPS = wantFPS; view.preferredFramesPerSecond = wantFPS; Diag.step("screen-fps", ["qps": wantFPS], send: false) }
     if live {
       guard let liveFrame else { return }

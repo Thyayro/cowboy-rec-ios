@@ -16,7 +16,9 @@ import UIKit
 
 enum ProResPrefs {
   private static let d = UserDefaults.standard
-  static var enabled: Bool { get { d.object(forKey: "proresExtra") as? Bool ?? true } set { d.set(newValue, forKey: "proresExtra") } }
+  // 0.13.6: o mestre ProRes É o armazenamento (operador 24/11) — chave nova, ligada de fábrica; o "desligado" antigo
+  // ("proresExtra", salvo na rua em 20/11) é ignorado. Desligar continua possível em Ajustes.
+  static var enabled: Bool { get { d.object(forKey: "proresMestre") as? Bool ?? true } set { d.set(newValue, forKey: "proresMestre") } }
   static var home: ProResFlavor { get { ProResFlavor(rawValue: d.string(forKey: "proresHome") ?? "") ?? .hq } set { d.set(newValue.rawValue, forKey: "proresHome") } }
   static var away: ProResFlavor { get { ProResFlavor(rawValue: d.string(forKey: "proresAway") ?? "") ?? .hq } set { d.set(newValue.rawValue, forKey: "proresAway") } }
 }
@@ -453,8 +455,14 @@ struct ProResSettingsSection: View {
   @State private var home = ProResPrefs.home
   @State private var away = ProResPrefs.away
   var body: some View {
-    Section("ProRes Log extra (mestre)") {
-      Toggle("Gravar mestre ProRes junto", isOn: $on).disabled(recording)
+    Section("Mestre ProRes (armazenamento)") {
+      Toggle("Gravar mestre ProRes (Apple Log 10 bits)", isOn: $on).disabled(recording)
+      if !on { Text("DESLIGADO: só a gravação de sempre (HEVC). Ligue para guardar o mestre de cinema.").font(.caption).foregroundStyle(.orange) }
+      if on {
+        let free = Double(ProResRecorder.freeBytes() - ProResPolicy.minFreeBytes) / 1e9, rate = ProResPolicy.gbPerMinute(away, width: 3840, height: 2160, fps: 30)
+        Text(String(format: "iPhone com espaço pra ~%.0f min de mestre %@ 4K (%.1f GB/min) antes de parar com 3 GB.", max(0, free) / max(0.1, rate), away.label, rate)).font(.caption)
+          .foregroundStyle(free / max(0.1, rate) < 5 ? .orange : .secondary)
+      }
         .onChange(of: on) { _, v in ProResPrefs.enabled = v; if v { ProResUploader.shared.wake() } }
       if on {
         Picker("Em casa (Wi-Fi → PC)", selection: $home) { ForEach(ProResFlavor.allCases, id: \.self) { Text($0.label).tag($0) } }

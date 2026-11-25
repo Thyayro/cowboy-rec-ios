@@ -727,6 +727,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         if self.recording { self.pressureMax = max(self.pressureMax, lv) }
         self.renderer.pressure = lv
         self.updateHot()
+        self.applyIdleRate()
       }
       renderer.rawScreen = rawScreen
       idleSlow = false
@@ -834,7 +835,7 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
   }
   func setZoomInstant(_ value: Bool) { UserDefaults.standard.set(value, forKey: "zoomInstant2"); renderer.zoomInstant = value; publish { self.zoomInstant = value } }
-  func setRawScreen(_ value: Bool) { UserDefaults.standard.set(value, forKey: "telaCrua"); renderer.rawScreen = value; publish { self.rawScreen = value } }
+  func setRawScreen(_ value: Bool) { UserDefaults.standard.set(value, forKey: "telaCrua"); renderer.rawScreen = value; publish { self.rawScreen = value }; applyIdleRate() }
   func setLightPreview(_ value: Bool) { UserDefaults.standard.set(value, forKey: "lightPreview"); renderer.lightPreview = value; publish { self.lightPreview = value } }
   func setBitrate(_ value: Int) { UserDefaults.standard.set(value, forKey: "bitrate"); publish { self.bitrateChoice = value } }
   // interface girou (retrato/deitado): a prévia acompanha; o arquivo usa o ângulo do horizonte travado ao começar
@@ -1002,7 +1003,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
       guard self.configured, let cam = self.device, !self.isRecording else { return }
       let full = self.selectedProfile.fps
       // 0.8.7: só no CRÍTICO — a 30 qps o atraso da Extrema DOBRA (0,57 -> 1,08 s, medido nos trechos): zoom e tela lentos
-      let hot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.critical.rawValue
+      // 0.13.6: com a tela leve, já no QUENTE ou com a câmera sob pressão séria (24/11: abriu quente e esquentou parado)
+      let hot = ProcessInfo.processInfo.thermalState.rawValue >= (self.rawScreen ? ProcessInfo.ThermalState.serious : ProcessInfo.ThermalState.critical).rawValue || (self.rawScreen && self.pressureLevel >= 2)
       let slow = hot && full > 31 && cam.activeFormat.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30.01 && $0.maxFrameRate >= 29.99 }
       guard slow != self.idleSlow else { return }
       self.idleSlow = slow
