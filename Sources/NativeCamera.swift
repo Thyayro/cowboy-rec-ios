@@ -524,6 +524,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     var chosen = profile ?? selectedProfile
     var wantsHDR = hdr ?? requestedHDR, wantsLog = log ?? requestedLog
     let encoding = codec ?? requestedCodec
+    // 0.13.9: modo mestre = Extrema de padrão (uma vez; depois vale o que o operador escolher em Ajustes)
+    if masterOn && UserDefaults.standard.object(forKey: "stabMestre") == nil {
+      UserDefaults.standard.set(true, forKey: "stabMestre"); UserDefaults.standard.set(4, forKey: "stab")
+      stabilizationChoiceValue = 4; publish { self.stabilizationChoice = 4 }
+    }
     let catalog = descriptors(cam)
     if wantsLog && !catalog.contains(where: { $0.log }) { wantsLog = false }   // lente/aparelho sem Log: segue sem, avisa no seletor
     if wantsLog { wantsHDR = false }
@@ -849,10 +854,11 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
   func setZoomInstant(_ value: Bool) { UserDefaults.standard.set(value, forKey: "zoomInstant2"); renderer.zoomInstant = value; publish { self.zoomInstant = value } }
   func setMasterMode(_ on: Bool) {
     ProResPrefs.enabled = on; masterOn = on; publish { self.masterMode = on }
-    if on { setLightPreview(true); setRawScreen(true) }
+    if on { setLightPreview(true); setRawScreen(true); UserDefaults.standard.set(4, forKey: "stab"); UserDefaults.standard.set(true, forKey: "stabMestre"); publish { self.stabilizationChoice = 4 } }
     Diag.step("modo-mestre", ["on": on])
     reconfigure {
       guard let cam = self.device else { return }
+      if on { self.stabilizationChoiceValue = 4 }   // 0.13.9: Extrema (o formato é escolhido entre os que aceitam)
       var p = self.selectedProfile
       // desligando: volta ao qps que o operador escolheu (o modo mestre tinha descido pra 30)
       let want = UserDefaults.standard.object(forKey: "qpsPedido") as? Double ?? 60
@@ -884,6 +890,8 @@ final class NativeCamera: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     let mode = fallbackChain().first { cam.activeFormat.isVideoStabilizationModeSupported($0) } ?? .off
     if connection.isVideoStabilizationSupported { connection.preferredVideoStabilizationMode = mode }
     let actual = connection.activeVideoStabilizationMode
+    let aceita = [AVCaptureVideoStabilizationMode.standard, .cinematic, .cinematicExtended, Self.mode(for: 4)].filter { cam.activeFormat.isVideoStabilizationModeSupported($0) }.map { Self.label($0) }
+    Diag.step("estabilizacao", ["pedida": Self.label(desired), "aplicada": Self.label(mode), "ativa": Self.label(actual), "formato_aceita": aceita.joined(separator: ","), "fmt": selectedProfile.label, "log": requestedLog])
     let description = "\(name(cam)) · \(selectedProfile.label)\(requestedLog ? " · Apple Log" : requestedHDR ? " · HDR" : "") · estabilização \(Self.label(mode))"
     publish { self.preferredMode = mode; self.activeMode = actual; self.status = description }
   }
