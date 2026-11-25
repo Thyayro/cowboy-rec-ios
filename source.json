@@ -1,0 +1,109 @@
+{
+  "name": "Cowboy Rec",
+  "identifier": "com.cowboy.rec.source",
+  "subtitle": "Versões do Cowboy Rec",
+  "sourceURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/source.json",
+  "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+  "tintColor": "#F5C518",
+  "apps": [
+    {
+      "name": "Cowboy Rec",
+      "bundleIdentifier": "com.cowboy.rec.personal",
+      "developerName": "Cowboy do Consórcio",
+      "subtitle": "Apple Log direto na nuvem",
+      "localizedDescription": "Câmera Apple Log que grava direto na nuvem Cowboy.",
+      "iconURL": "https://raw.githubusercontent.com/Thyayro/cowboy-rec-ios/altstore/icon.png",
+      "tintColor": "#F5C518",
+      "category": "photo-video",
+      "versions": [
+        {
+          "version": "0.14.1",
+          "date": "2026-11-25T03:21:58Z",
+          "localizedDescription": "Cowboy Rec 0.14.1\n\nTroca de lente sem quebra de posição na tela sem atraso (padrão do modo mestre): a troca não entra mais como tremor, sai o alinhador antigo da tela e entra o dissolve de 0,18 s. Mantém a Régua mm da 0.14.0.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.14.1-test/CowboyRec-0.14.1-unsigned.ipa",
+          "size": 2721006,
+          "minOSVersion": "17.2",
+          "buildVersion": "94"
+        },
+        {
+          "version": "0.14.0",
+          "date": "2026-11-25T03:01:23Z",
+          "localizedDescription": "Cowboy Rec 0.14.0\n\nScan 3D ganha o tipo Régua mm (peça em cima do monitor com a Mesa mm): foco travado e dica de 2 voltas. O PC mede e devolve STL em mm, pegada SVG/DXF e furos. Feito em cima da 0.13.9.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.14.0-test/CowboyRec-0.14.0-unsigned.ipa",
+          "size": 2721491,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.9",
+          "date": "2026-11-25T02:53:16Z",
+          "localizedDescription": "Cowboy Rec 0.13.9\n\nModo mestre com a Extrema (estabilização mais forte da Apple) como padrão; o formato 4K30 é escolhido entre os que aceitam a Extrema. Diagnóstico registra a estabilização pedida, aplicada e a que o formato aceita.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.9-test/CowboyRec-0.13.9-unsigned.ipa",
+          "size": 2718522,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.8",
+          "date": "2026-11-25T01:40:07Z",
+          "localizedDescription": "Cowboy Rec 0.13.8\n\nMODO MESTRE (trabalho pesado e longo): com o mestre ProRes ligado, câmera a 30 qps no mesmo 4K, tela sem atraso em Log cru, e gravando sem conversão, sem efeitos, sem envio (sobe ao parar) e com áudio cru. Desligar o mestre volta ao formato escolhido.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.8-test/CowboyRec-0.13.8-unsigned.ipa",
+          "size": 2716510,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.7",
+          "date": "2026-11-25T01:05:46Z",
+          "localizedDescription": "Cowboy Rec 0.13.7\n\nEspaço REAL do iPhone (o mestre parava com Disco Cheio antes do aviso), folga de 5 GB, a tela diz quantos minutos de mestre cabem ao gravar, e o aviso de envio não pisca mais durante a gravação.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.7-test/CowboyRec-0.13.7-unsigned.ipa",
+          "size": 2714680,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.6",
+          "date": "2026-11-25T00:29:43Z",
+          "localizedDescription": "Cowboy Rec 0.13.6\n\nMestre ProRes ligado de fábrica (o desligado antigo não vale mais) e Ajustes mostra quantos minutos de mestre cabem no iPhone. Tela leve a 30 qps também parada; câmera a 30 qps parada já no quente. Prévia em Rec.709 e Tela leve viram uma chave só.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.6-test/CowboyRec-0.13.6-unsigned.ipa",
+          "size": 2716785,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.5",
+          "date": "2026-11-24T23:45:43Z",
+          "localizedDescription": "Cowboy Rec 0.13.5\n\nGravação blindada pro trabalho pesado: mestre ProRes 422 HQ e arquivo recebem o quadro antes de qualquer conta da tela; gravando, nada de envio antigo/ProRes (sobe ao parar) e nada sobe com o aparelho quente; conta e mostra os quadros que a câmera descartar (diag quadros-caindo / pressao). Tela leve (Log cru, 30 qps gravando) ligada por padrão.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.5-test/CowboyRec-0.13.5-unsigned.ipa",
+          "size": 2716280,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        },
+        {
+          "version": "0.13.4",
+          "date": "2026-11-21T06:21:27Z",
+          "localizedDescription": "Cowboy Rec 0.13.4\n\nMestre ProRes sobe em 2º plano (iPhone bloqueado/app fechado), Rec.709 ao vivo começa desligado.",
+          "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.13.4-test/CowboyRec-0.13.4-unsigned.ipa",
+          "size": 2702216,
+          "minOSVersion": "17.2",
+          "buildVersion": "1"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSCameraUsageDescription": "Gravar vídeo.",
+          "NSMicrophoneUsageDescription": "Gravar o som do vídeo.",
+          "NSPhotoLibraryUsageDescription": "Mandar vídeos da galeria.",
+          "NSPhotoLibraryAddUsageDescription": "Salvar na galeria."
+        }
+      },
+      "version": "0.14.1",
+      "versionDate": "2026-11-25T03:21:58Z",
+      "versionDescription": "Cowboy Rec 0.14.1\n\nTroca de lente sem quebra de posição na tela sem atraso (padrão do modo mestre): a troca não entra mais como tremor, sai o alinhador antigo da tela e entra o dissolve de 0,18 s. Mantém a Régua mm da 0.14.0.",
+      "downloadURL": "https://github.com/Thyayro/cowboy-rec-ios/releases/download/v0.14.1-test/CowboyRec-0.14.1-unsigned.ipa",
+      "size": 2721006
+    }
+  ],
+  "news": []
+}
