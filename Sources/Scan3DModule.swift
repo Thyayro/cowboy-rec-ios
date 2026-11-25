@@ -120,7 +120,9 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
         let ys = f.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }.map { $0.transform.columns.3.y }.filter { $0 <= c.y + 0.02 }
         self.floorY = ys.max()
       }
-      self.publish { self.centerSet = true; self.onCenter?(c); self.hint = "Centro marcado. INICIAR e ande em volta a 20–35 cm. Dica: apoiado num copo menor que ele, a base sai limpa" }
+      self.publish { self.centerSet = true; self.onCenter?(c)
+        self.hint = self.mode == "regua" ? "Centro marcado. INICIAR: 2 voltas a 25–35 cm (uma alta, uma baixa) com os alvos da borda da tela sempre no quadro"
+                                         : "Centro marcado. INICIAR e ande em volta a 20–35 cm. Dica: apoiado num copo menor que ele, a base sai limpa" }
     }
   }
 
@@ -220,7 +222,10 @@ final class Scan3DCamera: NSObject, ObservableObject, ARSessionDelegate, @unchec
       do {
         try dev.lockForConfiguration()
         // 0.12.1: foco NUNCA trava (a distancia muda andando em volta: foco travado = foto borrada, medido no 1o scan)
-        if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
+        // 0.14.0 REGUA: aqui o foco TRAVA de proposito -- foco andando muda o tamanho da lente (focus breathing) e a medida em mm;
+        // a distancia fica constante (25-35 cm em volta da peca na Mesa mm) e o agente calibra a lente uma vez so.
+        if self.mode == "regua", dev.isFocusModeSupported(.locked) { dev.focusMode = .locked }
+        else if dev.isFocusModeSupported(.continuousAutoFocus) { dev.focusMode = .continuousAutoFocus }
         let alvo = CMTime(value: 1, timescale: 250)          // video: obturador curto contra borrao de movimento
         if self.videoMode, dev.isExposureModeSupported(.custom), CMTimeCompare(dev.exposureDuration, alvo) > 0 {
           let ganho = Float(dev.exposureDuration.seconds / alvo.seconds)
@@ -760,6 +765,7 @@ struct Scan3DView: View {
     } message: { Text("O que foi filmado até agora é apagado e nada é enviado.") }
     .task { camera.start(); up.kick() }
     .onDisappear { camera.close() }
+    .onChange(of: mode) { _, m in camera.mode = m }   // 0.14.0: a dica do MARCAR já sabe se é Régua mm
     .onChange(of: phase) { _, p in
       if p == .background { if camera.scanning { camera.finish { _ in } }; camera.close() }
       else if p == .active { camera.start(); up.kick() }
@@ -884,8 +890,9 @@ struct Scan3DView: View {
           Label("Objeto", systemImage: "cube").tag("objeto")
           Label("Pessoa / busto", systemImage: "person.crop.circle").tag("pessoa")
           Label("Ambiente", systemImage: "house").tag("ambiente")
+          Label("Régua mm (peça no monitor)", systemImage: "ruler").tag("regua")
         }
-      } label: { chip(icon: mode == "pessoa" ? "person.crop.circle" : mode == "ambiente" ? "house" : "cube", text: mode == "pessoa" ? "Pessoa" : mode == "ambiente" ? "Ambiente" : "Objeto") }
+      } label: { chip(icon: mode == "pessoa" ? "person.crop.circle" : mode == "ambiente" ? "house" : mode == "regua" ? "ruler" : "cube", text: mode == "pessoa" ? "Pessoa" : mode == "ambiente" ? "Ambiente" : mode == "regua" ? "Régua mm" : "Objeto") }
       Menu {
         Picker("Qualidade", selection: $quality) {
           Label("Ultra — detalhe máximo", systemImage: "sparkles").tag("ultra")
